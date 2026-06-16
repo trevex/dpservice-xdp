@@ -1,0 +1,21 @@
+[package]
+name = "xdp-dp-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+xdp-dp-common = { path = "../xdp-dp-common", default-features = false }
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+network-types = "0.0.7"
+
+[build-dependencies]
+which = "6"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xdp-dp-ebpf"
+path = "src/main.rs"
