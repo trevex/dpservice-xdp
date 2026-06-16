@@ -1,10 +1,6 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     flake-utils.url = "github:numtide/flake-utils";
     go-overlay = {
       url = "github:purpleclay/go-overlay";
@@ -16,34 +12,36 @@
     };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils, go-overlay, git-hooks, ... }:
+  outputs = { self, nixpkgs, flake-utils, go-overlay, git-hooks, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ (import rust-overlay) go-overlay.overlays.default ];
+        overlays = [ go-overlay.overlays.default ];
         pkgs = import nixpkgs { inherit system overlays; };
-        # Single nightly toolchain (no rustup on this host): the ambient cargo must be
-        # nightly so it can build the eBPF crate for the BPF target via -Z build-std=core.
-        # selectLatestNightlyWith pins to the latest nightly in the locked rust-overlay.
-        # Rust is managed by rustup (community-standard for aya/aya-build), pinned via
-        # rust-toolchain.toml to a nightly that uses LLVM 21 — matching nixpkgs bpf-linker
-        # (also LLVM 21.1.8). rustup is the only Rust on PATH. `rustToolchain` below is a
-        # nix toolchain used ONLY by the git-hooks rustfmt/clippy (referenced by store path,
-        # never added to PATH, so it does not conflict with rustup's shims).
-        rustToolchain = pkgs.rust-bin.selectLatestNightlyWith (toolchain:
-          toolchain.default.override {
-            extensions = [ "rust-src" "rustfmt" "clippy" ];
-          });
         go = pkgs.go-bin.latest;
+        # Rust is managed entirely by rustup (community-standard for aya/aya-build), pinned
+        # via rust-toolchain.toml to nightly-2026-01-15 (LLVM 21) to match nixpkgs bpf-linker.
+        # The pre-commit rustfmt/clippy hooks therefore run through rustup too (system hooks
+        # invoking `cargo fmt` / `cargo clippy`), so there is exactly one Rust toolchain.
         pre-commit-check = git-hooks.lib.${system}.run {
           src = ./.;
           hooks = {
-            rustfmt = {
+            rustfmt-rustup = {
               enable = true;
-              packageOverrides = { cargo = rustToolchain; rustfmt = rustToolchain; };
+              name = "rustfmt (rustup)";
+              entry = "cargo fmt --all -- --check";
+              language = "system";
+              pass_filenames = false;
+              files = "\\.rs$";
             };
-            clippy = {
+            clippy-rustup = {
               enable = true;
-              packageOverrides = { cargo = rustToolchain; clippy = rustToolchain; };
+              name = "clippy (rustup)";
+              # default-members excludes xdp-dp-ebpf, so the host build never tries to compile
+              # the #![no_main] eBPF bin; the ebpf object is built via aya-build from build.rs.
+              entry = "cargo clippy --all-targets";
+              language = "system";
+              pass_filenames = false;
+              files = "\\.rs$";
             };
           };
         };
