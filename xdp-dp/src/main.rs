@@ -71,6 +71,11 @@ enum Cmd {
         #[arg(long)]
         addr: String,
     },
+    /// Attach the trivial xdp_pass program to an interface (redirect-target enabler), then idle.
+    Pass {
+        #[arg(long)]
+        iface: String,
+    },
     /// Attach both XDP programs and populate CONFIG[0], then idle until ctrl-c.
     Bringup {
         /// Guest-facing interface name (guest_tx is attached here).
@@ -147,6 +152,12 @@ async fn main() -> anyhow::Result<()> {
                 "bringup: guest={guest}(if{}) uplink={uplink}(if{}) vni={vni}; CONFIG written; ctrl-c to stop",
                 cfg.guest_ifindex, cfg.uplink_ifindex
             );
+            tokio::signal::ctrl_c().await?;
+        }
+        Cmd::Pass { iface } => {
+            let mut ebpf = loader::load_ebpf()?;
+            loader::attach_xdp(&mut ebpf, "xdp_pass", &iface)?;
+            println!("attached xdp_pass to {iface}; ctrl-c to detach");
             tokio::signal::ctrl_c().await?;
         }
     }

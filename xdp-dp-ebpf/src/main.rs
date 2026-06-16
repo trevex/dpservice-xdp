@@ -23,6 +23,13 @@ const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
 const IPPROTO_IPIP: u8 = 4; // IPv4 encapsulated in IPv6 (outer next-header)
 
+/// Trivial pass program used as a redirect-target enabler: XDP redirect *into* a veth only
+/// works if the veth's peer has an XDP program attached. Attach this on those receiving ends.
+#[xdp]
+pub fn xdp_pass(_ctx: XdpContext) -> u32 {
+    xdp_action::XDP_PASS
+}
+
 #[xdp]
 pub fn guest_tx(ctx: XdpContext) -> u32 {
     match try_guest_tx(&ctx) {
