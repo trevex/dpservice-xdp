@@ -66,8 +66,14 @@ ironcore-net-xdp/
 ```toml
 [workspace]
 resolver = "2"
-members = ["xdp-dp-common", "xdp-dp", "xtask"]
-# xdp-dp-ebpf is built out-of-tree for the BPF target via xtask; excluded here.
+# Members start empty and are appended by each crate task (cargo errors on a listed
+# member whose Cargo.toml does not exist yet, and a `*` glob errors on non-crate dirs
+# like docs/proto/env — so we grow this list explicitly: Task 3 adds "xdp-dp-common",
+# Task 4 adds "xtask", Task 5 adds "xdp-dp").
+members = []
+# xdp-dp-ebpf is built out-of-tree for the BPF target via xtask. `exclude` is REQUIRED:
+# xtask runs `cargo` inside xdp-dp-ebpf/, which would otherwise error that the package
+# is inside the workspace root but not a member.
 exclude = ["xdp-dp-ebpf"]
 
 [workspace.package]
@@ -109,7 +115,7 @@ Append to `.gitignore`:
 - [ ] **Step 4: Verify workspace parses**
 
 Run: `cargo metadata --no-deps --format-version 1 >/dev/null && echo OK`
-Expected: `OK` (members `xdp-dp-common`, `xdp-dp`, `xtask` will error until their manifests exist — acceptable now; re-run after Task 5).
+Expected: `OK` (an empty-members virtual workspace is valid; members get appended by Tasks 3/4/5).
 
 - [ ] **Step 5: Commit**
 
@@ -191,6 +197,11 @@ license.workspace = true
 [features]
 default = []
 user = []   # gates std-only impls (e.g. aya Pod) for the userspace side
+```
+
+Then register the crate in the root workspace — edit root `Cargo.toml` so:
+```toml
+members = ["xdp-dp-common"]
 ```
 
 - [ ] **Step 2: Write the failing test**
@@ -357,6 +368,12 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 ```
 
+Register `xtask` in the root workspace — edit root `Cargo.toml` so:
+```toml
+members = ["xdp-dp-common", "xtask"]
+```
+(`xdp-dp-ebpf` stays in `exclude`, never in `members`.)
+
 `xtask/src/main.rs`:
 ```rust
 use std::process::Command;
@@ -433,6 +450,11 @@ prost = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.12"
+```
+
+Register `xdp-dp` in the root workspace — edit root `Cargo.toml` so:
+```toml
+members = ["xdp-dp-common", "xtask", "xdp-dp"]
 ```
 
 - [ ] **Step 2: Write the loader that embeds and attaches the eBPF object**
