@@ -503,15 +503,18 @@ fn main() -> anyhow::Result<()> {
         .to_string();
     aya_build::build_ebpf(
         [Package { name: "xdp-dp-ebpf", root_dir: root_dir.as_str(), ..Default::default() }],
-        Toolchain::default(),
+        Toolchain::Custom("nightly-2026-01-15"),
     )
 }
 ```
-> NOTE: match `aya-build` 0.1.3's actual API. If `Package`/`Toolchain`/`build_ebpf` differ
-> (e.g. field names or `Toolchain::default()` vs an explicit variant), use the names from
-> `cargo doc -p aya-build --open` or docs.rs/aya-build/0.1.3. `Toolchain::default()` must use
-> the ambient cargo (this host has no rustup, so it must NOT shell out to `cargo +nightly`).
-> If it tries to, switch to whatever variant means "current toolchain" and note it as a concern.
+> NOTE: aya-build 0.1.3 API (verified): `build_ebpf(impl IntoIterator<Item=Package>, Toolchain)`;
+> `Package { name: &str, root_dir: &str, no_default_features: bool, features: &[&str] }` (impls
+> Default); `Toolchain::{Nightly, Custom(&str)}`. aya-build runs `rustup run <toolchain> cargo
+> build … -Z build-std=core --target bpfel-unknown-none` — so rustup must be present (it is) and
+> the toolchain must exist. We use `Toolchain::Custom("nightly-2026-01-15")` ON PURPOSE: it is
+> the LLVM-21 nightly pinned in `rust-toolchain.toml` that matches nixpkgs bpf-linker (LLVM 21).
+> Do NOT use `Toolchain::Nightly`/default — that resolves to the latest nightly (LLVM 22) and
+> fails bpf-linker with "ERROR llvm: Invalid record".
 
 - [ ] **Step 3: Write the loader that embeds and attaches the eBPF object**
 
@@ -657,7 +660,7 @@ fn main() -> anyhow::Result<()> {
         .to_string();
     aya_build::build_ebpf(
         [Package { name: "xdp-dp-ebpf", root_dir: root_dir.as_str(), ..Default::default() }],
-        Toolchain::default(),
+        Toolchain::Custom("nightly-2026-01-15"),
     )?;
 
     // 2) Generate the DPDKironcore gRPC service (server only).
