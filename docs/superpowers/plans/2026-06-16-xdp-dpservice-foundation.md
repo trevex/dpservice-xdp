@@ -19,8 +19,11 @@
 ```
 ironcore-net-xdp/
   Cargo.toml                # [workspace] members = common, ebpf, xdp-dp, xtask
-  rust-toolchain.toml       # pin toolchains (stable default; nightly for ebpf build)
-  flake.nix                 # devShell: + nightly+rust-src, bpf-linker, protobuf, qemu/libvirt, iproute2
+  flake.nix                 # devShell: single NIGHTLY toolchain (+rust-src, bpfel target),
+                            #   bpf-linker, protobuf, qemu/libvirt, iproute2
+  # NOTE: no rust-toolchain.toml — this host uses a Nix-provided toolchain with NO rustup,
+  #   so `cargo +nightly` and rust-toolchain.toml are inert. The flake supplies one nightly
+  #   toolchain; the ambient `cargo` runs `-Z build-std=core` directly.
   proto/
     dpdk.proto              # vendored from ironcore-dev/dpservice (package dpdkironcore.v1)
   xdp-dp-common/
@@ -55,7 +58,6 @@ ironcore-net-xdp/
 
 **Files:**
 - Create: `Cargo.toml`
-- Create: `rust-toolchain.toml`
 - Create: `.gitignore` (append)
 
 - [ ] **Step 1: Create the workspace manifest**
@@ -86,16 +88,15 @@ clap = { version = "4", features = ["derive"] }
 network-types = "0.0.7"
 ```
 
-- [ ] **Step 2: Pin toolchains**
+- [ ] **Step 2: Toolchain note (no file to create)**
 
-`rust-toolchain.toml`:
-```toml
-[toolchain]
-channel = "stable"
-components = ["rust-src", "rustfmt", "clippy"]
-# The eBPF crate is built with the nightly toolchain invoked explicitly by xtask
-# (nightly is provided by the Nix devShell), using -Z build-std=core.
-```
+Do **not** create a `rust-toolchain.toml`. This host has no rustup; the Rust toolchain
+is provided by the Nix devShell. Task 2 switches that devShell to a single **nightly**
+toolchain with `rust-src`, so the ambient `cargo` can build the BPF target via
+`-Z build-std=core` with no `+toolchain` proxy. Confirm the BPF target is known:
+
+Run: `rustc --print target-list | grep -x bpfel-unknown-none`
+Expected: `bpfel-unknown-none`
 
 - [ ] **Step 3: Append build artifacts to .gitignore**
 
@@ -122,39 +123,45 @@ git commit -m "chore: scaffold cargo workspace and toolchain pin"
 **Files:**
 - Modify: `flake.nix`
 
-- [ ] **Step 1: Add a nightly toolchain and the new tools**
+- [ ] **Step 1: Switch the toolchain to nightly and add the new tools**
 
-In `flake.nix`, inside the `let` block after `rustToolchain`, add a nightly toolchain for the BPF build:
+In `flake.nix`, change `rustToolchain` from stable to a pinned **nightly** with the BPF
+target, and keep it as the single toolchain (pre-commit clippy/rustfmt keep using it):
 ```nix
-        rustNightly = pkgs.rust-bin.nightly."2026-05-01".default.override {
-          extensions = [ "rust-src" ];
+        rustToolchain = pkgs.rust-bin.nightly."2026-05-01".default.override {
+          extensions = [ "rust-src" "rust-analyzer" "rustfmt" "clippy" ];
+          targets = [ "bpfel-unknown-none" ];
         };
 ```
 Then extend `buildInputs` (keep existing entries) with:
 ```nix
-            rustNightly
             pkgs.bpf-linker
             pkgs.protobuf
+            pkgs.grpcurl
             pkgs.qemu
             pkgs.libvirt
             pkgs.OVMF
             pkgs.iproute2
             pkgs.bridge-utils
             pkgs.kubectl
-            pkgs.k3d
 ```
 And add an env var so `tonic-build` finds `protoc`:
 ```nix
           PROTOC = "${pkgs.protobuf}/bin/protoc";
 ```
+> If `pkgs.rust-bin.nightly."2026-05-01"` is unavailable, pick the nearest available
+> nightly date from `rust-overlay`; the only requirements are `rust-src` + the
+> `bpfel-unknown-none` target. If `pkgs.bpf-linker` is missing from the pinned nixpkgs,
+> install it via `cargo install bpf-linker` inside the shell and note it as a concern.
 
 - [ ] **Step 2: Reload the devShell and verify tools resolve**
 
 Run:
 ```bash
-nix develop --command bash -c 'bpf-linker --version && protoc --version && qemu-system-x86_64 --version | head -1 && cargo +nightly --version'
+nix develop --command bash -c 'cargo --version && bpf-linker --version && protoc --version && qemu-system-x86_64 --version | head -1 && rustc --print target-list | grep -x bpfel-unknown-none'
 ```
-Expected: a version line for each (no "command not found").
+Expected: `cargo` reports a `-nightly` version, plus a version line for each tool and
+`bpfel-unknown-none` printed (no "command not found").
 
 - [ ] **Step 3: Commit**
 
@@ -277,7 +284,6 @@ git commit -m "feat(common): POD map key/value types shared with eBPF"
 **Files:**
 - Create: `xdp-dp-ebpf/Cargo.toml`
 - Create: `xdp-dp-ebpf/src/main.rs`
-- Create: `xdp-dp-ebpf/rust-toolchain.toml`
 - Create: `xtask/Cargo.toml`
 - Create: `xtask/src/main.rs`
 
@@ -337,16 +343,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 ```
 
-- [ ] **Step 3: Pin the eBPF crate to nightly**
-
-`xdp-dp-ebpf/rust-toolchain.toml`:
-```toml
-[toolchain]
-channel = "nightly-2026-05-01"
-components = ["rust-src"]
-```
-
-- [ ] **Step 4: Write the xtask build helper**
+- [ ] **Step 3: Write the xtask build helper**
 
 `xtask/Cargo.toml`:
 ```toml
@@ -378,9 +375,10 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let target = "bpfel-unknown-none";
+    // Ambient cargo is the Nix-provided nightly (no rustup), so -Z build-std works directly.
     let mut cmd = Command::new("cargo");
     cmd.current_dir("xdp-dp-ebpf")
-        .args(["+nightly-2026-05-01", "build", "--target", target, "-Z", "build-std=core"]);
+        .args(["build", "--target", target, "-Z", "build-std=core"]);
     if args.release {
         cmd.arg("--release");
     }
@@ -393,13 +391,13 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 5: Build the eBPF object**
+- [ ] **Step 4: Build the eBPF object**
 
 Run: `cargo run -p xtask -- --release`
 Expected: `ebpf build OK (bpfel-unknown-none)` and an object under `xdp-dp-ebpf/target/bpfel-unknown-none/release/xdp-dp`.
 (If `bpf-linker` is missing the linker step fails — confirm Task 2 Step 2 passed.)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add xdp-dp-ebpf xtask Cargo.toml
