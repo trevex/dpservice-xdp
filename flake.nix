@@ -24,12 +24,14 @@
         # Single nightly toolchain (no rustup on this host): the ambient cargo must be
         # nightly so it can build the eBPF crate for the BPF target via -Z build-std=core.
         # selectLatestNightlyWith pins to the latest nightly in the locked rust-overlay.
-        # rust-src is required so `-Z build-std=core` can compile core for the BPF target.
-        # NOTE: bpfel-unknown-none is a built-in rustc target compiled via build-std; it is
-        # NOT a downloadable rustup `targets` component, so it must not be listed there.
+        # Rust is managed by rustup (community-standard for aya/aya-build), pinned via
+        # rust-toolchain.toml to a nightly that uses LLVM 21 — matching nixpkgs bpf-linker
+        # (also LLVM 21.1.8). rustup is the only Rust on PATH. `rustToolchain` below is a
+        # nix toolchain used ONLY by the git-hooks rustfmt/clippy (referenced by store path,
+        # never added to PATH, so it does not conflict with rustup's shims).
         rustToolchain = pkgs.rust-bin.selectLatestNightlyWith (toolchain:
           toolchain.default.override {
-            extensions = [ "rust-src" "rust-analyzer" "rustfmt" "clippy" ];
+            extensions = [ "rust-src" "rustfmt" "clippy" ];
           });
         go = pkgs.go-bin.latest;
         pre-commit-check = git-hooks.lib.${system}.run {
@@ -51,7 +53,7 @@
           inherit (pre-commit-check) shellHook;
 
           buildInputs = [
-            rustToolchain
+            pkgs.rustup
             go.withDefaultTools
             pkgs.cargo-watch
             pkgs.cargo-edit

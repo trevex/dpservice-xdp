@@ -1,0 +1,12 @@
+# Rust toolchain pinned via rustup (community-standard for aya/aya-build).
+#
+# Pinned to a nightly that predates rust's switch to LLVM 22 (merged 2026-01-28), so its
+# rustc emits LLVM 21 bitcode — matching nixpkgs `bpf-linker` 0.10.3 (built against LLVM
+# 21.1.8). This avoids the "ERROR llvm: Invalid record" mismatch when bpf-linker links the
+# eBPF object. `aya-build` is told to use `Toolchain::Custom("nightly-2026-01-15")` so it
+# uses THIS toolchain (not the latest LLVM-22 nightly).
+#
+# rust-src is required for `-Z build-std=core` (the bpfel target has no prebuilt std).
+[toolchain]
+channel = "nightly-2026-01-15"
+components = ["rust-src", "rustfmt", "clippy"]
