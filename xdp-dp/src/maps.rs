@@ -1,7 +1,7 @@
 use anyhow::Context;
-use aya::maps::{HashMap, MapData};
+use aya::maps::{Array, HashMap, MapData};
 use aya::Ebpf;
-use xdp_dp_common::{IfaceKey, IfaceValue};
+use xdp_dp_common::{Config, IfaceKey, IfaceValue};
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
 // Exercised by the roundtrip test now; wired into the gRPC control plane in Task 12.
@@ -27,6 +27,30 @@ impl Interfaces {
 
     pub fn get(&self, key: &IfaceKey) -> Option<IfaceValue> {
         self.map.get(key, 0).ok()
+    }
+}
+
+/// Typed handle over the single-entry `CONFIG` Array map.
+pub struct ConfigMap {
+    map: Array<MapData, Config>,
+}
+
+#[allow(dead_code)]
+impl ConfigMap {
+    /// Take ownership of the `CONFIG` map from a loaded eBPF object.
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = Array::try_from(ebpf.take_map("CONFIG").context("CONFIG map missing")?)?;
+        Ok(Self { map })
+    }
+
+    /// Write a `Config` into entry 0.
+    pub fn set(&mut self, cfg: &Config) -> anyhow::Result<()> {
+        self.map.set(0, cfg, 0).context("write CONFIG[0]")
+    }
+
+    /// Read entry 0.
+    pub fn get(&self) -> anyhow::Result<Config> {
+        self.map.get(&0, 0).context("read CONFIG[0]")
     }
 }
 
