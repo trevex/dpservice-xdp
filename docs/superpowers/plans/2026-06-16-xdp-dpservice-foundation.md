@@ -290,13 +290,26 @@ git add xdp-dp-common
 git commit -m "feat(common): POD map key/value types shared with eBPF"
 ```
 
-### Task 4: `xdp-dp-ebpf` crate that builds for the BPF target
+### Task 4: `xdp-dp-ebpf` crate (XDP_PASS skeleton; compiled later by aya-build)
 
 **Files:**
 - Create: `xdp-dp-ebpf/Cargo.toml`
+- Create: `xdp-dp-ebpf/src/lib.rs`
 - Create: `xdp-dp-ebpf/src/main.rs`
-- Create: `xtask/Cargo.toml`
-- Create: `xtask/src/main.rs`
+- Create: `xdp-dp-ebpf/build.rs`
+- Modify: root `Cargo.toml` (workspace membership + ebpf profile)
+
+> **Build model (IMPORTANT — no xtask).** Following the current aya pattern, the eBPF object
+> is compiled by the `aya-build` crate invoked from `xdp-dp`'s `build.rs` (Task 5). aya-build
+> runs cargo-in-cargo with `-Z build-std` and selects `bpf-linker` automatically — so there
+> is no hand-rolled xtask and no manual linker config. Consequences for this crate:
+> - It is a workspace **member** but excluded from `default-members`, so a normal host
+>   `cargo build` does not try to compile its `#![no_main]` bin for the host.
+> - It exposes a tiny `src/lib.rs` (`#![no_std]`) purely to provide a **library target** so
+>   the host-built `path` build-dependency declared by `xdp-dp` (Task 5) resolves; the actual
+>   XDP programs live in `src/main.rs` and are compiled only for `bpfel-unknown-none`.
+> - Never run `cargo build -p xdp-dp-ebpf` (whole-package) or `cargo build --workspace`: those
+>   try to host-compile the bin and fail. Build only the lib target for sanity checks.
 
 - [ ] **Step 1: Write the eBPF crate manifest**
 
@@ -309,26 +322,36 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
+xdp-dp-common = { path = "../xdp-dp-common", default-features = false }
 aya-ebpf = "0.1"
 aya-log-ebpf = "0.1"
-xdp-dp-common = { path = "../xdp-dp-common", default-features = false }
 network-types = "0.0.7"
 
+[build-dependencies]
+which = "6"
+
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
-name = "xdp-dp"
+name = "xdp-dp-ebpf"
 path = "src/main.rs"
+```
+> Do NOT put `[profile.*]` here — profile settings in a workspace member are ignored with a
+> warning; the BPF profile goes in the root workspace manifest (Step 5).
 
-[profile.dev]
-opt-level = 3
-debug = false
-panic = "abort"
+- [ ] **Step 2: Write the library shim**
 
-[profile.release]
-panic = "abort"
-codegen-units = 1
+`xdp-dp-ebpf/src/lib.rs`:
+```rust
+#![no_std]
+
+// This crate's real content is the bpfel-only program binary in `src/main.rs`. This empty
+// `#![no_std]` library target exists so that `xdp-dp`'s host-built `path` build-dependency on
+// this crate resolves (build-dependencies compile the lib target for the host).
 ```
 
-- [ ] **Step 2: Write a minimal XDP_PASS program (compiles for BPF target)**
+- [ ] **Step 3: Write the XDP_PASS programs**
 
 `xdp-dp-ebpf/src/main.rs`:
 ```rust
@@ -352,73 +375,63 @@ pub fn guest_tx(_ctx: XdpContext) -> u32 {
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
+
+// Declare a GPL-compatible license so GPL-only helpers (bpf_redirect, bpf_fib_lookup, used
+// from Task 11 onward) are permitted by the verifier. edition-2021 attribute spelling.
+#[link_section = "license"]
+#[no_mangle]
+static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
 ```
 
-- [ ] **Step 3: Write the xtask build helper**
+- [ ] **Step 4: Write the build.rs bpf-linker rebuild hint**
 
-`xtask/Cargo.toml`:
-```toml
-[package]
-name = "xtask"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-anyhow = { workspace = true }
-clap = { workspace = true }
-```
-
-Register `xtask` in the root workspace — edit root `Cargo.toml` so:
-```toml
-members = ["xdp-dp-common", "xtask"]
-```
-(`xdp-dp-ebpf` stays in `exclude`, never in `members`.)
-
-`xtask/src/main.rs`:
+`xdp-dp-ebpf/build.rs`:
 ```rust
-use std::process::Command;
+use which::which;
 
-use anyhow::{bail, Context};
-use clap::Parser;
-
-/// Build the eBPF crate for the BPF target.
-#[derive(Parser)]
-struct Args {
-    /// Build in release mode.
-    #[arg(long)]
-    release: bool,
-}
-
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let target = "bpfel-unknown-none";
-    // Ambient cargo is the Nix-provided nightly (no rustup), so -Z build-std works directly.
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir("xdp-dp-ebpf")
-        .args(["build", "--target", target, "-Z", "build-std=core"]);
-    if args.release {
-        cmd.arg("--release");
-    }
-    let status = cmd.status().context("failed to spawn cargo for ebpf build")?;
-    if !status.success() {
-        bail!("ebpf build failed");
-    }
-    println!("ebpf build OK ({target})");
-    Ok(())
+// aya-build links the object with `bpf-linker`. This rebuild hint (mirrored from the aya
+// template) re-runs the build when the resolved bpf-linker binary changes.
+fn main() {
+    let bpf_linker = which("bpf-linker").expect("bpf-linker not found in PATH");
+    println!("cargo:rerun-if-changed={}", bpf_linker.to_str().unwrap());
 }
 ```
 
-- [ ] **Step 4: Build the eBPF object**
+- [ ] **Step 5: Register the crate in the workspace (member, not default; BPF profile)**
 
-Run: `cargo run -p xtask -- --release`
-Expected: `ebpf build OK (bpfel-unknown-none)` and an object under `xdp-dp-ebpf/target/bpfel-unknown-none/release/xdp-dp`.
-(If `bpf-linker` is missing the linker step fails — confirm Task 2 Step 2 passed.)
+Edit root `Cargo.toml`: add `xdp-dp-ebpf` as a member, **remove** the `exclude` line, add a
+`default-members` that omits the ebpf crate, and add the BPF release profile. The
+`[workspace]` table should read:
+```toml
+[workspace]
+resolver = "2"
+members = ["xdp-dp-common", "xdp-dp-ebpf"]
+default-members = ["xdp-dp-common"]
 
-- [ ] **Step 5: Commit**
+[profile.release.package.xdp-dp-ebpf]
+debug = 2
+codegen-units = 1
+strip = false
+```
+(Leave `[workspace.package]` and `[workspace.dependencies]` unchanged. Task 5 appends
+`xdp-dp` to both `members` and `default-members`.)
+
+- [ ] **Step 6: Verify structural validity (host lib only; the bpfel object builds in Task 5)**
+
+Run:
+```bash
+cargo build -p xdp-dp-ebpf --lib          # host-compiles the no_std lib shim only
+cargo build -p xdp-dp-common              # default member still builds
+cargo metadata --no-deps --format-version 1 | grep -q '"name":"xdp-dp-ebpf"' && echo MEMBER_OK
+```
+Expected: both builds finish; `MEMBER_OK` printed. Do NOT attempt to build the bin/object
+here — that happens via aya-build in Task 5.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add xdp-dp-ebpf xtask Cargo.toml
-git commit -m "feat(ebpf): XDP_PASS skeleton building for bpfel target via xtask"
+git add xdp-dp-ebpf Cargo.toml
+git commit -m "feat(ebpf): XDP_PASS skeleton (aya-build compiles it from xdp-dp)"
 ```
 
 ### Task 5: `xdp-dp` userspace crate loads and attaches the eBPF program
@@ -449,15 +462,58 @@ tonic = { workspace = true }
 prost = { workspace = true }
 
 [build-dependencies]
-tonic-build = "0.12"
+anyhow = { workspace = true }
+aya-build = "0.1.3"
+cargo_metadata = "0.23"
+# Declared so cargo tracks the ebpf crate for cache invalidation; it is built for the host
+# as a (no_std) lib here, and separately compiled to bpfel by aya-build in build.rs.
+xdp-dp-ebpf = { path = "../xdp-dp-ebpf" }
 ```
+(`tonic-build` is added in Task 6 when the proto is introduced.)
 
-Register `xdp-dp` in the root workspace — edit root `Cargo.toml` so:
+Register `xdp-dp` in the root workspace — edit root `Cargo.toml` so both lists include it:
 ```toml
-members = ["xdp-dp-common", "xtask", "xdp-dp"]
+members = ["xdp-dp-common", "xdp-dp-ebpf", "xdp-dp"]
+default-members = ["xdp-dp-common", "xdp-dp"]
 ```
 
-- [ ] **Step 2: Write the loader that embeds and attaches the eBPF object**
+- [ ] **Step 2: Write build.rs that compiles the eBPF object via aya-build**
+
+`xdp-dp/build.rs`:
+```rust
+use anyhow::{anyhow, Context as _};
+use aya_build::{Package, Toolchain};
+
+fn main() -> anyhow::Result<()> {
+    // Locate the xdp-dp-ebpf package and compile its bin to bpfel via build-std + bpf-linker.
+    // aya-build places the resulting object at $OUT_DIR/xdp-dp-ebpf.
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .no_deps()
+        .exec()
+        .context("cargo metadata")?;
+    let ebpf = metadata
+        .packages
+        .into_iter()
+        .find(|p| p.name.as_str() == "xdp-dp-ebpf")
+        .ok_or_else(|| anyhow!("xdp-dp-ebpf package not found"))?;
+    let root_dir = ebpf
+        .manifest_path
+        .parent()
+        .ok_or_else(|| anyhow!("no parent dir for {}", ebpf.manifest_path))?
+        .to_string();
+    aya_build::build_ebpf(
+        [Package { name: "xdp-dp-ebpf", root_dir: root_dir.as_str(), ..Default::default() }],
+        Toolchain::default(),
+    )
+}
+```
+> NOTE: match `aya-build` 0.1.3's actual API. If `Package`/`Toolchain`/`build_ebpf` differ
+> (e.g. field names or `Toolchain::default()` vs an explicit variant), use the names from
+> `cargo doc -p aya-build --open` or docs.rs/aya-build/0.1.3. `Toolchain::default()` must use
+> the ambient cargo (this host has no rustup, so it must NOT shell out to `cargo +nightly`).
+> If it tries to, switch to whatever variant means "current toolchain" and note it as a concern.
+
+- [ ] **Step 3: Write the loader that embeds and attaches the eBPF object**
 
 `xdp-dp/src/loader.rs`:
 ```rust
@@ -465,13 +521,15 @@ use anyhow::Context;
 use aya::programs::{Xdp, XdpFlags};
 use aya::Ebpf;
 
-/// Embedded eBPF object, built by `cargo xtask` before the userspace build.
-static EBPF_OBJECT: &[u8] =
-    include_bytes!("../../xdp-dp-ebpf/target/bpfel-unknown-none/release/xdp-dp");
+/// Load the eBPF object that aya-build compiled to bpfel and placed in OUT_DIR.
+pub fn load_ebpf() -> anyhow::Result<Ebpf> {
+    Ebpf::load(aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/xdp-dp-ebpf")))
+        .context("load ebpf object")
+}
 
 /// Load the eBPF object and attach `uplink_rx` to the named uplink interface.
 pub fn attach_uplink(iface: &str) -> anyhow::Result<Ebpf> {
-    let mut ebpf = Ebpf::load(EBPF_OBJECT).context("load ebpf object")?;
+    let mut ebpf = load_ebpf()?;
     let prog: &mut Xdp = ebpf
         .program_mut("uplink_rx")
         .context("uplink_rx program missing")?
@@ -483,7 +541,7 @@ pub fn attach_uplink(iface: &str) -> anyhow::Result<Ebpf> {
 }
 ```
 
-- [ ] **Step 3: Write the CLI entrypoint**
+- [ ] **Step 4: Write the CLI entrypoint**
 
 `xdp-dp/src/main.rs`:
 ```rust
@@ -521,31 +579,31 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 4: Build the ebpf object then the userspace binary**
+- [ ] **Step 5: Build the userspace binary (this compiles the eBPF object via build.rs)**
 
-Run:
-```bash
-cargo run -p xtask -- --release
-cargo build -p xdp-dp
-```
-Expected: both succeed (the `include_bytes!` path now exists).
+Run: `cargo build -p xdp-dp`
+Expected: succeeds. The first build runs `build.rs` → `aya-build` compiles `xdp-dp-ebpf` to
+bpfel and writes `$OUT_DIR/xdp-dp-ebpf`, which `include_bytes_aligned!` then embeds. If the
+build fails inside aya-build, capture the exact error (toolchain/linker) and report it — do
+not paper over it.
 
-- [ ] **Step 5: Smoke-test attach on a throwaway veth (needs root)**
+- [ ] **Step 6: Smoke-test attach on a throwaway veth (needs root)**
 
-Run:
+This step needs root/CAP_BPF; the controller will run it or hand it to the user. Commands:
 ```bash
 sudo ip link add veth-smoke type veth peer name veth-smoke-peer
-sudo target/debug/xdp-dp load --uplink veth-smoke &
+sudo ./target/debug/xdp-dp load --uplink veth-smoke &
 sleep 1; sudo bpftool prog show | grep -i xdp && echo ATTACH_OK
 sudo kill %1; sudo ip link del veth-smoke
 ```
-Expected: `ATTACH_OK` and a visible xdp prog.
+Expected: `ATTACH_OK` and a visible xdp prog. (`bpftool` is provided by the iproute2/kernel
+tooling; if absent, verify via `ip link show veth-smoke` reporting an attached `xdp` prog id.)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add xdp-dp
-git commit -m "feat(userspace): load and attach XDP datapath via aya"
+git add xdp-dp Cargo.toml
+git commit -m "feat(userspace): load and attach XDP datapath via aya (aya-build)"
 ```
 
 ---
@@ -555,26 +613,58 @@ git commit -m "feat(userspace): load and attach XDP datapath via aya"
 ### Task 6: Vendor the proto and generate the service
 
 **Files:**
-- Create: `proto/dpdk.proto`
-- Create: `xdp-dp/build.rs`
+- Create: `proto/dpdk.proto` (+ any imported protos)
+- Modify: `xdp-dp/build.rs` (Task 5 created it for aya-build; here we ALSO compile the proto)
+- Modify: `xdp-dp/Cargo.toml` (add `tonic-build` build-dependency)
 - Modify: `xdp-dp/src/main.rs`
 
 - [ ] **Step 1: Vendor the proto**
 
 Fetch the real proto (and any files it `import`s) from the dpservice repo into `proto/`:
 ```bash
+mkdir -p proto
 curl -fsSL https://raw.githubusercontent.com/ironcore-dev/dpservice/main/proto/dpdk.proto -o proto/dpdk.proto
 ```
 If `dpdk.proto` has `import` lines, fetch those siblings into `proto/` too (re-run curl per import path). Confirm `head -5 proto/dpdk.proto` shows `syntax = "proto3";` and `package dpdkironcore.v1;`.
 
-- [ ] **Step 2: Write the tonic build script**
+- [ ] **Step 2: Add the tonic-build dependency and extend build.rs**
 
-`xdp-dp/build.rs`:
+Add to `xdp-dp/Cargo.toml` under `[build-dependencies]` (keep the aya-build entries):
+```toml
+tonic-build = "0.12"
+```
+Then EXTEND the existing `xdp-dp/build.rs` (created in Task 5 for aya-build) so it ALSO
+compiles the proto. The file becomes:
 ```rust
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+use anyhow::{anyhow, Context as _};
+use aya_build::{Package, Toolchain};
+
+fn main() -> anyhow::Result<()> {
+    // 1) Compile the eBPF object via aya-build (unchanged from Task 5).
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .no_deps()
+        .exec()
+        .context("cargo metadata")?;
+    let ebpf = metadata
+        .packages
+        .into_iter()
+        .find(|p| p.name.as_str() == "xdp-dp-ebpf")
+        .ok_or_else(|| anyhow!("xdp-dp-ebpf package not found"))?;
+    let root_dir = ebpf
+        .manifest_path
+        .parent()
+        .ok_or_else(|| anyhow!("no parent dir for {}", ebpf.manifest_path))?
+        .to_string();
+    aya_build::build_ebpf(
+        [Package { name: "xdp-dp-ebpf", root_dir: root_dir.as_str(), ..Default::default() }],
+        Toolchain::default(),
+    )?;
+
+    // 2) Generate the DPDKironcore gRPC service (server only).
     tonic_build::configure()
         .build_client(false)
-        .compile_protos(&["../proto/dpdk.proto"], &["../proto"])?;
+        .compile_protos(&["../proto/dpdk.proto"], &["../proto"])
+        .context("tonic-build compile dpdk.proto")?;
     println!("cargo:rerun-if-changed=../proto/dpdk.proto");
     Ok(())
 }
