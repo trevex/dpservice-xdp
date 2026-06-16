@@ -17,5 +17,5 @@ which = "6"
 path = "src/lib.rs"
 
 [[bin]]
-name = "xdp-dp-ebpf"
+name = "xdp-dp-prog"
 path = "src/main.rs"
