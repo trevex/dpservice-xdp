@@ -1,3 +1,7 @@
+pub mod pb {
+    tonic::include_proto!("dpdkironcore.v1");
+}
+
 mod loader;
 
 use clap::{Parser, Subcommand};
