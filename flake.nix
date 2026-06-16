@@ -21,10 +21,16 @@
       let
         overlays = [ (import rust-overlay) go-overlay.overlays.default ];
         pkgs = import nixpkgs { inherit system overlays; };
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" "rust-analyzer" "rustfmt" "clippy" ];
-          targets = [ "wasm32-unknown-unknown" ];
-        };
+        # Single nightly toolchain (no rustup on this host): the ambient cargo must be
+        # nightly so it can build the eBPF crate for the BPF target via -Z build-std=core.
+        # selectLatestNightlyWith pins to the latest nightly in the locked rust-overlay.
+        # rust-src is required so `-Z build-std=core` can compile core for the BPF target.
+        # NOTE: bpfel-unknown-none is a built-in rustc target compiled via build-std; it is
+        # NOT a downloadable rustup `targets` component, so it must not be listed there.
+        rustToolchain = pkgs.rust-bin.selectLatestNightlyWith (toolchain:
+          toolchain.default.override {
+            extensions = [ "rust-src" "rust-analyzer" "rustfmt" "clippy" ];
+          });
         go = pkgs.go-bin.latest;
         pre-commit-check = git-hooks.lib.${system}.run {
           src = ./.;
@@ -53,6 +59,16 @@
             pkgs.wasm-tools
             pkgs.mdbook
             pkgs.mdbook-mermaid
+            # eBPF + gRPC + VM harness tooling
+            pkgs.bpf-linker
+            pkgs.protobuf
+            pkgs.grpcurl
+            pkgs.qemu
+            pkgs.libvirt
+            pkgs.OVMF
+            pkgs.iproute2
+            pkgs.bridge-utils
+            pkgs.kubectl
           ];
 
           packages = [
@@ -60,6 +76,7 @@
           ];
 
           RUST_BACKTRACE = 1;
+          PROTOC = "${pkgs.protobuf}/bin/protoc";
         };
       });
 }
