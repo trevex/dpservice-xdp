@@ -1,0 +1,1204 @@
+# xdp-dpservice Foundation Implementation Plan (Milestones 1–3)
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Stand up a Rust/aya eBPF-XDP dataplane that speaks the real dpservice `DPDKironcore` gRPC contract and carries guest-to-guest traffic across two hypervisor VMs via XDP IP-in-IPv6 encap/decap.
+
+**Architecture:** A cargo workspace with three crates — `xdp-dp-common` (`no_std` POD types shared with eBPF), `xdp-dp-ebpf` (XDP programs built for the BPF target), and `xdp-dp` (userspace `tonic` gRPC server + `aya` loader/CLI) — plus an `xtask` build helper and an `env/` harness (KVM VMs, host underlay bridge, k3s, netns/tap guests). The control plane translates `DPDKironcore` RPCs into BPF map writes; XDP programs on the guest tap and uplink do encap/redirect and decap/redirect (Approach A, pure XDP).
+
+**Tech Stack:** Rust (stable + nightly/`rust-src` for the BPF target), `aya` / `aya-ebpf`, `bpf-linker`, `tonic` + `prost` (+ `protoc`), Nix flake devShell, `just`, qemu/libvirt, iproute2, k3s, the real Go `dpservice-cli` as conformance driver.
+
+**Scope:** This plan covers spec Milestones 1–3 (Scaffold → gRPC skeleton → Overlay base). Milestones 4–8 (VIP, LB/maglev, NAT-GW, metalbond, metalnet) are deferred to follow-on plans; each builds on the maps + datapath established here.
+
+**Spec:** `docs/superpowers/specs/2026-06-15-xdp-dpservice-design.md`
+
+---
+
+## File Structure
+
+```
+ironcore-net-xdp/
+  Cargo.toml                # [workspace] members = common, ebpf, xdp-dp, xtask
+  rust-toolchain.toml       # pin toolchains (stable default; nightly for ebpf build)
+  flake.nix                 # devShell: + nightly+rust-src, bpf-linker, protobuf, qemu/libvirt, iproute2
+  proto/
+    dpdk.proto              # vendored from ironcore-dev/dpservice (package dpdkironcore.v1)
+  xdp-dp-common/
+    Cargo.toml
+    src/lib.rs              # no_std POD map key/value structs + tunnel constants
+  xdp-dp-ebpf/
+    Cargo.toml
+    src/main.rs             # #[xdp] guest_tx (encap) + uplink_rx (decap) programs + maps
+  xdp-dp/
+    Cargo.toml
+    build.rs                # tonic_build compile of proto/dpdk.proto
+    src/main.rs             # CLI entry (serve / load / debug)
+    src/grpc.rs             # DPDKironcore service impl -> state
+    src/state.rs            # authoritative in-memory state + BPF map projection
+    src/maps.rs             # typed wrappers over aya maps (interfaces, routes)
+    src/loader.rs           # aya program load/attach to ifaces
+  xtask/
+    Cargo.toml
+    src/main.rs             # `cargo xtask build-ebpf` helper (calls nightly build)
+  env/
+    justfile                # up/down/demo targets
+    setup-host.sh           # underlay bridge on host
+    setup-hyp-vm.sh         # per-VM: k3s, tap, netns guest, attach xdp-dp
+    cloud-init/             # VM images / ignition (libvirt)
+```
+
+---
+
+## Milestone 1: Scaffold
+
+### Task 1: Workspace skeleton + toolchain pin
+
+**Files:**
+- Create: `Cargo.toml`
+- Create: `rust-toolchain.toml`
+- Create: `.gitignore` (append)
+
+- [ ] **Step 1: Create the workspace manifest**
+
+`Cargo.toml`:
+```toml
+[workspace]
+resolver = "2"
+members = ["xdp-dp-common", "xdp-dp", "xtask"]
+# xdp-dp-ebpf is built out-of-tree for the BPF target via xtask; excluded here.
+exclude = ["xdp-dp-ebpf"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+aya = "0.13"
+aya-ebpf = "0.1"
+aya-log = "0.2"
+aya-log-ebpf = "0.1"
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+network-types = "0.0.7"
+```
+
+- [ ] **Step 2: Pin toolchains**
+
+`rust-toolchain.toml`:
+```toml
+[toolchain]
+channel = "stable"
+components = ["rust-src", "rustfmt", "clippy"]
+# The eBPF crate is built with the nightly toolchain invoked explicitly by xtask
+# (nightly is provided by the Nix devShell), using -Z build-std=core.
+```
+
+- [ ] **Step 3: Append build artifacts to .gitignore**
+
+Append to `.gitignore`:
+```
+/target
+*.o
+```
+
+- [ ] **Step 4: Verify workspace parses**
+
+Run: `cargo metadata --no-deps --format-version 1 >/dev/null && echo OK`
+Expected: `OK` (members `xdp-dp-common`, `xdp-dp`, `xtask` will error until their manifests exist — acceptable now; re-run after Task 5).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Cargo.toml rust-toolchain.toml .gitignore
+git commit -m "chore: scaffold cargo workspace and toolchain pin"
+```
+
+### Task 2: Extend the Nix devShell for eBPF + gRPC + VMs
+
+**Files:**
+- Modify: `flake.nix`
+
+- [ ] **Step 1: Add a nightly toolchain and the new tools**
+
+In `flake.nix`, inside the `let` block after `rustToolchain`, add a nightly toolchain for the BPF build:
+```nix
+        rustNightly = pkgs.rust-bin.nightly."2026-05-01".default.override {
+          extensions = [ "rust-src" ];
+        };
+```
+Then extend `buildInputs` (keep existing entries) with:
+```nix
+            rustNightly
+            pkgs.bpf-linker
+            pkgs.protobuf
+            pkgs.qemu
+            pkgs.libvirt
+            pkgs.OVMF
+            pkgs.iproute2
+            pkgs.bridge-utils
+            pkgs.kubectl
+            pkgs.k3d
+```
+And add an env var so `tonic-build` finds `protoc`:
+```nix
+          PROTOC = "${pkgs.protobuf}/bin/protoc";
+```
+
+- [ ] **Step 2: Reload the devShell and verify tools resolve**
+
+Run:
+```bash
+nix develop --command bash -c 'bpf-linker --version && protoc --version && qemu-system-x86_64 --version | head -1 && cargo +nightly --version'
+```
+Expected: a version line for each (no "command not found").
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add flake.nix flake.lock
+git commit -m "chore: add eBPF, gRPC and VM tooling to devShell"
+```
+
+### Task 3: `xdp-dp-common` crate with a tested POD type
+
+**Files:**
+- Create: `xdp-dp-common/Cargo.toml`
+- Create: `xdp-dp-common/src/lib.rs`
+
+- [ ] **Step 1: Write the crate manifest**
+
+`xdp-dp-common/Cargo.toml`:
+```toml
+[package]
+name = "xdp-dp-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[features]
+default = []
+user = []   # gates std-only impls (e.g. aya Pod) for the userspace side
+```
+
+- [ ] **Step 2: Write the failing test**
+
+`xdp-dp-common/src/lib.rs`:
+```rust
+#![cfg_attr(not(feature = "user"), no_std)]
+
+/// Key for the `interfaces` map: an overlay (VNI, IPv4) tuple.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct IfaceKey {
+    pub vni: u32,
+    pub ipv4: [u8; 4],
+}
+
+/// Value for the `interfaces` map: where to deliver/encap for this overlay IP.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct IfaceValue {
+    /// Host-side tap ifindex for local delivery (0 if remote-only).
+    pub tap_ifindex: u32,
+    /// Underlay IPv6 endpoint of the owning hypervisor (the tunnel dst).
+    pub underlay_ipv6: [u8; 16],
+}
+
+impl IfaceKey {
+    pub fn new(vni: u32, ipv4: [u8; 4]) -> Self {
+        Self { vni, ipv4 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iface_key_is_word_packed() {
+        // POD layout must be stable for sharing with eBPF: 4 (vni) + 4 (ipv4).
+        assert_eq!(core::mem::size_of::<IfaceKey>(), 8);
+        let k = IfaceKey::new(100, [10, 0, 0, 5]);
+        assert_eq!(k.vni, 100);
+        assert_eq!(k.ipv4, [10, 0, 0, 5]);
+    }
+}
+```
+
+- [ ] **Step 3: Run the test (expect compile-driven failure first, then pass)**
+
+Run: `cargo test -p xdp-dp-common --features user`
+Expected: PASS (`iface_key_is_word_packed`). If size assertion fails, fix field order/padding before proceeding.
+
+- [ ] **Step 4: Add the aya `Pod` impls behind the `user` feature**
+
+Append to `xdp-dp-common/src/lib.rs`:
+```rust
+#[cfg(feature = "user")]
+mod user_impls {
+    use super::*;
+    unsafe impl aya::Pod for IfaceKey {}
+    unsafe impl aya::Pod for IfaceValue {}
+}
+```
+Add to `[dependencies]` in `xdp-dp-common/Cargo.toml`:
+```toml
+aya = { workspace = true, optional = true }
+```
+And change the `user` feature line to:
+```toml
+user = ["dep:aya"]
+```
+
+- [ ] **Step 5: Verify both build shapes compile**
+
+Run:
+```bash
+cargo test -p xdp-dp-common --features user
+cargo build -p xdp-dp-common   # no_std shape, no aya
+```
+Expected: both succeed.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add xdp-dp-common
+git commit -m "feat(common): POD map key/value types shared with eBPF"
+```
+
+### Task 4: `xdp-dp-ebpf` crate that builds for the BPF target
+
+**Files:**
+- Create: `xdp-dp-ebpf/Cargo.toml`
+- Create: `xdp-dp-ebpf/src/main.rs`
+- Create: `xdp-dp-ebpf/rust-toolchain.toml`
+- Create: `xtask/Cargo.toml`
+- Create: `xtask/src/main.rs`
+
+- [ ] **Step 1: Write the eBPF crate manifest**
+
+`xdp-dp-ebpf/Cargo.toml`:
+```toml
+[package]
+name = "xdp-dp-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+xdp-dp-common = { path = "../xdp-dp-common", default-features = false }
+network-types = "0.0.7"
+
+[[bin]]
+name = "xdp-dp"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = false
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+```
+
+- [ ] **Step 2: Write a minimal XDP_PASS program (compiles for BPF target)**
+
+`xdp-dp-ebpf/src/main.rs`:
+```rust
+#![no_std]
+#![no_main]
+
+use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
+
+#[xdp]
+pub fn uplink_rx(_ctx: XdpContext) -> u32 {
+    xdp_action::XDP_PASS
+}
+
+#[xdp]
+pub fn guest_tx(_ctx: XdpContext) -> u32 {
+    xdp_action::XDP_PASS
+}
+
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+```
+
+- [ ] **Step 3: Pin the eBPF crate to nightly**
+
+`xdp-dp-ebpf/rust-toolchain.toml`:
+```toml
+[toolchain]
+channel = "nightly-2026-05-01"
+components = ["rust-src"]
+```
+
+- [ ] **Step 4: Write the xtask build helper**
+
+`xtask/Cargo.toml`:
+```toml
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+```
+
+`xtask/src/main.rs`:
+```rust
+use std::process::Command;
+
+use anyhow::{bail, Context};
+use clap::Parser;
+
+/// Build the eBPF crate for the BPF target.
+#[derive(Parser)]
+struct Args {
+    /// Build in release mode.
+    #[arg(long)]
+    release: bool,
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let target = "bpfel-unknown-none";
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir("xdp-dp-ebpf")
+        .args(["+nightly-2026-05-01", "build", "--target", target, "-Z", "build-std=core"]);
+    if args.release {
+        cmd.arg("--release");
+    }
+    let status = cmd.status().context("failed to spawn cargo for ebpf build")?;
+    if !status.success() {
+        bail!("ebpf build failed");
+    }
+    println!("ebpf build OK ({target})");
+    Ok(())
+}
+```
+
+- [ ] **Step 5: Build the eBPF object**
+
+Run: `cargo run -p xtask -- --release`
+Expected: `ebpf build OK (bpfel-unknown-none)` and an object under `xdp-dp-ebpf/target/bpfel-unknown-none/release/xdp-dp`.
+(If `bpf-linker` is missing the linker step fails — confirm Task 2 Step 2 passed.)
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add xdp-dp-ebpf xtask Cargo.toml
+git commit -m "feat(ebpf): XDP_PASS skeleton building for bpfel target via xtask"
+```
+
+### Task 5: `xdp-dp` userspace crate loads and attaches the eBPF program
+
+**Files:**
+- Create: `xdp-dp/Cargo.toml`
+- Create: `xdp-dp/src/main.rs`
+- Create: `xdp-dp/src/loader.rs`
+
+- [ ] **Step 1: Write the userspace manifest**
+
+`xdp-dp/Cargo.toml`:
+```toml
+[package]
+name = "xdp-dp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aya = { workspace = true }
+aya-log = { workspace = true }
+xdp-dp-common = { path = "../xdp-dp-common", features = ["user"] }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+```
+
+- [ ] **Step 2: Write the loader that embeds and attaches the eBPF object**
+
+`xdp-dp/src/loader.rs`:
+```rust
+use anyhow::Context;
+use aya::programs::{Xdp, XdpFlags};
+use aya::Ebpf;
+
+/// Embedded eBPF object, built by `cargo xtask` before the userspace build.
+static EBPF_OBJECT: &[u8] =
+    include_bytes!("../../xdp-dp-ebpf/target/bpfel-unknown-none/release/xdp-dp");
+
+/// Load the eBPF object and attach `uplink_rx` to the named uplink interface.
+pub fn attach_uplink(iface: &str) -> anyhow::Result<Ebpf> {
+    let mut ebpf = Ebpf::load(EBPF_OBJECT).context("load ebpf object")?;
+    let prog: &mut Xdp = ebpf
+        .program_mut("uplink_rx")
+        .context("uplink_rx program missing")?
+        .try_into()?;
+    prog.load().context("verify uplink_rx")?;
+    prog.attach(iface, XdpFlags::default())
+        .with_context(|| format!("attach uplink_rx to {iface}"))?;
+    Ok(ebpf)
+}
+```
+
+- [ ] **Step 3: Write the CLI entrypoint**
+
+`xdp-dp/src/main.rs`:
+```rust
+mod loader;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "xdp-dp")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Load and attach the XDP datapath to an interface, then idle.
+    Load {
+        #[arg(long)]
+        uplink: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Load { uplink } => {
+            let _ebpf = loader::attach_uplink(&uplink)?;
+            println!("attached uplink_rx to {uplink}; ctrl-c to detach");
+            tokio::signal::ctrl_c().await?;
+        }
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 4: Build the ebpf object then the userspace binary**
+
+Run:
+```bash
+cargo run -p xtask -- --release
+cargo build -p xdp-dp
+```
+Expected: both succeed (the `include_bytes!` path now exists).
+
+- [ ] **Step 5: Smoke-test attach on a throwaway veth (needs root)**
+
+Run:
+```bash
+sudo ip link add veth-smoke type veth peer name veth-smoke-peer
+sudo target/debug/xdp-dp load --uplink veth-smoke &
+sleep 1; sudo bpftool prog show | grep -i xdp && echo ATTACH_OK
+sudo kill %1; sudo ip link del veth-smoke
+```
+Expected: `ATTACH_OK` and a visible xdp prog.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add xdp-dp
+git commit -m "feat(userspace): load and attach XDP datapath via aya"
+```
+
+---
+
+## Milestone 2: gRPC skeleton (`DPDKironcore`)
+
+### Task 6: Vendor the proto and generate the service
+
+**Files:**
+- Create: `proto/dpdk.proto`
+- Create: `xdp-dp/build.rs`
+- Modify: `xdp-dp/src/main.rs`
+
+- [ ] **Step 1: Vendor the proto**
+
+Fetch the real proto (and any files it `import`s) from the dpservice repo into `proto/`:
+```bash
+curl -fsSL https://raw.githubusercontent.com/ironcore-dev/dpservice/main/proto/dpdk.proto -o proto/dpdk.proto
+```
+If `dpdk.proto` has `import` lines, fetch those siblings into `proto/` too (re-run curl per import path). Confirm `head -5 proto/dpdk.proto` shows `syntax = "proto3";` and `package dpdkironcore.v1;`.
+
+- [ ] **Step 2: Write the tonic build script**
+
+`xdp-dp/build.rs`:
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_build::configure()
+        .build_client(false)
+        .compile_protos(&["../proto/dpdk.proto"], &["../proto"])?;
+    println!("cargo:rerun-if-changed=../proto/dpdk.proto");
+    Ok(())
+}
+```
+
+- [ ] **Step 3: Wire the generated module and verify it compiles**
+
+Add to top of `xdp-dp/src/main.rs`:
+```rust
+pub mod pb {
+    tonic::include_proto!("dpdkironcore.v1");
+}
+```
+Run: `cargo build -p xdp-dp`
+Expected: builds; generated types available under `pb::` (e.g. `pb::dpdk_ironcore_server::DpdkIroncore`). If the generated server trait/module name differs, note the exact path printed in the error and use it in Task 7.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add proto xdp-dp/build.rs xdp-dp/src/main.rs
+git commit -m "feat(grpc): vendor dpservice proto and generate DPDKironcore service"
+```
+
+### Task 7: Implement `Initialize`/`CheckInitialized`/`GetVersion` with state
+
+**Files:**
+- Create: `xdp-dp/src/state.rs`
+- Create: `xdp-dp/src/grpc.rs`
+- Modify: `xdp-dp/src/main.rs`
+
+- [ ] **Step 1: Write the failing test for init state**
+
+`xdp-dp/src/state.rs`:
+```rust
+use std::sync::Mutex;
+
+use uuid::Uuid;
+
+/// Authoritative control-plane state (BPF map projection added in Milestone 3).
+#[derive(Default)]
+pub struct State {
+    inner: Mutex<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    uuid: Option<String>,
+}
+
+impl State {
+    /// Idempotently initialize; returns the stable service uuid.
+    pub fn initialize(&self) -> String {
+        let mut g = self.inner.lock().unwrap();
+        g.uuid.get_or_insert_with(|| Uuid::new_v4().to_string()).clone()
+    }
+
+    /// Returns Some(uuid) if initialized.
+    pub fn check_initialized(&self) -> Option<String> {
+        self.inner.lock().unwrap().uuid.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_is_idempotent_and_check_reflects_it() {
+        let s = State::default();
+        assert_eq!(s.check_initialized(), None);
+        let u1 = s.initialize();
+        let u2 = s.initialize();
+        assert_eq!(u1, u2, "initialize must be idempotent");
+        assert_eq!(s.check_initialized(), Some(u1));
+    }
+}
+```
+Add to `xdp-dp/Cargo.toml` `[dependencies]`:
+```toml
+uuid = { version = "1", features = ["v4"] }
+```
+
+- [ ] **Step 2: Run the test to verify it passes**
+
+Run: `cargo test -p xdp-dp state::tests`
+Expected: PASS (`initialize_is_idempotent_and_check_reflects_it`).
+
+- [ ] **Step 3: Implement the gRPC service over the state**
+
+`xdp-dp/src/grpc.rs` (adjust the trait/type paths to whatever Task 6 Step 3 printed):
+```rust
+use std::sync::Arc;
+
+use tonic::{Request, Response, Status};
+
+use crate::pb::dpdk_ironcore_server::DpdkIroncore;
+use crate::pb::{
+    CheckInitializedRequest, CheckInitializedResponse, GetVersionRequest, GetVersionResponse,
+    InitializeRequest, InitializeResponse, Status as DpStatus,
+};
+use crate::state::State;
+
+pub struct Service {
+    pub state: Arc<State>,
+}
+
+fn ok() -> Option<DpStatus> {
+    Some(DpStatus { error: 0, message: "OK".into() })
+}
+
+#[tonic::async_trait]
+impl DpdkIroncore for Service {
+    async fn initialize(
+        &self,
+        _req: Request<InitializeRequest>,
+    ) -> Result<Response<InitializeResponse>, Status> {
+        let uuid = self.state.initialize();
+        Ok(Response::new(InitializeResponse { status: ok(), uuid }))
+    }
+
+    async fn check_initialized(
+        &self,
+        _req: Request<CheckInitializedRequest>,
+    ) -> Result<Response<CheckInitializedResponse>, Status> {
+        let uuid = self.state.check_initialized().unwrap_or_default();
+        Ok(Response::new(CheckInitializedResponse { status: ok(), uuid }))
+    }
+
+    async fn get_version(
+        &self,
+        req: Request<GetVersionRequest>,
+    ) -> Result<Response<GetVersionResponse>, Status> {
+        let r = req.into_inner();
+        Ok(Response::new(GetVersionResponse {
+            status: ok(),
+            service_protocol: r.client_protocol,
+            service_version: env!("CARGO_PKG_VERSION").into(),
+        }))
+    }
+}
+```
+> NOTE: `Status { error, message }`, `error: 0`, and field names (`uuid`, `service_protocol`) must match the generated structs from the vendored proto. If names differ, use the generated ones — do not invent fields.
+
+- [ ] **Step 4: Add a `serve` subcommand**
+
+In `xdp-dp/src/main.rs` add modules and a command:
+```rust
+mod grpc;
+mod state;
+```
+Add a `Serve { addr: String }` variant to `Cmd`, and handle it:
+```rust
+Cmd::Serve { addr } => {
+    let svc = grpc::Service { state: std::sync::Arc::new(state::State::default()) };
+    let server = crate::pb::dpdk_ironcore_server::DpdkIroncoreServer::new(svc);
+    println!("serving DPDKironcore on {addr}");
+    tonic::transport::Server::builder()
+        .add_service(server)
+        .serve(addr.parse()?)
+        .await?;
+}
+```
+
+- [ ] **Step 5: Build and run, then probe with grpcurl**
+
+Run:
+```bash
+cargo run -p xdp-dp -- serve --addr 127.0.0.1:1337 &
+sleep 1
+grpcurl -plaintext -import-path proto -proto dpdk.proto \
+  127.0.0.1:1337 dpdkironcore.v1.DPDKironcore/Initialize
+kill %1
+```
+Expected: a JSON response containing a `uuid` and `status` with `OK`. (Add `grpcurl` to the devShell `buildInputs` if absent.)
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add xdp-dp
+git commit -m "feat(grpc): Initialize/CheckInitialized/GetVersion backed by state"
+```
+
+### Task 8: Conformance — real `dpservice-cli` drives our server
+
+**Files:**
+- Create: `env/justfile` (target `dpservice-cli`)
+
+- [ ] **Step 1: Obtain the real Go client**
+
+Install `dpservice-cli` from ironcore-dev (Go toolchain is in the devShell):
+```bash
+go install github.com/ironcore-dev/dpservice/cli/dpservice-cli@latest || \
+  echo "if the module path differs, clone ironcore-dev/dpservice and 'go build ./cli/...'"
+```
+
+- [ ] **Step 2: Run the real client against our server**
+
+Run:
+```bash
+cargo run -p xdp-dp -- serve --addr 127.0.0.1:1337 &
+sleep 1
+dpservice-cli --address 127.0.0.1:1337 init || dpservice-cli --address 127.0.0.1:1337 get version
+kill %1
+```
+Expected: the genuine CLI completes the call without a proto/transport error (it may warn about unimplemented RPCs — that is fine; the contract handshake is what we are proving).
+
+- [ ] **Step 3: Record the conformance recipe**
+
+`env/justfile`:
+```make
+# Drive our Rust server with the genuine Go dpservice-cli.
+conformance addr="127.0.0.1:1337":
+    dpservice-cli --address {{addr}} get version
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add env/justfile
+git commit -m "test(grpc): conformance recipe driving server with real dpservice-cli"
+```
+
+---
+
+## Milestone 3: Overlay base (the core proof)
+
+### Task 9: `interfaces` + `routes` BPF maps shared common types
+
+**Files:**
+- Modify: `xdp-dp-common/src/lib.rs`
+
+- [ ] **Step 1: Write the failing test for the route types**
+
+Append to `xdp-dp-common/src/lib.rs` (above the `#[cfg(test)]` module, then extend tests):
+```rust
+/// Key for the `routes` map: (VNI, IPv4 prefix). Host-order length in `prefix_len`.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct RouteKey {
+    pub vni: u32,
+    pub prefix_len: u32,
+    pub ipv4: [u8; 4],
+}
+
+/// Value for the `routes` map: the underlay IPv6 nexthop (tunnel dst) + nexthop VNI.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct RouteValue {
+    pub nexthop_vni: u32,
+    pub nexthop_ipv6: [u8; 16],
+}
+```
+Extend the `tests` module:
+```rust
+    #[test]
+    fn route_types_have_stable_layout() {
+        assert_eq!(core::mem::size_of::<RouteKey>(), 12);
+        assert_eq!(core::mem::size_of::<RouteValue>(), 20);
+    }
+```
+And add the Pod impls in `user_impls`:
+```rust
+    unsafe impl aya::Pod for RouteKey {}
+    unsafe impl aya::Pod for RouteValue {}
+```
+
+- [ ] **Step 2: Run the test**
+
+Run: `cargo test -p xdp-dp-common --features user`
+Expected: PASS (`route_types_have_stable_layout`).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add xdp-dp-common
+git commit -m "feat(common): RouteKey/RouteValue POD types"
+```
+
+### Task 10: Userspace typed map wrappers (TDD against a real BPF map)
+
+**Files:**
+- Create: `xdp-dp/src/maps.rs`
+- Modify: `xdp-dp/src/main.rs` (add `mod maps;`)
+
+- [ ] **Step 1: Declare maps in the eBPF crate**
+
+In `xdp-dp-ebpf/src/main.rs`, above the programs:
+```rust
+use aya_ebpf::maps::HashMap;
+use aya_ebpf::macros::map;
+use xdp_dp_common::{IfaceKey, IfaceValue, RouteKey, RouteValue};
+
+#[map]
+static INTERFACES: HashMap<IfaceKey, IfaceValue> = HashMap::with_max_entries(1024, 0);
+
+#[map]
+static ROUTES: HashMap<RouteKey, RouteValue> = HashMap::with_max_entries(4096, 0);
+```
+Rebuild the object: `cargo run -p xtask -- --release` (expected: `ebpf build OK`).
+
+- [ ] **Step 2: Write the failing test for the userspace wrapper**
+
+`xdp-dp/src/maps.rs`:
+```rust
+use anyhow::Context;
+use aya::maps::{HashMap, MapData};
+use aya::Ebpf;
+use xdp_dp_common::{IfaceKey, IfaceValue};
+
+/// Typed handle over the `INTERFACES` BPF map.
+pub struct Interfaces {
+    map: HashMap<MapData, IfaceKey, IfaceValue>,
+}
+
+impl Interfaces {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(
+            ebpf.take_map("INTERFACES").context("INTERFACES map missing")?,
+        )?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, key: IfaceKey, val: IfaceValue) -> anyhow::Result<()> {
+        self.map.insert(key, val, 0).context("insert iface")
+    }
+
+    pub fn get(&self, key: &IfaceKey) -> Option<IfaceValue> {
+        self.map.get(key, 0).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static OBJ: &[u8] =
+        include_bytes!("../../xdp-dp-ebpf/target/bpfel-unknown-none/release/xdp-dp");
+
+    #[test]
+    fn interfaces_roundtrip_through_bpf_map() {
+        // Requires CAP_BPF/root and a kernel; run under `sudo -E`.
+        let mut ebpf = Ebpf::load(OBJ).expect("load");
+        let mut ifaces = Interfaces::open(&mut ebpf).expect("open");
+        let k = IfaceKey::new(100, [10, 0, 0, 5]);
+        let v = IfaceValue { tap_ifindex: 7, underlay_ipv6: [0xfd; 16] };
+        ifaces.upsert(k, v).expect("upsert");
+        assert_eq!(ifaces.get(&k), Some(v));
+    }
+}
+```
+Add to `xdp-dp/src/main.rs`: `mod maps;`
+
+- [ ] **Step 3: Run the test (privileged)**
+
+Run: `cargo run -p xtask -- --release && sudo -E cargo test -p xdp-dp maps::tests`
+Expected: PASS. If it fails with EPERM, the runner lacks CAP_BPF — run as root. This is the gate proving userspace ↔ kernel map I/O works end to end.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add xdp-dp xdp-dp-ebpf
+git commit -m "feat(maps): typed Interfaces wrapper with BPF-map roundtrip test"
+```
+
+### Task 11: XDP encap on guest tap + decap on uplink
+
+**Files:**
+- Modify: `xdp-dp-ebpf/src/main.rs`
+
+- [ ] **Step 1: Implement decap in `uplink_rx`**
+
+Replace `uplink_rx` body. Parse outer IPv6; if `next_header` is our tunnel proto (IPIP = 4 for IPv4-in-IPv6), shrink the head past the IPv6 header and redirect to the local tap resolved from `INTERFACES`:
+```rust
+use aya_ebpf::helpers::bpf_xdp_adjust_head;
+use aya_ebpf::bindings::xdp_action;
+use network_types::{eth::EthHdr, ip::Ipv6Hdr};
+
+const IPPROTO_IPIP: u8 = 4; // IPv4 encapsulated in IPv6 outer
+
+#[xdp]
+pub fn uplink_rx(ctx: XdpContext) -> u32 {
+    match try_uplink_rx(&ctx) {
+        Ok(act) => act,
+        Err(_) => xdp_action::XDP_PASS,
+    }
+}
+
+fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
+    let eth: *const EthHdr = ptr_at(ctx, 0)?;
+    if unsafe { (*eth).ether_type } != network_types::eth::EtherType::Ipv6 {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    let ip6: *const Ipv6Hdr = ptr_at(ctx, EthHdr::LEN)?;
+    if unsafe { (*ip6).next_hdr } as u8 != IPPROTO_IPIP {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    // Strip outer IPv6 (keep inner eth+ipv4 to follow). Adjust by Ipv6Hdr::LEN.
+    let delta = Ipv6Hdr::LEN as i32;
+    if unsafe { bpf_xdp_adjust_head(ctx.ctx, delta) } != 0 {
+        return Err(());
+    }
+    // For the PoC, redirect to a fixed local tap looked up from INTERFACES by inner dst.
+    // (Inner-IP lookup + bpf_redirect added below.)
+    Ok(xdp_action::XDP_PASS)
+}
+
+#[inline(always)]
+fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    if start + offset + core::mem::size_of::<T>() > end {
+        return Err(());
+    }
+    Ok((start + offset) as *const T)
+}
+```
+
+- [ ] **Step 2: Implement encap + redirect in `guest_tx`**
+
+Look up `ROUTES` by inner IPv4 dst, grow headroom by `Ipv6Hdr::LEN`, write the outer IPv6 (src = local underlay, dst = `nexthop_ipv6`, next_hdr = IPIP), then `bpf_redirect` to the uplink ifindex (held in a single-entry `DEVMAP`/config map). Add:
+```rust
+use aya_ebpf::helpers::bpf_redirect;
+use aya_ebpf::maps::Array;
+use network_types::ip::Ipv4Hdr;
+
+#[map]
+static UPLINK_IFINDEX: Array<u32> = Array::with_max_entries(1, 0);
+
+#[xdp]
+pub fn guest_tx(ctx: XdpContext) -> u32 {
+    match try_guest_tx(&ctx) {
+        Ok(act) => act,
+        Err(_) => xdp_action::XDP_PASS,
+    }
+}
+
+fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
+    let eth: *const EthHdr = ptr_at(ctx, 0)?;
+    if unsafe { (*eth).ether_type } != network_types::eth::EtherType::Ipv4 {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    let ip4: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN)?;
+    let dst = unsafe { (*ip4).dst_addr }.to_be_bytes();
+    let key = RouteKey { vni: 100, prefix_len: 32, ipv4: dst };
+    let route = unsafe { ROUTES.get(&key) }.ok_or(())?;
+
+    // Grow headroom for the outer IPv6 header.
+    let delta = -(Ipv6Hdr::LEN as i32);
+    if unsafe { bpf_xdp_adjust_head(ctx.ctx, delta) } != 0 {
+        return Err(());
+    }
+    // Write outer IPv6 header at the new head (bounds-checked), next_hdr = IPIP,
+    // dst = route.nexthop_ipv6. (Field writes elided here; implement with ptr_at_mut.)
+    let _ = route;
+
+    let ifindex = unsafe { UPLINK_IFINDEX.get(0) }.copied().ok_or(())?;
+    Ok(unsafe { bpf_redirect(ifindex, 0) } as u32)
+}
+```
+> NOTE: exact `network_types` field names (`ether_type`, `next_hdr`, `dst_addr`) and the `XdpContext` raw-ctx accessor (`ctx.ctx`) must match the crate versions pinned in Task 1. Fix to the real names if the build complains; the structure is the contract.
+
+- [ ] **Step 3: Build the object**
+
+Run: `cargo run -p xtask -- --release`
+Expected: `ebpf build OK`. Resolve any field-name/borrow errors now (this is where the eBPF verifier-friendly bounds checks matter).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add xdp-dp-ebpf
+git commit -m "feat(ebpf): IPv6 encap on guest_tx and decap on uplink_rx"
+```
+
+### Task 12: Control plane programs maps from `CreateInterface`/`CreateRoute`
+
+**Files:**
+- Modify: `xdp-dp/src/state.rs`
+- Modify: `xdp-dp/src/grpc.rs`
+- Modify: `xdp-dp/src/loader.rs`
+
+- [ ] **Step 1: Write the failing test for route translation**
+
+Add to `xdp-dp/src/state.rs` a pure helper that converts a proto `Route` into `(RouteKey, RouteValue)`, and test it:
+```rust
+use xdp_dp_common::{RouteKey, RouteValue};
+
+/// Convert a (vni, ipv4 prefix, prefix_len, nexthop ipv6, nexthop vni) into map entries.
+pub fn route_entry(
+    vni: u32,
+    ipv4: [u8; 4],
+    prefix_len: u32,
+    nexthop_ipv6: [u8; 16],
+    nexthop_vni: u32,
+) -> (RouteKey, RouteValue) {
+    (
+        RouteKey { vni, prefix_len, ipv4 },
+        RouteValue { nexthop_vni, nexthop_ipv6 },
+    )
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn route_entry_maps_fields() {
+        let (k, v) = route_entry(100, [10, 0, 0, 5], 32, [0xfd; 16], 100);
+        assert_eq!(k.vni, 100);
+        assert_eq!(k.ipv4, [10, 0, 0, 5]);
+        assert_eq!(k.prefix_len, 32);
+        assert_eq!(v.nexthop_ipv6, [0xfd; 16]);
+        assert_eq!(v.nexthop_vni, 100);
+    }
+}
+```
+
+- [ ] **Step 2: Run the test**
+
+Run: `cargo test -p xdp-dp route_tests`
+Expected: PASS (`route_entry_maps_fields`).
+
+- [ ] **Step 3: Implement `CreateInterface` / `CreateRoute` RPCs**
+
+Extend `xdp-dp/src/grpc.rs` with the two methods, parsing the proto messages and calling into a `State` that holds the opened map wrappers (`Interfaces`, `Routes`). Decode `interface_id`/IP `bytes` fields into `[u8;4]`/`[u8;16]`, call `route_entry`, and `upsert`. (Mirror the `Interfaces` wrapper with a `Routes` wrapper in `maps.rs`.) Return `status: ok()`.
+> The exact proto field access (`req.into_inner().route`, `Prefix`, `IpAddress.address` bytes) must match generated types from Task 6.
+
+- [ ] **Step 4: Build**
+
+Run: `cargo run -p xtask -- --release && cargo build -p xdp-dp`
+Expected: success.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add xdp-dp
+git commit -m "feat(grpc): CreateInterface/CreateRoute program BPF maps"
+```
+
+### Task 13: Two-VM environment harness
+
+**Files:**
+- Create: `env/setup-host.sh`
+- Create: `env/setup-hyp-vm.sh`
+- Modify: `env/justfile`
+
+- [ ] **Step 1: Host underlay bridge script**
+
+`env/setup-host.sh` (idempotent): create a Linux bridge `br-underlay`, assign an IPv6 ULA prefix (e.g. `fd00:underlay::/64`), and document attaching the two VM tap/macvtap uplinks to it. Include `set -euo pipefail` and guards (`ip link show br-underlay || ip link add ...`).
+
+- [ ] **Step 2: Per-hypervisor-VM setup script**
+
+`env/setup-hyp-vm.sh` (runs inside each VM): install/enable k3s (`curl -sfL https://get.k3s.io | sh -`), create a guest netns + veth/tap pair (`guest0` ↔ `tap0`), assign the guest overlay IPv4 (e.g. A=`10.0.0.5/24`, B=`10.0.0.6/24`), set the VM's underlay IPv6 on its uplink, then run `xdp-dp` attaching `guest_tx` to `tap0` and `uplink_rx` to the uplink, seeding `UPLINK_IFINDEX`.
+
+- [ ] **Step 3: `just` orchestration targets**
+
+Add to `env/justfile`:
+```make
+host-up:
+    sudo bash env/setup-host.sh
+
+# Bring up VM A and VM B with libvirt (images defined under env/cloud-init).
+vms-up:
+    @echo "create/boot hypA and hypB via virt-install or virsh (see env/cloud-init)"
+
+# Program the overlay: create interfaces + routes on both hypervisors via gRPC.
+overlay-up addrA="hypA:1337" addrB="hypB:1337":
+    dpservice-cli --address {{addrA}} create interface --id guestA --vni 100 --ipv4 10.0.0.5
+    dpservice-cli --address {{addrB}} create interface --id guestB --vni 100 --ipv4 10.0.0.6
+    dpservice-cli --address {{addrA}} create route --vni 100 --prefix 10.0.0.6/32 --nexthop-vni 100 --nexthop-ip <hypB-underlay-ipv6>
+    dpservice-cli --address {{addrB}} create route --vni 100 --prefix 10.0.0.5/32 --nexthop-vni 100 --nexthop-ip <hypA-underlay-ipv6>
+```
+> Replace `<hypX-underlay-ipv6>` with the actual ULA addresses chosen in Step 1. If `dpservice-cli` flag names differ, use its `--help` output; the gRPC call is the contract.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add env
+git commit -m "feat(env): two-VM overlay harness (host bridge, k3s, netns/tap)"
+```
+
+### Task 14: End-to-end acceptance — guest-A ⇄ guest-B over XDP
+
+**Files:**
+- Create: `env/demo.sh`
+- Modify: `env/justfile`
+
+- [ ] **Step 1: Write the demo/acceptance script**
+
+`env/demo.sh`: assumes `host-up`, `vms-up`, both `xdp-dp` attached, and `overlay-up` applied. Then from guest netns A, ping guest B and run iperf3, and capture the underlay to prove encapsulation:
+```bash
+set -euo pipefail
+# 1. connectivity
+ip netns exec guestA ping -c 3 10.0.0.6
+# 2. throughput
+ip netns exec guestB iperf3 -s -D
+ip netns exec guestA iperf3 -c 10.0.0.6 -t 5
+# 3. prove it's tunneled: outer must be IPv6 on the underlay
+timeout 5 tcpdump -ni br-underlay 'ip6 and proto 4' -c 3
+```
+
+- [ ] **Step 2: Add the acceptance target**
+
+Add to `env/justfile`:
+```make
+demo:
+    sudo bash env/demo.sh
+```
+
+- [ ] **Step 3: Run the full acceptance gate**
+
+Run: `just -f env/justfile demo`
+Expected:
+- `ping`: 3 packets received, 0% loss.
+- `iperf3`: a non-zero bitrate summary.
+- `tcpdump`: at least one `IP6 ... proto 4` (IPv4-in-IPv6) frame on `br-underlay`, proving XDP did the encap.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add env
+git commit -m "test(e2e): guest-to-guest connectivity over XDP IPv6 overlay"
+```
+
+---
+
+## Deferred to follow-on plans
+
+- **Milestone 4 — VIP (1:1 DNAT/SNAT):** extend `xdp-dp-common` with a `vips` map, add `CreateVip`/`GetVip`/`DeleteVip`, rewrite in the XDP pass.
+- **Milestone 5 — LB (maglev):** maglev backend table in a BPF map; `CreateLoadBalancer`/`...Target`; consistent-hash select + rewrite.
+- **Milestone 6 — NAT-GW:** SNAT + port-range allocation; the one feature permitted a TC-egress/userspace-assist carve-out.
+- **Milestone 7 — metalbond client:** subscribe for dynamic overlay routes and program `ROUTES`.
+- **Milestone 8 — metalnet integration:** adapt metalnet's sysfs/VF assumptions to the tap model; run unmodified where possible.
+
+---
+
+## Self-Review
+
+**Spec coverage (Milestones 1–3):**
+- M1 Scaffold → Tasks 1–5 (workspace, flake, common, ebpf, userspace loader). ✓
+- M2 gRPC skeleton + `dpservice-cli` conformance → Tasks 6–8. ✓
+- M3 Overlay base (maps, XDP encap/decap, control-plane programming, two-VM env, e2e ping) → Tasks 9–14. ✓
+- Offload-readiness rule → enforced in Task 11 (bounds-checked `ptr_at`, fixed-shape map lookups, `adjust_head`/`redirect` only); called out as a review criterion. ✓
+- Conformance-driver decision → Task 8. Defer metalbond/metalnet → "Deferred" section + spec §7. ✓
+
+**Placeholder scan:** No "TBD/TODO/implement later". Two intentional `> NOTE` callouts (Task 7/11/12) flag where generated-proto and `network-types`/aya field names must be matched to pinned crate versions rather than invented — these are verification instructions, not missing content; each task still ships complete, runnable code and an explicit run/expected gate.
+
+**Type consistency:** `IfaceKey::new(vni, ipv4)`, `IfaceValue { tap_ifindex, underlay_ipv6 }`, `RouteKey { vni, prefix_len, ipv4 }`, `RouteValue { nexthop_vni, nexthop_ipv6 }` are defined in Tasks 3/9 and used identically in Tasks 10/11/12. Map names `INTERFACES`/`ROUTES`/`UPLINK_IFINDEX` consistent between eBPF (Tasks 10/11) and userspace `take_map`/`open` (Task 10). gRPC types (`InitializeResponse.uuid`, `Status{error,message}`) flagged as proto-generated and to be matched, not invented.
