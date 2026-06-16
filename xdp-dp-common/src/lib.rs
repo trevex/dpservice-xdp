@@ -41,6 +41,32 @@ pub struct RouteValue {
     pub nexthop_ipv6: [u8; 16],
 }
 
+/// Single-entry `CONFIG` map: per-hypervisor datapath parameters for the PoC's
+/// CONFIG-driven single-peer overlay (one guest + one peer hypervisor). The XDP programs
+/// read entry 0; the control plane populates it. MACs/ifindexes are filled at e2e time.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct Config {
+    /// Overlay VNI this hypervisor's guest belongs to.
+    pub vni: u32,
+    /// ifindex of the underlay-facing uplink (encap redirect target).
+    pub uplink_ifindex: u32,
+    /// ifindex of the guest-facing tap/veth (decap redirect target).
+    pub guest_ifindex: u32,
+    pub _pad: u32,
+    /// This hypervisor's underlay IPv6 (outer src on encap).
+    pub local_underlay_ipv6: [u8; 16],
+    /// The peer hypervisor's underlay IPv6 (outer dst on encap).
+    pub peer_underlay_ipv6: [u8; 16],
+    /// Uplink source MAC (outer eth src on encap).
+    pub local_mac: [u8; 6],
+    /// Peer uplink MAC (outer eth dst on encap).
+    pub peer_mac: [u8; 6],
+    /// Guest MAC (inner eth dst on decap delivery).
+    pub guest_mac: [u8; 6],
+    pub _pad2: [u8; 2],
+}
+
 #[cfg(feature = "user")]
 mod user_impls {
     use super::*;
@@ -48,6 +74,7 @@ mod user_impls {
     unsafe impl aya::Pod for IfaceValue {}
     unsafe impl aya::Pod for RouteKey {}
     unsafe impl aya::Pod for RouteValue {}
+    unsafe impl aya::Pod for Config {}
 }
 
 #[cfg(test)]
@@ -68,5 +95,12 @@ mod tests {
         // 4 (vni) + 4 (prefix_len) + 4 (ipv4) = 12; 4 (nexthop_vni) + 16 (ipv6) = 20.
         assert_eq!(core::mem::size_of::<RouteKey>(), 12);
         assert_eq!(core::mem::size_of::<RouteValue>(), 20);
+    }
+
+    #[test]
+    fn config_has_stable_layout() {
+        // 4*4 (u32s) + 16 + 16 (underlays) + 6+6+6+2 (macs+pad) = 16 + 32 + 20 = 68.
+        assert_eq!(core::mem::size_of::<Config>(), 68);
+        assert_eq!(core::mem::align_of::<Config>(), 4);
     }
 }

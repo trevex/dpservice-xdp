@@ -23,3 +23,23 @@ pub fn attach_uplink(iface: &str) -> anyhow::Result<Ebpf> {
         .with_context(|| format!("attach uplink_rx to {iface}"))?;
     Ok(ebpf)
 }
+
+#[cfg(test)]
+mod tests {
+    use aya::programs::Xdp;
+
+    #[test]
+    #[ignore = "requires root/CAP_BPF; loads programs through the verifier"]
+    fn both_programs_pass_verifier() {
+        let mut ebpf = super::load_ebpf().expect("load ebpf object");
+        for name in ["uplink_rx", "guest_tx"] {
+            let prog: &mut Xdp = ebpf
+                .program_mut(name)
+                .unwrap_or_else(|| panic!("program {name} missing"))
+                .try_into()
+                .expect("is xdp");
+            prog.load()
+                .unwrap_or_else(|e| panic!("verifier rejected {name}: {e}"));
+        }
+    }
+}
