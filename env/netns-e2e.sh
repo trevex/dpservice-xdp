@@ -17,7 +17,9 @@
 set -euo pipefail
 
 BIN="$(pwd)/target/debug/xdp-dp"
-PIDFILE="/run/xdp-e2e-pids"
+# User-writable: the script runs as the normal user (only individual commands use sudo),
+# so this must NOT be under root-owned /run.
+PIDFILE="${TMPDIR:-/tmp}/xdp-e2e-pids"
 IP6TABLES_MARK="xdp-e2e"  # comment tag to identify our rules
 
 # Locate tcpdump: first in PATH, then well-known Nix store paths.
@@ -201,15 +203,19 @@ cmd_test() {
 cmd_down() {
     echo "=== Tearing down ==="
 
-    # Kill all backgrounded xdp-dp processes
+    # Kill all backgrounded datapath processes by their recorded PIDs (precise).
+    # These PIDs are the `sudo ...` wrappers; SIGTERM is forwarded to the xdp-dp child.
     if [[ -f "$PIDFILE" ]]; then
         while read -r pid; do
             sudo kill "$pid" 2>/dev/null || true
         done < "$PIDFILE"
         rm -f "$PIDFILE"
     fi
-    # Belt-and-suspenders: kill any remaining xdp-dp processes
-    sudo pkill -f 'target/debug/xdp-dp' 2>/dev/null || true
+    # Belt-and-suspenders fallback. IMPORTANT: do NOT use a broad `pkill -f target/debug/xdp-dp`
+    # — that regex also matches ANY shell whose command line merely mentions the binary path
+    # (e.g. an interactive verification command), killing unrelated processes. Match only the
+    # actual datapath subcommands.
+    sudo pkill -f 'xdp-dp (bringup|pass) --' 2>/dev/null || true
 
     sleep 1
 
@@ -233,11 +239,12 @@ cmd_down() {
 
 # ---------------------------------------------------------------------------
 cmd_run() {
-    trap 'echo ""; echo "=== ERROR: cleaning up ==="; cmd_down' ERR INT TERM
+    # An EXIT trap guarantees teardown however the script ends — normal completion, a
+    # `set -e` abort inside a function (an ERR trap would NOT fire there without errtrace),
+    # or INT/TERM. cmd_down is idempotent, so running it once here is enough.
+    trap cmd_down EXIT INT TERM
     cmd_up
     cmd_test
-    cmd_down
-    trap - ERR INT TERM
 }
 
 # ---------------------------------------------------------------------------
