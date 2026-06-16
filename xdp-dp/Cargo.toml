@@ -11,8 +11,9 @@ xdp-dp-common = { path = "../xdp-dp-common", features = ["user"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
 prost = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 anyhow = { workspace = true }

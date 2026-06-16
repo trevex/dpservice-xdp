@@ -2,7 +2,9 @@ pub mod pb {
     tonic::include_proto!("dpdkironcore.v1");
 }
 
+mod grpc;
 mod loader;
+mod state;
 
 use clap::{Parser, Subcommand};
 
@@ -20,6 +22,11 @@ enum Cmd {
         #[arg(long)]
         uplink: String,
     },
+    /// Start the gRPC control-plane server.
+    Serve {
+        #[arg(long)]
+        addr: String,
+    },
 }
 
 #[tokio::main]
@@ -30,6 +37,17 @@ async fn main() -> anyhow::Result<()> {
             let _ebpf = loader::attach_uplink(&uplink)?;
             println!("attached uplink_rx to {uplink}; ctrl-c to detach");
             tokio::signal::ctrl_c().await?;
+        }
+        Cmd::Serve { addr } => {
+            let svc = grpc::Service {
+                state: std::sync::Arc::new(state::State::default()),
+            };
+            let server = crate::pb::dpd_kironcore_server::DpdKironcoreServer::new(svc);
+            println!("serving DPDKironcore on {addr}");
+            tonic::transport::Server::builder()
+                .add_service(server)
+                .serve(addr.parse()?)
+                .await?;
         }
     }
     Ok(())
