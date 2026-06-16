@@ -763,7 +763,8 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
-use crate::pb::dpdk_ironcore_server::DpdkIroncore;
+// VERIFIED generated names (prost snake-cases "DPDKironcore" → "dpd_kironcore"):
+use crate::pb::dpd_kironcore_server::DpdKironcore;
 use crate::pb::{
     CheckInitializedRequest, CheckInitializedResponse, GetVersionRequest, GetVersionResponse,
     InitializeRequest, InitializeResponse, Status as DpStatus,
@@ -774,12 +775,13 @@ pub struct Service {
     pub state: Arc<State>,
 }
 
+// Status has fields { code: u32, message: String } (NOT `error`).
 fn ok() -> Option<DpStatus> {
-    Some(DpStatus { error: 0, message: "OK".into() })
+    Some(DpStatus { code: 0, message: "OK".into() })
 }
 
 #[tonic::async_trait]
-impl DpdkIroncore for Service {
+impl DpdKironcore for Service {
     async fn initialize(
         &self,
         _req: Request<InitializeRequest>,
@@ -809,7 +811,11 @@ impl DpdkIroncore for Service {
     }
 }
 ```
-> NOTE: `Status { error, message }`, `error: 0`, and field names (`uuid`, `service_protocol`) must match the generated structs from the vendored proto. If names differ, use the generated ones — do not invent fields.
+> VERIFIED field names from the generated code: `Status { code: u32, message: String }`;
+> `InitializeResponse { status: Option<Status>, uuid: String }`;
+> `CheckInitializedResponse { status, uuid }`;
+> `GetVersionRequest { client_protocol, client_name, client_version }`;
+> `GetVersionResponse { status, service_protocol, service_version }`. Use exactly these.
 
 - [ ] **Step 4: Add a `serve` subcommand**
 
@@ -822,7 +828,7 @@ Add a `Serve { addr: String }` variant to `Cmd`, and handle it:
 ```rust
 Cmd::Serve { addr } => {
     let svc = grpc::Service { state: std::sync::Arc::new(state::State::default()) };
-    let server = crate::pb::dpdk_ironcore_server::DpdkIroncoreServer::new(svc);
+    let server = crate::pb::dpd_kironcore_server::DpdKironcoreServer::new(svc);
     println!("serving DPDKironcore on {addr}");
     tonic::transport::Server::builder()
         .add_service(server)
