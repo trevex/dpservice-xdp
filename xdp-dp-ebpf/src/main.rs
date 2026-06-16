@@ -1,7 +1,22 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
+use aya_ebpf::{
+    bindings::xdp_action,
+    macros::{map, xdp},
+    maps::HashMap,
+    programs::XdpContext,
+};
+use xdp_dp_common::{IfaceKey, IfaceValue, RouteKey, RouteValue};
+
+/// Overlay (VNI, IPv4) -> local tap ifindex + owning hypervisor underlay endpoint.
+/// Written by the userspace control plane; read by the XDP datapath (Task 11+).
+#[map]
+static INTERFACES: HashMap<IfaceKey, IfaceValue> = HashMap::with_max_entries(1024, 0);
+
+/// Overlay (VNI, IPv4 prefix) -> underlay IPv6 nexthop (tunnel dst).
+#[map]
+static ROUTES: HashMap<RouteKey, RouteValue> = HashMap::with_max_entries(4096, 0);
 
 #[xdp]
 pub fn uplink_rx(_ctx: XdpContext) -> u32 {

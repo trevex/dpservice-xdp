@@ -4,6 +4,7 @@ pub mod pb {
 
 mod grpc;
 mod loader;
+mod maps;
 mod state;
 
 use clap::{Parser, Subcommand};

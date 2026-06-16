@@ -32,5 +32,11 @@ fn main() -> anyhow::Result<()> {
         .compile_protos(&["../proto/dpdk.proto"], &["../proto"])
         .context("tonic-build compile dpdk.proto")?;
     println!("cargo:rerun-if-changed=../proto/dpdk.proto");
+    // Re-run aya-build when the eBPF crate sources change. Without this, the build.rs has a
+    // rerun-if-changed directive (the proto above), so cargo would otherwise NOT re-run it on
+    // edits to xdp-dp-ebpf/src/*.rs (the build-dependency edge only covers that crate's lib
+    // target, not its bin), leaving a stale embedded object.
+    println!("cargo:rerun-if-changed=../xdp-dp-ebpf/src");
+    println!("cargo:rerun-if-changed=../xdp-dp-ebpf/Cargo.toml");
     Ok(())
 }
