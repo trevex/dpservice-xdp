@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+# Members start empty and are appended by each crate task later (cargo errors on a
+# listed member whose Cargo.toml does not exist yet, and a `*` glob errors on non-crate
+# dirs like docs/proto/env). xdp-dp-ebpf is built out-of-tree via xtask and must stay in
+# `exclude` (xtask runs cargo inside that dir).
+members = []
+exclude = ["xdp-dp-ebpf"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+aya = "0.13"
+aya-ebpf = "0.1"
+aya-log = "0.2"
+aya-log-ebpf = "0.1"
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+network-types = "0.0.7"
