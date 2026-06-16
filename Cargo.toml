@@ -4,7 +4,7 @@ resolver = "2"
 # listed member whose Cargo.toml does not exist yet, and a `*` glob errors on non-crate
 # dirs like docs/proto/env). xdp-dp-ebpf is built out-of-tree via xtask and must stay in
 # `exclude` (xtask runs cargo inside that dir).
-members = []
+members = ["xdp-dp-common"]
 exclude = ["xdp-dp-ebpf"]
 
 [workspace.package]
