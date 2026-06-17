@@ -1,5 +1,31 @@
 #![cfg_attr(not(feature = "user"), no_std)]
 
+/// Manual incremental checksum updates (XDP has no bpf_l3/l4_csum_replace helpers).
+pub mod csum {
+    #[inline(always)]
+    fn fold(mut sum: u32) -> u16 {
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u16
+    }
+
+    /// RFC 1624 incremental update of a 16-bit ones-complement checksum `check` (host order, i.e.
+    /// already `u16::from_be`) when a 32-bit field changes from `old` to `new` (big-endian bytes).
+    /// Returns the new checksum (host order) to store back as big-endian.
+    ///
+    /// HC' = ~( ~HC + ~m + m' ), summed over the two 16-bit words of the changed field.
+    #[inline(always)]
+    pub fn csum_replace4(check: u16, old: &[u8; 4], new: &[u8; 4]) -> u16 {
+        let mut sum: u32 = (!check) as u32;
+        sum += (!u16::from_be_bytes([old[0], old[1]])) as u32;
+        sum += (!u16::from_be_bytes([old[2], old[3]])) as u32;
+        sum += u16::from_be_bytes([new[0], new[1]]) as u32;
+        sum += u16::from_be_bytes([new[2], new[3]]) as u32;
+        !fold(sum)
+    }
+}
+
 /// Key for the `interfaces` map: an overlay (VNI, IPv4) tuple.
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -167,5 +193,68 @@ mod tests {
     #[test]
     fn vip_key_layout() {
         assert_eq!(core::mem::size_of::<VipKey>(), 8);
+    }
+}
+
+#[cfg(test)]
+mod csum_tests {
+    use super::csum::csum_replace4;
+
+    /// Full ones-complement checksum over a byte slice (16-bit words, big-endian), folded.
+    fn full_csum(bytes: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            sum += u16::from_be_bytes([bytes[i], bytes[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < bytes.len() {
+            sum += (bytes[i] as u32) << 8;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Build a minimal 20-byte IPv4 header with a correct checksum, then verify that changing the
+    /// destination address via csum_replace4 yields the same checksum as a full recompute.
+    #[test]
+    fn ipv4_dst_change_matches_full_recompute() {
+        // ver/ihl=0x45, tos=0, total_len=0x0054, id=0, flags/frag=0x4000, ttl=64, proto=1(ICMP),
+        // checksum=0 (placeholder), src=10.0.0.5, dst=10.0.0.6
+        let mut hdr: [u8; 20] = [
+            0x45, 0x00, 0x00, 0x54, 0x00, 0x00, 0x40, 0x00, 0x40, 0x01, 0x00, 0x00, 10, 0, 0, 5,
+            10, 0, 0, 6,
+        ];
+        // initial correct checksum
+        let init = full_csum(&hdr);
+        hdr[10] = (init >> 8) as u8;
+        hdr[11] = (init & 0xff) as u8;
+
+        let old_dst = [hdr[16], hdr[17], hdr[18], hdr[19]];
+        let new_dst = [10u8, 0, 0, 7];
+
+        // incremental
+        let inc = csum_replace4(u16::from_be_bytes([hdr[10], hdr[11]]), &old_dst, &new_dst);
+
+        // apply change + full recompute (zero the checksum field first)
+        hdr[16..20].copy_from_slice(&new_dst);
+        hdr[10] = 0;
+        hdr[11] = 0;
+        let full = full_csum(&hdr);
+
+        assert_eq!(inc, full, "incremental checksum must equal full recompute");
+    }
+
+    /// Also verify the round-trip: changing A->B then B->A restores the original checksum.
+    #[test]
+    fn round_trip_restores_checksum() {
+        let a = [10u8, 0, 0, 5];
+        let b = [192u8, 168, 1, 1];
+        let start = 0x1234u16;
+        let once = csum_replace4(start, &a, &b);
+        let back = csum_replace4(once, &b, &a);
+        assert_eq!(back, start);
     }
 }
