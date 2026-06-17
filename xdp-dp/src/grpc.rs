@@ -436,23 +436,76 @@ impl DpdKironcore for Service {
 
     async fn list_prefixes(
         &self,
-        _req: Request<ListPrefixesRequest>,
+        req: Request<ListPrefixesRequest>,
     ) -> Result<Response<ListPrefixesResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let prefixes = control
+            .list_prefixes(&r.interface_id)
+            .into_iter()
+            .map(|(ip, len)| Prefix {
+                ip: Some(IpAddress {
+                    ipver: IpVersion::Ipv4 as i32,
+                    address: ip.to_vec(),
+                }),
+                length: len,
+                underlay_route: Vec::new(),
+            })
+            .collect();
+        Ok(Response::new(ListPrefixesResponse {
+            status: ok(),
+            prefixes,
+        }))
     }
 
     async fn create_prefix(
         &self,
-        _req: Request<CreatePrefixRequest>,
+        req: Request<CreatePrefixRequest>,
     ) -> Result<Response<CreatePrefixResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let pfx = r
+            .prefix
+            .ok_or_else(|| Status::invalid_argument("prefix is required"))?;
+        let addr = pfx
+            .ip
+            .ok_or_else(|| Status::invalid_argument("prefix.ip is required"))?;
+        let ip = decode_ipv4(&addr.address)?;
+        control
+            .add_prefix(&r.interface_id, ip, pfx.length)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CreatePrefixResponse {
+            status: ok(),
+            underlay_route: self.underlay.to_vec(),
+        }))
     }
 
     async fn delete_prefix(
         &self,
-        _req: Request<DeletePrefixRequest>,
+        req: Request<DeletePrefixRequest>,
     ) -> Result<Response<DeletePrefixResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let pfx = r
+            .prefix
+            .ok_or_else(|| Status::invalid_argument("prefix is required"))?;
+        let addr = pfx
+            .ip
+            .ok_or_else(|| Status::invalid_argument("prefix.ip is required"))?;
+        let ip = decode_ipv4(&addr.address)?;
+        control
+            .del_prefix(&r.interface_id, ip, pfx.length)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(DeletePrefixResponse { status: ok() }))
     }
 
     async fn list_load_balancer_prefixes(

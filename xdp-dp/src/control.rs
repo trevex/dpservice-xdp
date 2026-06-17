@@ -50,6 +50,10 @@ struct Inner {
     by_id: HashMap<Vec<u8>, (u32, [u8; 4])>,
     /// interface_id -> ifindex
     by_ifindex: HashMap<Vec<u8>, u32>,
+    /// interface_id -> its underlay /128
+    iface_underlay: HashMap<Vec<u8>, [u8; 16]>,
+    /// interface_id -> list of (prefix_ip, prefix_len) alias prefixes
+    prefixes: HashMap<Vec<u8>, Vec<([u8; 4], u32)>>,
     /// ifindex -> ordered (rule_id, rule) pairs
     fw: HashMap<u32, Vec<(Vec<u8>, FwRule)>>,
 }
@@ -100,6 +104,8 @@ impl Control {
                 next_table_id: 1,
                 by_id: HashMap::new(),
                 by_ifindex: HashMap::new(),
+                iface_underlay: HashMap::new(),
+                prefixes: HashMap::new(),
                 fw: HashMap::new(),
                 underlay,
             }),
@@ -127,6 +133,8 @@ impl Control {
         let mut g = self.inner.lock().unwrap();
         g.by_id.insert(interface_id.to_vec(), (vni, ipv4));
         g.by_ifindex.insert(interface_id.to_vec(), tap);
+        g.iface_underlay
+            .insert(interface_id.to_vec(), underlay_ipv6);
         // Try attach-only first (program already loaded for a previous interface).
         // Fall back to full load+attach for the first guest interface.
         loader::attach_xdp_extra(&mut g.ebpf, "guest_tx", device)
@@ -450,5 +458,69 @@ impl Control {
             Some(ifindex) => g.fw.get(ifindex).cloned().unwrap_or_default(),
             None => Vec::new(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Alias prefix management
+    // -----------------------------------------------------------------------
+
+    /// Announce an alias prefix routed to an interface: program a route (vni, prefix/len) -> the
+    /// interface's underlay /128.
+    pub fn add_prefix(
+        &self,
+        interface_id: &[u8],
+        prefix: [u8; 4],
+        prefix_len: u32,
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let (vni, _gip) = *g
+            .by_id
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        let underlay = *g
+            .iface_underlay
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("interface has no underlay"))?;
+        g.routes.upsert(
+            vni,
+            prefix,
+            prefix_len,
+            RouteValue {
+                nexthop_vni: vni,
+                nexthop_ipv6: underlay,
+                is_external: 0,
+                _pad: [0; 3],
+            },
+        )?;
+        g.prefixes
+            .entry(interface_id.to_vec())
+            .or_default()
+            .push((prefix, prefix_len));
+        Ok(())
+    }
+
+    /// Remove an alias prefix: delete the LPM route entry and forget the local record.
+    pub fn del_prefix(
+        &self,
+        interface_id: &[u8],
+        prefix: [u8; 4],
+        prefix_len: u32,
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let (vni, _gip) = *g
+            .by_id
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        let _ = g.routes.remove(vni, prefix, prefix_len);
+        if let Some(v) = g.prefixes.get_mut(interface_id) {
+            v.retain(|&(p, l)| !(p == prefix && l == prefix_len));
+        }
+        Ok(())
+    }
+
+    /// Return all alias prefixes for an interface as (prefix_ip, prefix_len) pairs.
+    pub fn list_prefixes(&self, interface_id: &[u8]) -> Vec<([u8; 4], u32)> {
+        let g = self.inner.lock().unwrap();
+        g.prefixes.get(interface_id).cloned().unwrap_or_default()
     }
 }
