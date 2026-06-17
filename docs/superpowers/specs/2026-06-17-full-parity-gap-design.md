@@ -85,12 +85,13 @@ dpservice model (`dp_firewall.h`): per-port, priority-ordered rules with `src_ip
 **caches the action in the conntrack entry** for both directions (stateful: the reply is allowed
 because the flow is established).
 
-**Fidelity note:** upstream `firewall_node.c` currently has the actual drop **commented out**
-(`// Ignore the drop actions till we have the metalnet ready to set the firewall rules`). So
-drop-in parity = implement rule storage + per-flow evaluation + conntrack caching, with
-**enforcement behind a feature gate defaulting to "evaluate-but-don't-drop"** to match upstream,
-flippable to real dropping. RPCs: `CreateFirewallRule`/`GetFirewallRule`/`DeleteFirewallRule`/
-`ListFirewallRules`.
+**Fidelity note + decision:** upstream `firewall_node.c` currently has the actual drop **commented
+out** (`// Ignore the drop actions till we have the metalnet ready to set the firewall rules`). We
+implement rule storage + per-flow evaluation + conntrack caching like upstream, **but we ship real
+enforcement ON by default** (a DROP rule actually drops) — diverging from upstream's temporary
+permissive state toward the semantics a user expects, with a config flag (`firewall_enforce`,
+default `true`) to disable dropping for upstream-matching behavior if needed. RPCs:
+`CreateFirewallRule`/`GetFirewallRule`/`DeleteFirewallRule`/`ListFirewallRules`.
 
 eBPF approach: a `FW_RULES` map (per-interface rule arrays; bounded linear scan in priority order
 inside the program — XDP handles bounded loops). Match → write `fwall_action` into the conntrack
@@ -156,11 +157,12 @@ failover doesn't drop live NAT/virtsvc connections.
 - True **cross-host** redundancy (a different machine taking over an interface) is the NeighborNat
   territory (§4.5) plus control-plane re-binding, not the dpservice same-machine sync.
 
-**Design deliverable for this milestone:** (a) pin all dynamic-state maps; (b) make the loader
-adopt-or-create pinned maps idempotently; (c) document the failover model and prove it (kill +
-restart the control plane mid-flow; flows survive). Optionally implement a dpservice-compatible
-`0x88B5` sync emitter only if we must interoperate with an upstream dpservice backup — flagged as a
-sub-task, likely unnecessary in an all-`xdp-dp` deployment. **Milestone M13.**
+**Design deliverable for this milestone (decision: pinned-maps model, no sync protocol):** (a) pin
+all dynamic-state maps under `bpffs`; (b) make the loader adopt-or-create pinned maps idempotently;
+(c) document the failover model and prove it (kill + restart the control plane mid-flow; flows
+survive). The dpservice `0x88B5` same-machine sync protocol is **not** implemented — pinned
+kernel-resident maps cover the failover motive in an all-`xdp-dp` deployment, and mixed
+dpservice/xdp-dp HA pairs are not a requirement. **Milestone M13.**
 
 ### 4.9 Packet capture (`Capture*`)
 dpservice offloads capture via `rte_flow` mirror to a pcap sink. XDP analog: a capture flag in
@@ -203,13 +205,13 @@ M14 Packet capture               (independent)
 M15 IPv6 overlay tenants         (pairs with M10/NAT64)
 ```
 
-Recommended order: **M5 → M6 → M7 → M8** (the high-value parity core: conntrack, firewall,
-tenancy, routing), then **M9/M10/M11** (advanced NAT/LB/virtsvc), then **M12/M13/M14/M15**.
+Order: **M5 → M6 → M7 → M8** (the high-value parity core: conntrack, firewall, tenancy, routing),
+then **M9/M10/M11** (advanced NAT/LB/virtsvc), then **M12/M13/M14/M15**.
 
-Relationship to **sub-project 2 (ioiab drop-in)**: ioiab needs **ND + DHCPv4/v6 + dynamic taps**
-(its own spec) but does **not** depend on the parity milestones above. The two tracks are
-independent; ioiab can proceed in parallel, or after M5–M6 so the drop-in demonstrates firewall
-parity too. **Decision point for sequencing (see §8).**
+Relationship to **sub-project 2 (ioiab drop-in)**: **decision — complete full parity (M5–M15)
+before ioiab.** ioiab needs **ND + DHCPv4/v6 + dynamic taps** (its own spec) and does not depend on
+the parity milestones, but we want the drop-in to land on top of a fully parity-complete dataplane
+rather than a partial one. ioiab follows M15.
 
 ## 6. Testing strategy
 
@@ -242,18 +244,14 @@ management (we attach to taps/veths, not VFs); actual NIC hardware offload backe
 stays offload-*ready*, but a concrete `rte_flow`/hw-offload lowering is a separate future effort);
 byte-exact internal algorithm parity.
 
-## 8. Open decisions (for review)
+## 8. Resolved decisions
 
-1. **Sequencing vs ioiab:** do the parity milestones (M5+) come **before**, **after**, or **in
-   parallel with** sub-project 2 (ioiab drop-in)? Recommendation: do **M5 (conntrack) + M6
-   (firewall)** first (they harden the core and ioiab benefits from showing firewall parity), then
-   ioiab, then the rest.
-2. **Firewall enforcement default:** match upstream (evaluate-but-don't-drop) or ship real
-   enforcement immediately behind a config flag defaulting **on**? Recommendation: match upstream
-   default (don't-drop) for true behavioral parity, flag to enable.
-3. **HA dpservice wire compat:** implement the `0x88B5` sync protocol for interop with an upstream
-   dpservice backup process, or rely solely on pinned-map kernel-resident state (no sync protocol)
-   in all-`xdp-dp` deployments? Recommendation: pinned-map model only; implement `0x88B5` only if a
-   mixed dpservice/xdp-dp HA pair is a real requirement.
-4. **Conntrack table sizing / GC cadence:** match dpservice (`850k` entries, 30 s / 1-day
-   timeouts) or tune for the PoC? Recommendation: mirror dpservice constants.
+1. **Sequencing vs ioiab:** ✅ **Full parity (M5–M15) first, then ioiab.** ioiab follows M15.
+2. **Firewall enforcement default:** ✅ **Real enforcement ON by default** (a DROP rule drops),
+   with a `firewall_enforce` config flag (default `true`) to disable for upstream-matching
+   permissive behavior. (§4.1)
+3. **HA dpservice wire compat:** ✅ **Pinned-maps model only** — no `0x88B5` sync protocol. Flow
+   state is kernel-resident and survives control-plane restarts; the loader adopts pinned maps.
+   (§4.8)
+4. **Conntrack table sizing / GC cadence:** ✅ **Mirror dpservice constants** — `850k` max entries,
+   30 s default timeout, 1-day established-TCP timeout. (§3)
