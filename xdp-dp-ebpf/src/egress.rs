@@ -41,6 +41,10 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
         })
     }
     .ok_or(())?;
+    // Network NAT: SNAT guest -> nat_ip:port when the dst route is external and the guest has a
+    // NAT config. Rewrites the packet in place; the route (dst unchanged) still encaps correctly.
+    let is_ext = route.is_external != 0;
+    crate::nat::nat_snat_egress(ctx, ETH_LEN, meta.vni, is_ext);
     let inner_len = (data_end - data - ETH_LEN) as u16;
     let local = LOCAL.get(0).ok_or(())?;
     encap_and_redirect(ctx, local, route, inner_len)

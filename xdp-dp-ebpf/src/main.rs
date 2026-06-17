@@ -9,6 +9,7 @@ mod ingress;
 mod inspect;
 mod lb;
 mod maps;
+mod nat;
 mod parse;
 mod vip;
 
