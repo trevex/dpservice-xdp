@@ -3,8 +3,8 @@ use aya_ebpf::{
     maps::{Array, HashMap, LruHashMap},
 };
 use xdp_dp_common::{
-    Config, CtEntry, CtKey, IfaceKey, IfaceValue, InspectEntry, LbKey, LbValue, Local, MaglevKey,
-    NatKey, NatValue, PortMeta, RouteKey, RouteValue, VipKey,
+    Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
+    LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteKey, RouteValue, VipKey,
 };
 
 #[map]
@@ -33,3 +33,10 @@ pub static MAGLEV: HashMap<MaglevKey, [u8; 4]> = HashMap::with_max_entries(65536
 pub static CONNTRACK: LruHashMap<CtKey, CtEntry> = LruHashMap::with_max_entries(1_048_576, 0);
 #[map]
 pub static NAT: HashMap<NatKey, NatValue> = HashMap::with_max_entries(1024, 0);
+#[map]
+pub static FW_RULES: HashMap<FwRuleKey, FwRule> = HashMap::with_max_entries(16384, 0);
+#[map]
+pub static FW_META: HashMap<u32, FwMeta> = HashMap::with_max_entries(1024, 0);
+/// Entry 0: firewall enforcement flag (1 = drop on deny, 0 = evaluate-only).
+#[map]
+pub static FW_CONFIG: Array<u32> = Array::with_max_entries(1, 0);

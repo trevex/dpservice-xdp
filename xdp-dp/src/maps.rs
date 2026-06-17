@@ -2,8 +2,8 @@ use anyhow::Context;
 use aya::maps::{Array, HashMap, MapData};
 use aya::Ebpf;
 use xdp_dp_common::{
-    Config, CtEntry, CtKey, IfaceKey, IfaceValue, InspectEntry, LbKey, LbValue, Local, MaglevKey,
-    NatKey, NatValue, PortMeta, RouteKey, RouteValue, VipKey,
+    Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
+    LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteKey, RouteValue, VipKey,
 };
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
@@ -275,6 +275,79 @@ impl Nat {
 
     pub fn get(&self, key: &NatKey) -> Option<NatValue> {
         self.map.get(key, 0).ok()
+    }
+}
+
+/// Typed handle over the `FW_RULES` BPF map ((ifindex, slot) -> rule).
+#[allow(dead_code)]
+pub struct FwRules {
+    map: HashMap<MapData, FwRuleKey, FwRule>,
+}
+
+#[allow(dead_code)]
+impl FwRules {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(ebpf.take_map("FW_RULES").context("FW_RULES map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, key: FwRuleKey, val: FwRule) -> anyhow::Result<()> {
+        self.map.insert(key, val, 0).context("insert fw rule")
+    }
+
+    pub fn remove(&mut self, key: &FwRuleKey) -> anyhow::Result<()> {
+        self.map.remove(key).context("remove fw rule")
+    }
+
+    pub fn get(&self, key: &FwRuleKey) -> Option<FwRule> {
+        self.map.get(key, 0).ok()
+    }
+}
+
+/// Typed handle over the `FW_META` BPF map (ifindex -> per-direction rule counts).
+#[allow(dead_code)]
+pub struct FwMetaMap {
+    map: HashMap<MapData, u32, FwMeta>,
+}
+
+#[allow(dead_code)]
+impl FwMetaMap {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(ebpf.take_map("FW_META").context("FW_META map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, ifindex: u32, val: FwMeta) -> anyhow::Result<()> {
+        self.map.insert(ifindex, val, 0).context("insert fw meta")
+    }
+
+    pub fn remove(&mut self, ifindex: u32) -> anyhow::Result<()> {
+        self.map.remove(&ifindex).context("remove fw meta")
+    }
+
+    pub fn get(&self, ifindex: u32) -> Option<FwMeta> {
+        self.map.get(&ifindex, 0).ok()
+    }
+}
+
+/// Typed handle over the single-entry `FW_CONFIG` Array map (entry 0 = enforce flag).
+#[allow(dead_code)]
+pub struct FwConfig {
+    map: Array<MapData, u32>,
+}
+
+#[allow(dead_code)]
+impl FwConfig {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = Array::try_from(
+            ebpf.take_map("FW_CONFIG")
+                .context("FW_CONFIG map missing")?,
+        )?;
+        Ok(Self { map })
+    }
+
+    pub fn set(&mut self, enforce: u32) -> anyhow::Result<()> {
+        self.map.set(0, &enforce, 0).context("write FW_CONFIG[0]")
     }
 }
 
