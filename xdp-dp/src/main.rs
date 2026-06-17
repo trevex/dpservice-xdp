@@ -5,6 +5,7 @@ pub mod pb {
 mod control;
 mod grpc;
 mod loader;
+mod maglev;
 mod maps;
 mod state;
 
