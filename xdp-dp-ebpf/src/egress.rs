@@ -1,5 +1,4 @@
 use aya_ebpf::{bindings::xdp_action, programs::XdpContext};
-use xdp_dp_common::RouteKey;
 
 use crate::arp_nd::try_arp_reply;
 use crate::encap::encap_and_redirect;
@@ -54,14 +53,15 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     crate::vip::snat_egress(ctx, ETH_LEN, meta.vni);
     // inner IPv4 dst at ETH_LEN + 16
     let dst = unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 16) as *const [u8; 4]) };
-    let route = unsafe {
-        ROUTES.get(&RouteKey {
-            vni: meta.vni,
-            prefix_len: 32,
-            ipv4: dst,
-        })
-    }
-    .ok_or(())?;
+    let route = ROUTES
+        .get(&aya_ebpf::maps::lpm_trie::Key::new(
+            64,
+            xdp_dp_common::RouteLpmData {
+                vni: meta.vni.to_be_bytes(),
+                ipv4: dst,
+            },
+        ))
+        .ok_or(())?;
     // Network NAT: SNAT guest -> nat_ip:port when the dst route is external and the guest has a
     // NAT config. Rewrites the packet in place; the route (dst unchanged) still encaps correctly.
     let is_ext = route.is_external != 0;

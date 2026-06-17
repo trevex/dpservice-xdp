@@ -1,9 +1,12 @@
 use anyhow::Context;
-use aya::maps::{Array, HashMap, MapData};
+use aya::maps::{
+    lpm_trie::{Key, LpmTrie},
+    Array, HashMap, MapData,
+};
 use aya::Ebpf;
 use xdp_dp_common::{
     Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
-    LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteKey, RouteValue, UnderlayValue,
+    LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteLpmData, RouteValue, UnderlayValue,
     VipKey,
 };
 
@@ -119,25 +122,45 @@ impl InspectMap {
     }
 }
 
-/// Typed handle over the `ROUTES` BPF map.
+/// Typed handle over the `ROUTES` BPF LPM trie map.
 #[allow(dead_code)]
 pub struct Routes {
-    map: HashMap<MapData, RouteKey, RouteValue>,
+    map: LpmTrie<MapData, RouteLpmData, RouteValue>,
 }
 
 #[allow(dead_code)]
 impl Routes {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
-        let map = HashMap::try_from(ebpf.take_map("ROUTES").context("ROUTES map missing")?)?;
+        let map = LpmTrie::try_from(ebpf.take_map("ROUTES").context("ROUTES map missing")?)?;
         Ok(Self { map })
     }
 
-    pub fn upsert(&mut self, key: RouteKey, val: RouteValue) -> anyhow::Result<()> {
-        self.map.insert(key, val, 0).context("insert route")
+    pub fn upsert(
+        &mut self,
+        vni: u32,
+        ipv4: [u8; 4],
+        prefix_len: u32,
+        val: RouteValue,
+    ) -> anyhow::Result<()> {
+        let key = Key::new(
+            32 + prefix_len.min(32),
+            RouteLpmData {
+                vni: vni.to_be_bytes(),
+                ipv4,
+            },
+        );
+        self.map.insert(&key, val, 0).context("insert route")
     }
 
-    pub fn get(&self, key: &RouteKey) -> Option<RouteValue> {
-        self.map.get(key, 0).ok()
+    pub fn remove(&mut self, vni: u32, ipv4: [u8; 4], prefix_len: u32) -> anyhow::Result<()> {
+        let key = Key::new(
+            32 + prefix_len.min(32),
+            RouteLpmData {
+                vni: vni.to_be_bytes(),
+                ipv4,
+            },
+        );
+        self.map.remove(&key).context("remove route")
     }
 }
 

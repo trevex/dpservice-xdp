@@ -5,7 +5,7 @@ use anyhow::Context as _;
 use aya::Ebpf;
 use xdp_dp_common::{
     FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, LbKey, LbValue, Local, MaglevKey, NatKey,
-    NatValue, PortMeta, RouteKey, RouteValue, VipKey, FW_DIR_EGRESS, FW_MAX_RULES,
+    NatValue, PortMeta, RouteValue, VipKey, FW_DIR_EGRESS, FW_MAX_RULES,
 };
 
 use crate::loader;
@@ -176,11 +176,9 @@ impl Control {
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
         g.routes.upsert(
-            RouteKey {
-                vni,
-                prefix_len,
-                ipv4,
-            },
+            vni,
+            ipv4,
+            prefix_len,
             RouteValue {
                 nexthop_vni: vni,
                 nexthop_ipv6,

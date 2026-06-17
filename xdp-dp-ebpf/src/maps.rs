@@ -1,17 +1,19 @@
 use aya_ebpf::{
     macros::map,
-    maps::{Array, HashMap, LruHashMap},
+    maps::{lpm_trie::LpmTrie, Array, HashMap, LruHashMap},
 };
 use xdp_dp_common::{
     Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
-    LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteKey, RouteValue, UnderlayValue,
+    LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteLpmData, RouteValue, UnderlayValue,
     VipKey,
 };
 
 #[map]
 pub static INTERFACES: HashMap<IfaceKey, IfaceValue> = HashMap::with_max_entries(1024, 0);
+// LPM trie: key data = [vni_be(4) ++ ipv4(4)], prefix_len = 32 + ipv4_prefix. flags=1 is
+// BPF_F_NO_PREALLOC, REQUIRED for LPM tries (the load fails without it).
 #[map]
-pub static ROUTES: HashMap<RouteKey, RouteValue> = HashMap::with_max_entries(4096, 0);
+pub static ROUTES: LpmTrie<RouteLpmData, RouteValue> = LpmTrie::with_max_entries(65536, 1);
 #[map]
 pub static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 #[map]

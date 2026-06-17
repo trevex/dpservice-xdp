@@ -86,6 +86,15 @@ pub struct RouteKey {
     pub ipv4: [u8; 4],
 }
 
+/// LPM-trie key data for `ROUTES`: VNI (big-endian, matched MSB-first as a fixed 32-bit VRF
+/// discriminator) followed by the IPv4 octets (network order, variable prefix).
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct RouteLpmData {
+    pub vni: [u8; 4],
+    pub ipv4: [u8; 4],
+}
+
 /// Value for the `routes` map: the underlay IPv6 nexthop (tunnel dst). MAC-free — the outer
 /// L2 next-hop is the single underlay gateway in `Local`, not per-route.
 #[repr(C)]
@@ -337,6 +346,7 @@ mod user_impls {
     unsafe impl aya::Pod for UnderlayValue {}
     unsafe impl aya::Pod for PortMeta {}
     unsafe impl aya::Pod for RouteKey {}
+    unsafe impl aya::Pod for RouteLpmData {}
     unsafe impl aya::Pod for RouteValue {}
     unsafe impl aya::Pod for Config {}
     unsafe impl aya::Pod for Local {}
@@ -375,6 +385,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<RouteValue>(), 24);
         // 4 (uplink_ifindex) + 6 (uplink_mac) + 6 (gateway_mac) + 16 (underlay_ipv6) = 32.
         assert_eq!(core::mem::size_of::<Local>(), 32);
+        // LPM key data: 4 (vni be) + 4 (ipv4) = 8.
+        assert_eq!(core::mem::size_of::<RouteLpmData>(), 8);
     }
 
     #[test]

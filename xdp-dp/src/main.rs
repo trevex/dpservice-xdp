@@ -305,23 +305,26 @@ async fn main() -> anyhow::Result<()> {
                 .map(|s| parse_ipv4(s))
                 .collect::<anyhow::Result<_>>()?;
             let mut routes = maps::Routes::open(&mut ebpf)?;
-            // --remote: "<overlay_ipv4>=<nexthop_underlay_ipv6>=<vni>" (nexthop = the remote
-            // interface's underlay /128).
+            // --remote: "<overlay_ipv4>[/len]=<nexthop_underlay_ipv6>=<vni>" (nexthop = the remote
+            // interface's underlay /128). An optional /prefix_len suffix enables CIDR routes;
+            // bare IPs default to /32 (host route, behavior-preserving).
             for r in &remotes {
                 let f: Vec<&str> = r.split('=').collect();
                 anyhow::ensure!(
                     f.len() == 3,
                     "--remote must be overlay_ipv4=nexthop_underlay_ipv6=vni, got {r:?}"
                 );
-                let ip = parse_ipv4(f[0])?;
+                let (ip_s, plen) = match f[0].split_once('/') {
+                    Some((ip, l)) => (ip, l.parse::<u32>().context("--remote: bad prefix len")?),
+                    None => (f[0], 32u32),
+                };
+                let ip = parse_ipv4(ip_s)?;
                 let nh = parse_ipv6(f[1])?;
                 let vni: u32 = f[2].parse().context("--remote: bad vni")?;
                 routes.upsert(
-                    xdp_dp_common::RouteKey {
-                        vni,
-                        prefix_len: 32,
-                        ipv4: ip,
-                    },
+                    vni,
+                    ip,
+                    plen,
                     xdp_dp_common::RouteValue {
                         nexthop_vni: vni,
                         nexthop_ipv6: nh,
