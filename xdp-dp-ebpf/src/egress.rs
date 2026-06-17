@@ -26,6 +26,8 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     if ethertype != ETH_P_IP {
         return Ok(xdp_action::XDP_PASS);
     }
+    // SNAT: rewrite inner IPv4 source if a VIP mapping exists (G->V).
+    crate::vip::snat_egress(ctx, ETH_LEN, meta.vni);
     // inner IPv4 dst at ETH_LEN + 16
     let dst = unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 16) as *const [u8; 4]) };
     let route = unsafe {

@@ -3,7 +3,7 @@ use aya_ebpf::{
     helpers::{bpf_redirect, bpf_xdp_adjust_head},
     programs::XdpContext,
 };
-use xdp_dp_common::IfaceKey;
+use xdp_dp_common::{IfaceKey, VipKey};
 
 use crate::arp_nd::GW_MAC;
 use crate::maps::INTERFACES;
@@ -27,10 +27,20 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     // inner IPv4 dst at ETH_LEN + IPV6_LEN + 16
     let inner_dst =
         unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + IPV6_LEN + 16) as *const [u8; 4]) };
+    // If inner_dst is a VIP, resolve the real interface IP (G) for interface lookup.
+    let target = match unsafe {
+        crate::maps::VIPS.get(&VipKey {
+            vni: 0,
+            ipv4: inner_dst,
+        })
+    } {
+        Some(g) => *g,
+        None => inner_dst,
+    };
     let iface = unsafe {
         INTERFACES.get(&IfaceKey {
             vni: 0,
-            ipv4: inner_dst,
+            ipv4: target,
         })
     }
     .ok_or(())?;
@@ -55,5 +65,7 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
         write6(q.add(6), &GW_MAC);
         core::ptr::write_unaligned(q.add(12) as *mut u16, ETH_P_IP.to_be());
     }
+    // DNAT: rewrite inner IPv4 dest if inner_dst was a VIP (V->G).
+    crate::vip::dnat_ingress(ctx, ETH_LEN, 0);
     Ok(unsafe { bpf_redirect(tap_ifindex, 0) } as u32)
 }

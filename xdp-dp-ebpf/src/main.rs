@@ -9,6 +9,7 @@ mod ingress;
 mod inspect;
 mod maps;
 mod parse;
+mod vip;
 
 use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
 
