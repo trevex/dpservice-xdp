@@ -353,7 +353,11 @@ impl DpdKironcore for Service {
         let interface_id = r.interface_id;
         let device = r.device_name;
         let vni = r.vni;
-        let underlay = self.underlay;
+        // Per-interface underlay /128 from this hypervisor's /64: prefix[0..8] ++ vni ++ ipv4.
+        // Unique per (vni, ipv4); deterministic so the route side can reproduce it.
+        let mut underlay = self.underlay;
+        underlay[8..12].copy_from_slice(&vni.to_be_bytes());
+        underlay[12..16].copy_from_slice(&ipv4);
 
         control
             .create_interface(&interface_id, &device, vni, ipv4, gateway_ipv4, underlay)

@@ -119,13 +119,15 @@ enum Cmd {
         /// In a flat-L2 lab this is the peer hypervisor's uplink MAC.
         #[arg(long)]
         gateway_mac: String,
-        /// Local guest, repeatable: "<ifname>=<overlay_ipv4>=<guest_mac>" where <guest_mac> is
-        /// the MAC of the guest interface inside the guest netns (inner eth dst on decap delivery).
-        /// guest_tx attaches to <ifname> (the hypervisor-side veth peer).
+        /// Local guest, repeatable:
+        /// "<ifname>=<overlay_ipv4>=<guest_mac>=<underlay_ipv6>=<vni>". The per-interface underlay
+        /// /128 is the interface's identity on the underlay (UNDERLAY map key); guest_tx attaches
+        /// to <ifname> (the hypervisor-side veth peer).
         #[arg(long = "guest")]
         guests: Vec<String>,
-        /// Remote guest route, repeatable: "<overlay_ipv4>=<nexthop_ipv6>". MAC-free — the outer
-        /// L2 next-hop is the single underlay gateway set via --gateway-mac, not per-route.
+        /// Remote guest route, repeatable: "<overlay_ipv4>=<nexthop_underlay_ipv6>=<vni>" where the
+        /// nexthop is the remote interface's underlay /128. The outer L2 next-hop is the single
+        /// underlay gateway set via --gateway-mac.
         #[arg(long = "remote")]
         remotes: Vec<String>,
         /// VIP mapping, repeatable: "<interface_ipv4>=<vip_ipv4>" (programs both VIPS directions).
@@ -251,31 +253,47 @@ async fn main() -> anyhow::Result<()> {
             let gw = parse_ipv4(&gateway)?;
             let mut ports = maps::PortMetaMap::open(&mut ebpf)?;
             let mut ifaces = maps::Interfaces::open(&mut ebpf)?;
+            let mut underlay_map = maps::Underlay::open(&mut ebpf)?;
+            // --guest: "<ifname>=<overlay_ipv4>=<guest_mac>=<underlay_ipv6>=<vni>". The per-interface
+            // underlay IPv6 is the interface's identity on the underlay; UNDERLAY maps it -> (vni,tap).
             for g in &guests {
-                let mut it = g.splitn(3, '=');
-                let ifname = it.next().context("--guest must be ifname=ipv4=mac")?;
-                let ip_str = it.next().context("--guest must be ifname=ipv4=mac")?;
-                let mac_str = it.next().context("--guest must be ifname=ipv4=mac")?;
-                let ip = parse_ipv4(ip_str)?;
-                let guest_mac = parse_mac(mac_str)?;
+                let f: Vec<&str> = g.split('=').collect();
+                anyhow::ensure!(
+                    f.len() == 5,
+                    "--guest must be ifname=ipv4=mac=underlay_ipv6=vni, got {g:?}"
+                );
+                let ifname = f[0];
+                let ip = parse_ipv4(f[1])?;
+                let guest_mac = parse_mac(f[2])?;
+                let underlay = parse_ipv6(f[3])?;
+                let vni: u32 = f[4].parse().context("--guest: bad vni")?;
                 let tap = ifindex(ifname)?;
                 ports.upsert(
                     tap,
                     xdp_dp_common::PortMeta {
-                        vni: 0,
+                        vni,
                         guest_ipv4: ip,
                         gateway_ipv4: gw,
                         guest_mac,
                         _pad: [0; 2],
-                        underlay_ipv6: [0u8; 16],
+                        underlay_ipv6: underlay,
                     },
                 )?;
                 ifaces.upsert(
-                    xdp_dp_common::IfaceKey::new(0, ip),
+                    xdp_dp_common::IfaceKey::new(vni, ip),
                     xdp_dp_common::IfaceValue {
                         tap_ifindex: tap,
                         is_local: 1,
-                        underlay_ipv6: parse_ipv6(&local_underlay)?,
+                        underlay_ipv6: underlay,
+                        guest_mac,
+                        _pad: [0; 2],
+                    },
+                )?;
+                underlay_map.upsert(
+                    underlay,
+                    xdp_dp_common::UnderlayValue {
+                        vni,
+                        tap_ifindex: tap,
                         guest_mac,
                         _pad: [0; 2],
                     },
@@ -287,18 +305,25 @@ async fn main() -> anyhow::Result<()> {
                 .map(|s| parse_ipv4(s))
                 .collect::<anyhow::Result<_>>()?;
             let mut routes = maps::Routes::open(&mut ebpf)?;
+            // --remote: "<overlay_ipv4>=<nexthop_underlay_ipv6>=<vni>" (nexthop = the remote
+            // interface's underlay /128).
             for r in &remotes {
-                let mut it = r.splitn(2, '=');
-                let ip = parse_ipv4(it.next().context("remote: missing overlay ipv4")?)?;
-                let nh = parse_ipv6(it.next().context("remote: missing nexthop ipv6")?)?;
+                let f: Vec<&str> = r.split('=').collect();
+                anyhow::ensure!(
+                    f.len() == 3,
+                    "--remote must be overlay_ipv4=nexthop_underlay_ipv6=vni, got {r:?}"
+                );
+                let ip = parse_ipv4(f[0])?;
+                let nh = parse_ipv6(f[1])?;
+                let vni: u32 = f[2].parse().context("--remote: bad vni")?;
                 routes.upsert(
                     xdp_dp_common::RouteKey {
-                        vni: 0,
+                        vni,
                         prefix_len: 32,
                         ipv4: ip,
                     },
                     xdp_dp_common::RouteValue {
-                        nexthop_vni: 0,
+                        nexthop_vni: vni,
                         nexthop_ipv6: nh,
                         is_external: external_set.contains(&ip) as u8,
                         _pad: [0; 3],

@@ -42,6 +42,7 @@ struct Inner {
     nat: Nat,
     fw_rules: FwRules,
     fw_meta: FwMetaMap,
+    underlay: crate::maps::Underlay,
     /// loadbalancer_id -> its LB state.
     lbs: HashMap<Vec<u8>, LbEntry>,
     next_table_id: u32,
@@ -80,6 +81,7 @@ impl Control {
         let nat = Nat::open(&mut ebpf)?;
         let fw_rules = FwRules::open(&mut ebpf)?;
         let fw_meta = FwMetaMap::open(&mut ebpf)?;
+        let underlay = crate::maps::Underlay::open(&mut ebpf)?;
         let conntrack = Conntrack::open(&mut ebpf)?;
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -99,6 +101,7 @@ impl Control {
                 by_id: HashMap::new(),
                 by_ifindex: HashMap::new(),
                 fw: HashMap::new(),
+                underlay,
             }),
             conntrack: Mutex::new(Some(conntrack)),
         })
@@ -137,7 +140,7 @@ impl Control {
                 gateway_ipv4,
                 guest_mac: mac,
                 _pad: [0; 2],
-                underlay_ipv6: [0u8; 16],
+                underlay_ipv6,
             },
         )?;
         g.ifaces.upsert(
@@ -146,6 +149,16 @@ impl Control {
                 tap_ifindex: tap,
                 is_local: 1,
                 underlay_ipv6,
+                guest_mac: mac,
+                _pad: [0; 2],
+            },
+        )?;
+        // Ingress delivery table: the interface's underlay /128 -> (vni, tap, guest_mac).
+        g.underlay.upsert(
+            underlay_ipv6,
+            xdp_dp_common::UnderlayValue {
+                vni,
+                tap_ifindex: tap,
                 guest_mac: mac,
                 _pad: [0; 2],
             },
