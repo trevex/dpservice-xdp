@@ -257,6 +257,7 @@ cmd_up() {
         --nat "10.0.0.5=10.0.0.50:20000:30000" \
         --remote "10.0.0.9=fd00:c::9=0" \
         --external "10.0.0.9" \
+        --meter "gA-h=1:0" \
         --remote "10.0.0.6=fd00:b::206=100" &
     echo $! >> "$PIDFILE"
 
@@ -550,6 +551,25 @@ cmd_test() {
             cat /tmp/nn.txt
         fi
         rm -f /tmp/nn.txt
+    fi
+    echo ""
+
+    echo "=== Test 13: rate metering — guesta egress capped at 1 Mbps (flood drops, slow passes) ==="
+    # gA-h has a 1 Mbps total-egress token bucket (~125 KB/s). A fast flood of large packets exceeds
+    # it -> significant loss; a slow, small ping stays under the cap -> 0 loss.
+    FLOOD=$(sudo ip netns exec guesta ping -c 60 -i 0.003 -s 1400 -W 1 10.0.0.6 2>/dev/null \
+            | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+' || echo 100)
+    echo "  flood (60x1400B @ ~3ms): ${FLOOD}% loss"
+    sleep 1  # let the bucket refill
+    if sudo ip netns exec guesta ping -c 3 -i 1 -W 2 10.0.0.6 >/dev/null 2>&1; then
+        SLOW_OK=1
+    else
+        SLOW_OK=0
+    fi
+    if [ "${FLOOD:-0}" -ge 20 ] && [ "$SLOW_OK" -eq 1 ]; then
+        echo "  rate metering OK: flood throttled (${FLOOD}% loss), slow traffic passed"
+    else
+        echo "  WARNING: metering not behaving (flood loss=${FLOOD}%, slow_ok=${SLOW_OK})"
     fi
     echo ""
 
