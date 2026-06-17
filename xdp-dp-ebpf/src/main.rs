@@ -1,27 +1,17 @@
 #![no_std]
 #![no_main]
 
+mod maps;
+mod parse;
+
 use aya_ebpf::{
     bindings::xdp_action,
     helpers::{bpf_redirect, bpf_xdp_adjust_head},
-    macros::{map, xdp},
-    maps::{Array, HashMap},
+    macros::xdp,
     programs::XdpContext,
 };
-use xdp_dp_common::{Config, IfaceKey, IfaceValue, RouteKey, RouteValue};
-
-#[map]
-static INTERFACES: HashMap<IfaceKey, IfaceValue> = HashMap::with_max_entries(1024, 0);
-#[map]
-static ROUTES: HashMap<RouteKey, RouteValue> = HashMap::with_max_entries(4096, 0);
-#[map]
-static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
-
-const ETH_LEN: usize = 14;
-const IPV6_LEN: usize = 40;
-const ETH_P_IP: u16 = 0x0800;
-const ETH_P_IPV6: u16 = 0x86DD;
-const IPPROTO_IPIP: u8 = 4; // IPv4 encapsulated in IPv6 (outer next-header)
+use maps::CONFIG;
+use parse::{write16, write6, ETH_LEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_IPIP, IPV6_LEN};
 
 /// Trivial pass program used as a redirect-target enabler: XDP redirect *into* a veth only
 /// works if the veth's peer has an XDP program attached. Attach this on those receiving ends.
@@ -121,24 +111,6 @@ fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
         core::ptr::write_unaligned(q.add(12) as *mut u16, ETH_P_IP.to_be());
     }
     Ok(unsafe { bpf_redirect(cfg.guest_ifindex, 0) } as u32)
-}
-
-#[inline(always)]
-unsafe fn write6(dst: *mut u8, src: &[u8; 6]) {
-    let mut i = 0;
-    while i < 6 {
-        *dst.add(i) = src[i];
-        i += 1;
-    }
-}
-
-#[inline(always)]
-unsafe fn write16(dst: *mut u8, src: &[u8; 16]) {
-    let mut i = 0;
-    while i < 16 {
-        *dst.add(i) = src[i];
-        i += 1;
-    }
 }
 
 #[cfg(not(test))]
