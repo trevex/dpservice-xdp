@@ -170,7 +170,8 @@ cmd_up() {
         --gateway-mac "$UB_MAC" \
         --guest "gA-h=10.0.0.5=${GA_MAC}" \
         --guest "gA2-h=10.0.0.7=${GA2_MAC}" \
-        --remote "10.0.0.6=fd00::2" &
+        --remote "10.0.0.6=fd00::2" \
+        --vip "10.0.0.7=10.0.0.100" &
     echo $! >> "$PIDFILE"
 
     # hypb: one local guest (gB=10.0.0.6) + remote routes to both hypa guests
@@ -182,7 +183,8 @@ cmd_up() {
         --gateway-mac "$UA_MAC" \
         --guest "gB-h=10.0.0.6=${GB_MAC}" \
         --remote "10.0.0.5=fd00::1" \
-        --remote "10.0.0.7=fd00::1" &
+        --remote "10.0.0.7=fd00::1" \
+        --remote "10.0.0.100=fd00::1" &
     echo $! >> "$PIDFILE"
 
     sleep 2
@@ -239,6 +241,26 @@ cmd_test() {
 
     echo "=== Test 5: return path guestb -> guesta ==="
     sudo ip netns exec guestb ping -c 3 -W 2 10.0.0.5
+    echo ""
+
+    echo "=== Test 6: VIP — guestb -> guesta2's VIP 10.0.0.100 (DNAT in, SNAT out) ==="
+    # 0% loss proves DNAT delivered to guesta2 AND its SNAT'd reply returned with a correct
+    # checksum (a bad checksum would be dropped by guestb). tcpdump prints packets to STDOUT, so
+    # redirect stdout (not just stderr) to the proof file.
+    if [[ -n "$TCPDUMP" ]]; then
+        sudo ip netns exec guestb "$TCPDUMP" -ni gB 'icmp' -c 6 >/tmp/vip-td.txt 2>&1 &
+        TDV=$!
+        sleep 0.3
+    fi
+    sudo ip netns exec guestb ping -c 3 -W 2 10.0.0.100
+    if [[ -n "$TCPDUMP" ]]; then
+        wait $TDV 2>/dev/null || true
+        echo "--- SNAT proof: echo replies must be sourced from 10.0.0.100 ---"
+        grep -E '10\.0\.0\.100 > 10\.0\.0\.6: ICMP echo reply' /tmp/vip-td.txt \
+            && echo "  SNAT proof OK: reply source is the VIP" \
+            || echo "  WARNING: no VIP-sourced reply seen"
+        rm -f /tmp/vip-td.txt
+    fi
 
     echo ""
     echo "=== All tests passed ==="

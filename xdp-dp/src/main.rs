@@ -123,6 +123,9 @@ enum Cmd {
         /// L2 next-hop is the single underlay gateway set via --gateway-mac, not per-route.
         #[arg(long = "remote")]
         remotes: Vec<String>,
+        /// VIP mapping, repeatable: "<interface_ipv4>=<vip_ipv4>" (programs both VIPS directions).
+        #[arg(long = "vip")]
+        vips: Vec<String>,
     },
 }
 
@@ -168,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
             gateway_mac,
             guests,
             remotes,
+            vips: vips_args,
         } => {
             let mut ebpf = loader::load_ebpf()?;
 
@@ -246,10 +250,21 @@ async fn main() -> anyhow::Result<()> {
                 )?;
             }
 
+            let mut vip_map = maps::Vips::open(&mut ebpf)?;
+            for v in &vips_args {
+                let (g, vip) = v.split_once('=').context("--vip must be ifaceip=vipip")?;
+                let g = parse_ipv4(g)?;
+                let vip = parse_ipv4(vip)?;
+                vip_map.upsert(xdp_dp_common::VipKey { vni: 0, ipv4: g }, vip)?; // (0,G)->V egress SNAT
+                vip_map.upsert(xdp_dp_common::VipKey { vni: 0, ipv4: vip }, g)?;
+                // (0,V)->G ingress DNAT
+            }
+
             println!(
-                "bringup: uplink={uplink} guests={} routes={}; ctrl-c to stop",
+                "bringup: uplink={uplink} guests={} routes={} vips={}; ctrl-c to stop",
                 guests.len(),
-                remotes.len()
+                remotes.len(),
+                vips_args.len()
             );
             tokio::signal::ctrl_c().await?;
         }
