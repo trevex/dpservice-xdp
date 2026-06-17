@@ -149,6 +149,13 @@ enum Cmd {
         /// Override the CONNTRACK map capacity (entries). Also settable via XDP_DP_CONNTRACK_MAX.
         #[arg(long)]
         conntrack_max: Option<u32>,
+        /// Firewall rule, repeatable:
+        /// "<ifname>:<in|eg>:<accept|drop>:<any|icmp|tcp|udp>:<src_cidr>:<dst_cidr>:<dport|*>".
+        #[arg(long = "fw-rule")]
+        fw_rules: Vec<String>,
+        /// Whether the firewall actually drops on a deny (false = evaluate-only). Default true.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        firewall_enforce: bool,
     },
 }
 
@@ -208,6 +215,8 @@ async fn main() -> anyhow::Result<()> {
             nats,
             externals,
             conntrack_max,
+            fw_rules,
+            firewall_enforce,
         } => {
             if let Some(n) = conntrack_max {
                 // SAFETY: single-threaded CLI startup, before any datapath thread is spawned.
@@ -390,16 +399,122 @@ async fn main() -> anyhow::Result<()> {
                 )?;
             }
 
+            // Firewall: each --fw-rule programs a per-interface rule; rules are appended in order
+            // to FW_RULES[(ifindex, slot)] and the per-direction counts to FW_META[ifindex].
+            // Whitelist semantics live in the datapath (empty direction => accept).
+            let mut fw_rules_map = maps::FwRules::open(&mut ebpf)?;
+            let mut fw_meta_map = maps::FwMetaMap::open(&mut ebpf)?;
+            let mut fw_config = maps::FwConfig::open(&mut ebpf)?;
+            fw_config.set(if firewall_enforce { 1 } else { 0 })?;
+            // ifindex -> (ingress_count, egress_count) accumulators while assigning slots.
+            let mut fw_slots: std::collections::HashMap<u32, u32> =
+                std::collections::HashMap::new();
+            let mut fw_counts: std::collections::HashMap<u32, (u32, u32)> =
+                std::collections::HashMap::new();
+            let parse_cidr = |s: &str| -> anyhow::Result<([u8; 4], [u8; 4])> {
+                let (ip_s, len_s) = s
+                    .split_once('/')
+                    .context("--fw-rule: cidr must be ip/len")?;
+                let ip = parse_ipv4(ip_s)?;
+                let len: u32 = len_s.parse().context("--fw-rule: bad prefix length")?;
+                anyhow::ensure!(len <= 32, "--fw-rule: prefix length > 32");
+                let mask = if len == 0 {
+                    0u32
+                } else {
+                    u32::MAX << (32 - len)
+                };
+                Ok((ip, mask.to_be_bytes()))
+            };
+            for spec in &fw_rules {
+                let f: Vec<&str> = spec.split(':').collect();
+                anyhow::ensure!(
+                    f.len() == 7,
+                    "--fw-rule must be ifname:dir:action:proto:src_cidr:dst_cidr:dport, got {spec:?}"
+                );
+                let ifindex = ifindex(f[0])?;
+                let direction = match f[1] {
+                    "in" => xdp_dp_common::FW_DIR_INGRESS,
+                    "eg" => xdp_dp_common::FW_DIR_EGRESS,
+                    o => anyhow::bail!("--fw-rule dir must be in|eg, got {o}"),
+                };
+                let action = match f[2] {
+                    "accept" => xdp_dp_common::FW_ACTION_ACCEPT,
+                    "drop" => xdp_dp_common::FW_ACTION_DROP,
+                    o => anyhow::bail!("--fw-rule action must be accept|drop, got {o}"),
+                };
+                let proto: u8 = match f[3] {
+                    "any" => 0,
+                    "icmp" => 1,
+                    "tcp" => 6,
+                    "udp" => 17,
+                    o => anyhow::bail!("--fw-rule proto must be any|icmp|tcp|udp, got {o}"),
+                };
+                let (src_ip, src_mask) = parse_cidr(f[4])?;
+                let (dst_ip, dst_mask) = parse_cidr(f[5])?;
+                let (dst_port_min, dst_port_max) = if f[6] == "*" {
+                    (0u16, 65535u16)
+                } else {
+                    let p: u16 = f[6].parse().context("--fw-rule: bad dport")?;
+                    (p, p)
+                };
+                let slot = fw_slots.entry(ifindex).or_insert(0);
+                anyhow::ensure!(
+                    *slot < xdp_dp_common::FW_MAX_RULES,
+                    "--fw-rule: more than {} rules for {}",
+                    xdp_dp_common::FW_MAX_RULES,
+                    f[0]
+                );
+                fw_rules_map.upsert(
+                    xdp_dp_common::FwRuleKey {
+                        ifindex,
+                        idx: *slot,
+                    },
+                    xdp_dp_common::FwRule {
+                        src_ip,
+                        src_mask,
+                        dst_ip,
+                        dst_mask,
+                        src_port_min: 0,
+                        src_port_max: 65535,
+                        dst_port_min,
+                        dst_port_max,
+                        icmp_type: 0xffff,
+                        icmp_code: 0xffff,
+                        proto,
+                        action,
+                        direction,
+                        enabled: 1,
+                    },
+                )?;
+                *slot += 1;
+                let c = fw_counts.entry(ifindex).or_insert((0, 0));
+                if direction == xdp_dp_common::FW_DIR_EGRESS {
+                    c.1 += 1;
+                } else {
+                    c.0 += 1;
+                }
+            }
+            for (ifindex, (ingress_count, egress_count)) in &fw_counts {
+                fw_meta_map.upsert(
+                    *ifindex,
+                    xdp_dp_common::FwMeta {
+                        ingress_count: *ingress_count,
+                        egress_count: *egress_count,
+                    },
+                )?;
+            }
+
             let ct = maps::Conntrack::open(&mut ebpf)?;
             tokio::spawn(conntrack_gc::run(ct, std::time::Duration::from_secs(10)));
 
             println!(
-                "bringup: uplink={uplink} guests={} routes={} vips={} lbs={} nats={}; ctrl-c to stop",
+                "bringup: uplink={uplink} guests={} routes={} vips={} lbs={} nats={} fw={}; ctrl-c to stop",
                 guests.len(),
                 remotes.len(),
                 vips_args.len(),
                 lbs.len(),
-                nats.len()
+                nats.len(),
+                fw_rules.len()
             );
             tokio::signal::ctrl_c().await?;
         }

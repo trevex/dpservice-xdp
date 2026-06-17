@@ -206,7 +206,10 @@ cmd_up() {
         --remote "10.0.0.7=fd00::1" \
         --remote "10.0.0.100=fd00::1" \
         --remote "10.0.0.200=fd00::1" \
-        --remote "10.0.0.50=fd00::1" &
+        --remote "10.0.0.50=fd00::1" \
+        --firewall-enforce true \
+        --fw-rule "gB-h:in:accept:icmp:10.0.0.5/32:0.0.0.0/0:*" \
+        --fw-rule "gB-h:in:drop:icmp:10.0.0.7/32:0.0.0.0/0:*" &
     echo $! >> "$PIDFILE"
 
     sleep 2
@@ -243,8 +246,21 @@ cmd_test() {
     fi
     echo ""
 
-    echo "=== Test 3: MULTI-INTERFACE — guesta2 (hypa's second guest) -> guestb ==="
-    sudo ip netns exec guesta2 ping -c 3 -W 2 10.0.0.6
+    echo "=== Test 3: FIREWALL — guestb ingress accepts guesta(10.0.0.5), drops guesta2(10.0.0.7) ==="
+    # gB-h has an ingress whitelist: accept ICMP from 10.0.0.5, drop ICMP from 10.0.0.7. This also
+    # exercises hypa's second interface (guesta2/gA2-h) — its packets reach the datapath and are
+    # dropped by policy at hypb (not by the link being down; guesta2 connectivity is also proven by
+    # the VIP (Test 6) and LB (Test 7) tests).
+    if sudo ip netns exec guesta ping -c 2 -W 2 10.0.0.6 >/dev/null 2>&1; then
+        echo "  ACCEPT-rule OK: guesta(10.0.0.5) -> guestb reaches"
+    else
+        echo "  WARNING: accepted source guesta could NOT reach guestb"
+    fi
+    if sudo ip netns exec guesta2 ping -c 2 -W 2 10.0.0.6 >/dev/null 2>&1; then
+        echo "  WARNING: drop-rule did NOT block guesta2(10.0.0.7) -> guestb"
+    else
+        echo "  DROP-rule OK: guesta2(10.0.0.7) -> guestb blocked by ingress firewall"
+    fi
     echo ""
 
     echo "=== Test 4: IPv6/proto-4 encap evidence on bridge (uA-br) ==="
