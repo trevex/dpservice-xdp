@@ -1,8 +1,8 @@
 use aya_ebpf::programs::XdpContext;
-use xdp_dp_common::{CtEntry, CtKey, NatKey};
+use xdp_dp_common::{CtEntry, CtKey, NatKey, NeighborNatEntry, NB_MAX_ENTRIES};
 
 use crate::csum::csum_replace4;
-use crate::maps::NAT;
+use crate::maps::{NAT, NEIGHBOR_NAT, NEIGHBOR_NAT_COUNT};
 use crate::parse::{hash5, l4_ports};
 
 const IPPROTO_ICMP: u8 = 1;
@@ -149,4 +149,32 @@ pub fn nat_snat_egress(ctx: &XdpContext, ip_off: usize, vni: u32, is_external: b
         }
     }
     true
+}
+
+/// If `(vni, dst, dport)` matches a neighbor-NAT entry, return the owning node's underlay /128.
+#[inline(always)]
+pub fn neighbor_nat_lookup(vni: u32, dst: [u8; 4], dport: u16) -> Option<[u8; 16]> {
+    let count = match NEIGHBOR_NAT_COUNT.get(0) {
+        Some(c) => *c,
+        None => return None,
+    };
+    let mut idx: u32 = 0;
+    while idx < NB_MAX_ENTRIES {
+        if idx >= count {
+            break;
+        }
+        if let Some(e) = unsafe { NEIGHBOR_NAT.get(&idx) } {
+            let e: NeighborNatEntry = *e;
+            if e.enabled != 0
+                && e.vni == vni
+                && e.nat_ip == dst
+                && dport >= e.port_min
+                && dport < e.port_max
+            {
+                return Some(e.underlay);
+            }
+        }
+        idx += 1;
+    }
+    None
 }

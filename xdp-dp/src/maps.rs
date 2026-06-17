@@ -6,8 +6,8 @@ use aya::maps::{
 use aya::Ebpf;
 use xdp_dp_common::{
     Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
-    LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteLpmData, RouteValue, UnderlayValue,
-    VipKey,
+    LbValue, Local, MaglevKey, NatKey, NatValue, NeighborNatEntry, PortMeta, RouteLpmData,
+    RouteValue, UnderlayValue, VipKey,
 };
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
@@ -398,6 +398,54 @@ impl Underlay {
 
     pub fn get(&self, key: &[u8; 16]) -> Option<UnderlayValue> {
         self.map.get(key, 0).ok()
+    }
+}
+
+/// Typed handle over the `NEIGHBOR_NAT` BPF map (slot index -> NeighborNatEntry).
+#[allow(dead_code)]
+pub struct NeighborNat {
+    map: HashMap<MapData, u32, NeighborNatEntry>,
+}
+
+#[allow(dead_code)]
+impl NeighborNat {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(
+            ebpf.take_map("NEIGHBOR_NAT")
+                .context("NEIGHBOR_NAT map missing")?,
+        )?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, idx: u32, val: NeighborNatEntry) -> anyhow::Result<()> {
+        self.map.insert(idx, val, 0).context("insert neighbor_nat")
+    }
+
+    pub fn remove(&mut self, idx: &u32) -> anyhow::Result<()> {
+        self.map.remove(idx).context("remove neighbor_nat")
+    }
+}
+
+/// Typed handle over the single-entry `NEIGHBOR_NAT_COUNT` Array map.
+#[allow(dead_code)]
+pub struct NeighborNatCount {
+    map: Array<MapData, u32>,
+}
+
+#[allow(dead_code)]
+impl NeighborNatCount {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = Array::try_from(
+            ebpf.take_map("NEIGHBOR_NAT_COUNT")
+                .context("NEIGHBOR_NAT_COUNT map missing")?,
+        )?;
+        Ok(Self { map })
+    }
+
+    pub fn set(&mut self, count: u32) -> anyhow::Result<()> {
+        self.map
+            .set(0, &count, 0)
+            .context("write NEIGHBOR_NAT_COUNT[0]")
     }
 }
 

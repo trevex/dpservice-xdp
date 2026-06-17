@@ -66,6 +66,24 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     let tap_ifindex = deliver_u.tap_ifindex;
     let guest_mac = deliver_u.guest_mac;
 
+    // Neighbor NAT: if this inbound packet is destined to a nat_ip owned by ANOTHER node (and we
+    // are not the LB target / local NAT owner), re-forward it to the owner's underlay.
+    if lb_ul.is_none() && nat_guest.is_none() {
+        let d = ctx.data();
+        let de = ctx.data_end();
+        let off = ETH_LEN + IPV6_LEN;
+        if d + off + 20 <= de {
+            let q = d as *const u8;
+            let inner_dst = unsafe { core::ptr::read_unaligned(q.add(off + 16) as *const [u8; 4]) };
+            if let Some((_proto, _sport, dport)) = crate::parse::l4_ports(d, de, off) {
+                if let Some(owner_ul) = crate::nat::neighbor_nat_lookup(vni, inner_dst, dport) {
+                    let local = LOCAL.get(0).ok_or(())?;
+                    return Ok(crate::encap::reforward(ctx, local, &outer_dst, &owner_ul));
+                }
+            }
+        }
+    }
+
     // Ingress firewall: enforce the DESTINATION interface's INGRESS rules on NEW inbound flows
     // (established flows — including seeded returns — already have a conntrack entry, so they are
     // allowed without re-evaluation). Runs on the post-LB/NAT-DNAT inner 5-tuple.

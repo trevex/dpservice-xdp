@@ -161,6 +161,16 @@ enum Cmd {
         /// Whether the firewall actually drops on a deny (false = evaluate-only). Default true.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         firewall_enforce: bool,
+        /// Neighbor NAT entry, repeatable:
+        /// "<nat_ip>:<port_min>:<port_max>@<owner_underlay_ipv6>@<vni>". Programs NEIGHBOR_NAT
+        /// so that return traffic to nat_ip:dport is re-forwarded to the owner's underlay node.
+        #[arg(long = "neigh-nat")]
+        neigh_nats: Vec<String>,
+        /// Underlay VNI marker, repeatable: "<ipv6>:<vni>". Programs UNDERLAY[ipv6] with a
+        /// vni-only entry (tap_ifindex=0, guest_mac=[0;6]) so that uplink_rx can resolve the VNI
+        /// for a NAT-gateway node that does not host a local interface.
+        #[arg(long = "underlay-marker")]
+        underlay_markers: Vec<String>,
     },
 }
 
@@ -222,6 +232,8 @@ async fn main() -> anyhow::Result<()> {
             conntrack_max,
             fw_rules,
             firewall_enforce,
+            neigh_nats,
+            underlay_markers,
         } => {
             if let Some(n) = conntrack_max {
                 // SAFETY: single-threaded CLI startup, before any datapath thread is spawned.
@@ -555,17 +567,87 @@ async fn main() -> anyhow::Result<()> {
                 )?;
             }
 
+            // --underlay-marker: "<ipv6>:<vni>" — program a VNI-only marker into UNDERLAY so that
+            // uplink_rx can resolve a VNI for a NAT-gateway node without a local guest interface.
+            // The IPv6 may contain colons so we split on the LAST ':' to extract the vni field.
+            for spec in &underlay_markers {
+                let pos = spec
+                    .rfind(':')
+                    .context("--underlay-marker must be <ipv6>:<vni>")?;
+                let ipv6_s = &spec[..pos];
+                let vni: u32 = spec[pos + 1..]
+                    .parse()
+                    .context("--underlay-marker: bad vni")?;
+                let ul = parse_ipv6(ipv6_s)?;
+                underlay_map.upsert(
+                    ul,
+                    xdp_dp_common::UnderlayValue {
+                        vni,
+                        tap_ifindex: 0,
+                        guest_mac: [0; 6],
+                        _pad: [0; 2],
+                    },
+                )?;
+            }
+
+            // --neigh-nat: "<nat_ip>:<port_min>:<port_max>@<owner_underlay_ipv6>@<vni>"
+            // We split on '@' to avoid colon-ambiguity with the IPv6 in the middle segment.
+            let mut neigh_nat_map = maps::NeighborNat::open(&mut ebpf)?;
+            let mut neigh_nat_count_map = maps::NeighborNatCount::open(&mut ebpf)?;
+            let mut neigh_nat_idx: u32 = 0;
+            for spec in &neigh_nats {
+                anyhow::ensure!(
+                    neigh_nat_idx < xdp_dp_common::NB_MAX_ENTRIES,
+                    "--neigh-nat: too many entries (max {})",
+                    xdp_dp_common::NB_MAX_ENTRIES
+                );
+                let parts: Vec<&str> = spec.splitn(3, '@').collect();
+                anyhow::ensure!(
+                    parts.len() == 3,
+                    "--neigh-nat must be <nat_ip>:<port_min>:<port_max>@<underlay_ipv6>@<vni>, got {spec:?}"
+                );
+                let head = parts[0];
+                let underlay_s = parts[1];
+                let vni: u32 = parts[2].parse().context("--neigh-nat: bad vni")?;
+                let underlay = parse_ipv6(underlay_s)?;
+                let mut it = head.split(':');
+                let nat_ip = parse_ipv4(it.next().context("--neigh-nat: missing nat_ip")?)?;
+                let port_min: u16 = it
+                    .next()
+                    .context("--neigh-nat: missing port_min")?
+                    .parse()?;
+                let port_max: u16 = it
+                    .next()
+                    .context("--neigh-nat: missing port_max")?
+                    .parse()?;
+                neigh_nat_map.upsert(
+                    neigh_nat_idx,
+                    xdp_dp_common::NeighborNatEntry {
+                        underlay,
+                        nat_ip,
+                        vni,
+                        port_min,
+                        port_max,
+                        enabled: 1,
+                        _pad: [0; 3],
+                    },
+                )?;
+                neigh_nat_idx += 1;
+            }
+            neigh_nat_count_map.set(neigh_nat_idx)?;
+
             let ct = maps::Conntrack::open(&mut ebpf)?;
             tokio::spawn(conntrack_gc::run(ct, std::time::Duration::from_secs(10)));
 
             println!(
-                "bringup: uplink={uplink} guests={} routes={} vips={} lbs={} nats={} fw={}; ctrl-c to stop",
+                "bringup: uplink={uplink} guests={} routes={} vips={} lbs={} nats={} fw={} neigh_nats={}; ctrl-c to stop",
                 guests.len(),
                 remotes.len(),
                 vips_args.len(),
                 lbs.len(),
                 nats.len(),
-                fw_rules.len()
+                fw_rules.len(),
+                neigh_nats.len()
             );
             tokio::signal::ctrl_c().await?;
         }

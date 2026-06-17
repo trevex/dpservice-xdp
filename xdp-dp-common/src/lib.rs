@@ -270,6 +270,23 @@ pub const FW_DIR_EGRESS: u8 = 1;
 pub const FW_ACTION_DROP: u8 = 0;
 pub const FW_ACTION_ACCEPT: u8 = 1;
 
+/// Maximum number of neighbor-NAT entries the datapath will scan.
+pub const NB_MAX_ENTRIES: u32 = 64;
+
+/// A neighbor-NAT entry: a remote node owns `(vni, nat_ip, [port_min, port_max))`; return traffic
+/// to that nat_ip:port is re-forwarded to `underlay`. `enabled` 1 = slot in use.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct NeighborNatEntry {
+    pub underlay: [u8; 16],
+    pub nat_ip: [u8; 4],
+    pub vni: u32,
+    pub port_min: u16,
+    pub port_max: u16,
+    pub enabled: u8,
+    pub _pad: [u8; 3],
+}
+
 /// Pure firewall match (no_std; used by the datapath and host-tested). Returns true if `r` matches
 /// the packet selectors. `icmp_type`/`icmp_code` are ignored unless `proto == 1`.
 #[inline]
@@ -362,6 +379,7 @@ mod user_impls {
     unsafe impl aya::Pod for FwRuleKey {}
     unsafe impl aya::Pod for FwRule {}
     unsafe impl aya::Pod for FwMeta {}
+    unsafe impl aya::Pod for NeighborNatEntry {}
 }
 
 #[cfg(test)]
@@ -438,6 +456,14 @@ mod tests {
         assert_eq!(core::mem::size_of::<FwRule>(), 32);
         // 4 (ingress_count) + 4 (egress_count) = 8.
         assert_eq!(core::mem::size_of::<FwMeta>(), 8);
+    }
+
+    #[test]
+    fn neighbor_nat_entry_layout() {
+        // 16 (underlay) + 4 (nat_ip) + 4 (vni) + 2 (port_min) + 2 (port_max)
+        // + 1 (enabled) + 3 (_pad) = 32.
+        assert_eq!(core::mem::size_of::<NeighborNatEntry>(), 32);
+        assert_eq!(core::mem::align_of::<NeighborNatEntry>(), 4);
     }
 
     #[test]

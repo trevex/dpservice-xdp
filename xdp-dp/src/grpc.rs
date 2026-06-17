@@ -757,24 +757,84 @@ impl DpdKironcore for Service {
 
     async fn create_neighbor_nat(
         &self,
-        _req: Request<CreateNeighborNatRequest>,
+        req: Request<CreateNeighborNatRequest>,
     ) -> Result<Response<CreateNeighborNatResponse>, Status> {
-        // Distributed (multi-node) NAT return is out of scope for the single-node PoC; accept + OK.
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let nat_addr = r
+            .nat_ip
+            .ok_or_else(|| Status::invalid_argument("nat_ip is required"))?;
+        let nat_ip = decode_ipv4(&nat_addr.address)?;
+        let underlay = decode_ipv6(&r.underlay_route)?;
+        control
+            .add_neighbor_nat(
+                r.vni,
+                nat_ip,
+                r.min_port as u16,
+                r.max_port as u16,
+                underlay,
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(CreateNeighborNatResponse { status: ok() }))
     }
 
     async fn delete_neighbor_nat(
         &self,
-        _req: Request<DeleteNeighborNatRequest>,
+        req: Request<DeleteNeighborNatRequest>,
     ) -> Result<Response<DeleteNeighborNatResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let nat_addr = r
+            .nat_ip
+            .ok_or_else(|| Status::invalid_argument("nat_ip is required"))?;
+        let nat_ip = decode_ipv4(&nat_addr.address)?;
+        control
+            .del_neighbor_nat(r.vni, nat_ip, r.min_port as u16, r.max_port as u16)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(DeleteNeighborNatResponse { status: ok() }))
     }
 
     async fn list_neighbor_nats(
         &self,
-        _req: Request<ListNeighborNatsRequest>,
+        req: Request<ListNeighborNatsRequest>,
     ) -> Result<Response<ListNeighborNatsResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        // Filter by nat_ip if provided, otherwise return all.
+        let filter_ip: Option<[u8; 4]> = r
+            .nat_ip
+            .as_ref()
+            .map(|addr| decode_ipv4(&addr.address))
+            .transpose()?;
+        let entries = control
+            .list_neighbor_nats()
+            .into_iter()
+            .filter(|e| filter_ip.is_none() || filter_ip.as_ref() == Some(&e.nat_ip))
+            .map(|e| pb::NatEntry {
+                nat_ip: Some(IpAddress {
+                    ipver: IpVersion::Ipv4 as i32,
+                    address: e.nat_ip.to_vec(),
+                }),
+                min_port: e.port_min as u32,
+                max_port: e.port_max as u32,
+                underlay_route: e.underlay.to_vec(),
+                vni: e.vni,
+                actual_nat_ip: None,
+            })
+            .collect();
+        Ok(Response::new(ListNeighborNatsResponse {
+            status: ok(),
+            nat_entries: entries,
+        }))
     }
 
     async fn list_routes(

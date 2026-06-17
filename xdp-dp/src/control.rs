@@ -5,12 +5,14 @@ use anyhow::Context as _;
 use aya::Ebpf;
 use xdp_dp_common::{
     FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, LbKey, LbValue, Local, MaglevKey, NatKey,
-    NatValue, PortMeta, RouteValue, VipKey, FW_DIR_EGRESS, FW_MAX_RULES,
+    NatValue, NeighborNatEntry, PortMeta, RouteValue, VipKey, FW_DIR_EGRESS, FW_MAX_RULES,
+    NB_MAX_ENTRIES,
 };
 
 use crate::loader;
 use crate::maps::{
-    Conntrack, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev, Nat, PortMetaMap, Routes, Vips,
+    Conntrack, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev, Nat, NeighborNat,
+    NeighborNatCount, PortMetaMap, Routes, Vips,
 };
 
 /// Registered load balancer: its Maglev table id, the (port,proto) services it answers, and the
@@ -44,6 +46,10 @@ struct Inner {
     fw_rules: FwRules,
     fw_meta: FwMetaMap,
     underlay: crate::maps::Underlay,
+    neigh_nat: NeighborNat,
+    neigh_nat_count: NeighborNatCount,
+    /// In-memory neighbor NAT entries (drives the BPF map reprogram).
+    neigh_nats: Vec<NeighborNatEntry>,
     /// loadbalancer_id -> its LB state.
     lbs: HashMap<Vec<u8>, LbEntry>,
     next_table_id: u32,
@@ -87,6 +93,8 @@ impl Control {
         let fw_rules = FwRules::open(&mut ebpf)?;
         let fw_meta = FwMetaMap::open(&mut ebpf)?;
         let underlay = crate::maps::Underlay::open(&mut ebpf)?;
+        let neigh_nat = NeighborNat::open(&mut ebpf)?;
+        let neigh_nat_count = NeighborNatCount::open(&mut ebpf)?;
         let conntrack = Conntrack::open(&mut ebpf)?;
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -101,6 +109,10 @@ impl Control {
                 nat,
                 fw_rules,
                 fw_meta,
+                underlay,
+                neigh_nat,
+                neigh_nat_count,
+                neigh_nats: Vec::new(),
                 lbs: HashMap::new(),
                 next_table_id: 1,
                 by_id: HashMap::new(),
@@ -108,7 +120,6 @@ impl Control {
                 iface_underlay: HashMap::new(),
                 prefixes: HashMap::new(),
                 fw: HashMap::new(),
-                underlay,
             }),
             conntrack: Mutex::new(Some(conntrack)),
         })
@@ -536,5 +547,76 @@ impl Control {
     pub fn list_prefixes(&self, interface_id: &[u8]) -> Vec<([u8; 4], u32)> {
         let g = self.inner.lock().unwrap();
         g.prefixes.get(interface_id).cloned().unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
+    // Neighbor NAT management (distributed NAT return)
+    // -----------------------------------------------------------------------
+
+    /// Reprogram NEIGHBOR_NAT and NEIGHBOR_NAT_COUNT from the in-memory vec.
+    fn neigh_nat_reprogram(g: &mut Inner) -> anyhow::Result<()> {
+        let n = g.neigh_nats.len() as u32;
+        for (i, e) in g.neigh_nats.iter().enumerate() {
+            g.neigh_nat.upsert(i as u32, *e)?;
+        }
+        g.neigh_nat_count.set(n)?;
+        Ok(())
+    }
+
+    /// Add a neighbor-NAT entry (capped at NB_MAX_ENTRIES).
+    pub fn add_neighbor_nat(
+        &self,
+        vni: u32,
+        nat_ip: [u8; 4],
+        port_min: u16,
+        port_max: u16,
+        underlay: [u8; 16],
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        if g.neigh_nats.len() >= NB_MAX_ENTRIES as usize {
+            anyhow::bail!("neighbor NAT table full (max {})", NB_MAX_ENTRIES);
+        }
+        // Deduplicate: replace existing entry with same (vni, nat_ip, port_min, port_max).
+        if let Some(slot) = g.neigh_nats.iter_mut().find(|e| {
+            e.vni == vni && e.nat_ip == nat_ip && e.port_min == port_min && e.port_max == port_max
+        }) {
+            slot.underlay = underlay;
+            slot.enabled = 1;
+        } else {
+            g.neigh_nats.push(NeighborNatEntry {
+                underlay,
+                nat_ip,
+                vni,
+                port_min,
+                port_max,
+                enabled: 1,
+                _pad: [0; 3],
+            });
+        }
+        Self::neigh_nat_reprogram(&mut g)
+    }
+
+    /// Remove a neighbor-NAT entry matching (vni, nat_ip, port_min, port_max).
+    pub fn del_neighbor_nat(
+        &self,
+        vni: u32,
+        nat_ip: [u8; 4],
+        port_min: u16,
+        port_max: u16,
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        g.neigh_nats.retain(|e| {
+            !(e.vni == vni
+                && e.nat_ip == nat_ip
+                && e.port_min == port_min
+                && e.port_max == port_max)
+        });
+        Self::neigh_nat_reprogram(&mut g)
+    }
+
+    /// List all neighbor-NAT entries.
+    pub fn list_neighbor_nats(&self) -> Vec<NeighborNatEntry> {
+        let g = self.inner.lock().unwrap();
+        g.neigh_nats.clone()
     }
 }
