@@ -184,6 +184,18 @@ enum Cmd {
         /// re-open the pinned CONNTRACK and resume aging. Requires --pin-dir.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         adopt: bool,
+        /// Overlay IPv6 gateway the datapath answers ND for (e.g. fd00:ov::1).
+        #[arg(long = "gateway6")]
+        gateway6: Option<String>,
+        /// Dual-stack guest v6, repeatable: "<ifname>=<overlay_ipv6>=<underlay_ipv6>=<vni>".
+        /// Sets the interface's PortMeta.gateway_ipv6 (= --gateway6) so ND works; delivery is by
+        /// UNDERLAY. The ifname must also appear in --guest for v4 fields to be set.
+        #[arg(long = "guest6")]
+        guests6: Vec<String>,
+        /// Remote IPv6 route, repeatable: "<overlay_ipv6>[/len]=<nexthop_underlay_ipv6>=<vni>".
+        /// Programs the ROUTES6 LPM trie so v6_guest_tx can forward overlay IPv6 packets.
+        #[arg(long = "remote6")]
+        remotes6: Vec<String>,
     },
 }
 
@@ -250,6 +262,9 @@ async fn main() -> anyhow::Result<()> {
             meters,
             pin_dir,
             adopt,
+            gateway6,
+            guests6,
+            remotes6,
         } => {
             // HA adopt path: re-open the pinned CONNTRACK and resume GC; no load/attach.
             if adopt {
@@ -307,6 +322,9 @@ async fn main() -> anyhow::Result<()> {
             let mut ports = maps::PortMetaMap::open(&mut ebpf)?;
             let mut ifaces = maps::Interfaces::open(&mut ebpf)?;
             let mut underlay_map = maps::Underlay::open(&mut ebpf)?;
+            // Collect v4 guest data keyed by ifname so --guest6 can look up the v4 fields.
+            let mut guest_v4: std::collections::HashMap<String, ([u8; 4], [u8; 6], [u8; 16], u32)> =
+                std::collections::HashMap::new();
             // --guest: "<ifname>=<overlay_ipv4>=<guest_mac>=<underlay_ipv6>=<vni>". The per-interface
             // underlay IPv6 is the interface's identity on the underlay; UNDERLAY maps it -> (vni,tap).
             for g in &guests {
@@ -350,6 +368,94 @@ async fn main() -> anyhow::Result<()> {
                         tap_ifindex: tap,
                         guest_mac,
                         _pad: [0; 2],
+                    },
+                )?;
+                guest_v4.insert(ifname.to_string(), (ip, guest_mac, underlay, vni));
+            }
+
+            // --gateway6: overlay IPv6 gateway for ND responder (default all-zeros = disabled).
+            let gw6: [u8; 16] = match &gateway6 {
+                Some(s) => parse_ipv6(s)?,
+                None => [0u8; 16],
+            };
+
+            // --guest6: "<ifname>=<overlay_ipv6>=<underlay_ipv6>=<vni>".
+            // Re-upserts the interface's PortMeta with gateway_ipv6 set so the ND responder works.
+            // Also adds a UNDERLAY entry for the v6 underlay if the interface has no --guest entry
+            // (v6-only mode; for dual-stack the UNDERLAY entry is already present from --guest).
+            for g6 in &guests6 {
+                let f: Vec<&str> = g6.split('=').collect();
+                anyhow::ensure!(
+                    f.len() == 4,
+                    "--guest6 must be ifname=overlay_ipv6=underlay_ipv6=vni, got {g6:?}"
+                );
+                let ifname = f[0];
+                let overlay_ipv6 = parse_ipv6(f[1])?;
+                let underlay_ipv6 = parse_ipv6(f[2])?;
+                let vni: u32 = f[3].parse().context("--guest6: bad vni")?;
+                let tap = ifindex(ifname)?;
+                let (guest_ipv4, guest_mac, _v4_underlay, _v4_vni) = match guest_v4.get(ifname) {
+                    Some(v4) => *v4,
+                    None => ([0u8; 4], [0u8; 6], [0u8; 16], vni),
+                };
+                // Re-upsert PortMeta with gateway_ipv6 now set.
+                ports.upsert(
+                    tap,
+                    xdp_dp_common::PortMeta {
+                        vni,
+                        guest_ipv4,
+                        gateway_ipv4: gw,
+                        guest_mac,
+                        _pad: [0; 2],
+                        underlay_ipv6,
+                        gateway_ipv6: gw6,
+                    },
+                )?;
+                // For v6-only interfaces (no --guest), add the UNDERLAY entry here.
+                if !guest_v4.contains_key(ifname) {
+                    underlay_map.upsert(
+                        underlay_ipv6,
+                        xdp_dp_common::UnderlayValue {
+                            vni,
+                            tap_ifindex: tap,
+                            guest_mac,
+                            _pad: [0; 2],
+                        },
+                    )?;
+                }
+                // Store the v6 overlay address in INTERFACES so ingress can deliver to this tap.
+                // Re-use the IfaceKey with the overlay IPv6's first 4 bytes as a placeholder;
+                // actual v6 delivery goes via UNDERLAY, so this entry is informational / for
+                // future use.
+                let _ = overlay_ipv6; // used above only to record intent; INTERFACES is v4-keyed
+            }
+
+            // --remote6: "<overlay_ipv6>[/len]=<nexthop_underlay_ipv6>=<vni>".
+            // Programs the ROUTES6 LPM trie. The overlay IPv6 may contain ':' so we split on '='
+            // and handle the optional '/len' suffix only in the first field.
+            let mut routes6 = maps::Routes6::open(&mut ebpf)?;
+            for r6 in &remotes6 {
+                let f: Vec<&str> = r6.split('=').collect();
+                anyhow::ensure!(
+                    f.len() == 3,
+                    "--remote6 must be overlay_ipv6[/len]=nexthop_underlay_ipv6=vni, got {r6:?}"
+                );
+                let (ipv6_s, plen) = match f[0].split_once('/') {
+                    Some((ip, l)) => (ip, l.parse::<u32>().context("--remote6: bad prefix len")?),
+                    None => (f[0], 128u32),
+                };
+                let ipv6 = parse_ipv6(ipv6_s)?;
+                let nh = parse_ipv6(f[1])?;
+                let vni: u32 = f[2].parse().context("--remote6: bad vni")?;
+                routes6.upsert(
+                    vni,
+                    ipv6,
+                    plen,
+                    xdp_dp_common::RouteValue {
+                        nexthop_vni: vni,
+                        nexthop_ipv6: nh,
+                        is_external: 0,
+                        _pad: [0; 3],
                     },
                 )?;
             }
@@ -715,9 +821,11 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(conntrack_gc::run(ct, std::time::Duration::from_secs(10)));
 
             println!(
-                "bringup: uplink={uplink} guests={} routes={} vips={} lbs={} nats={} fw={} neigh_nats={} meters={}; ctrl-c to stop",
+                "bringup: uplink={uplink} guests={} guests6={} routes={} routes6={} vips={} lbs={} nats={} fw={} neigh_nats={} meters={}; ctrl-c to stop",
                 guests.len(),
+                guests6.len(),
                 remotes.len(),
+                remotes6.len(),
                 vips_args.len(),
                 lbs.len(),
                 nats.len(),

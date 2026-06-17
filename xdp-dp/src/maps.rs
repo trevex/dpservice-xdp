@@ -7,7 +7,7 @@ use aya::Ebpf;
 use xdp_dp_common::{
     Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
     LbValue, Local, MaglevKey, MeterState, NatKey, NatValue, NeighborNatEntry, PortMeta,
-    RouteLpmData, RouteValue, UnderlayValue, VipKey,
+    RouteLpmData, RouteLpmData6, RouteValue, UnderlayValue, VipKey,
 };
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
@@ -161,6 +161,37 @@ impl Routes {
             },
         );
         self.map.remove(&key).context("remove route")
+    }
+}
+
+/// Typed handle over the `ROUTES6` BPF LPM trie map (IPv6 overlay routes).
+#[allow(dead_code)]
+pub struct Routes6 {
+    map: LpmTrie<MapData, RouteLpmData6, RouteValue>,
+}
+
+#[allow(dead_code)]
+impl Routes6 {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = LpmTrie::try_from(ebpf.take_map("ROUTES6").context("ROUTES6 map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(
+        &mut self,
+        vni: u32,
+        ipv6: [u8; 16],
+        prefix_len: u32,
+        val: RouteValue,
+    ) -> anyhow::Result<()> {
+        let key = Key::new(
+            32 + prefix_len.min(128),
+            RouteLpmData6 {
+                vni: vni.to_be_bytes(),
+                ipv6,
+            },
+        );
+        self.map.insert(&key, val, 0).context("insert route6")
     }
 }
 

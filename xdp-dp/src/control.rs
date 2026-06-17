@@ -12,7 +12,7 @@ use xdp_dp_common::{
 use crate::loader;
 use crate::maps::{
     Conntrack, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev, Meter, Nat, NeighborNat,
-    NeighborNatCount, PortMetaMap, Routes, Vips,
+    NeighborNatCount, PortMetaMap, Routes, Routes6, Vips,
 };
 
 /// Registered load balancer: its Maglev table id, the (port,proto) services it answers, and the
@@ -39,6 +39,7 @@ struct Inner {
     ports: PortMetaMap,
     ifaces: Interfaces,
     routes: Routes,
+    routes6: Routes6,
     vips: Vips,
     lb: Lb,
     maglev: Maglev,
@@ -87,6 +88,7 @@ impl Control {
         let ports = PortMetaMap::open(&mut ebpf)?;
         let ifaces = Interfaces::open(&mut ebpf)?;
         let routes = Routes::open(&mut ebpf)?;
+        let routes6 = Routes6::open(&mut ebpf)?;
         let vips = Vips::open(&mut ebpf)?;
         let lb = Lb::open(&mut ebpf)?;
         let maglev = Maglev::open(&mut ebpf)?;
@@ -105,6 +107,7 @@ impl Control {
                 ports,
                 ifaces,
                 routes,
+                routes6,
                 vips,
                 lb,
                 maglev,
@@ -248,6 +251,28 @@ impl Control {
             },
         )?;
         Ok(())
+    }
+
+    pub fn create_route6(
+        &self,
+        vni: u32,
+        ipv6: [u8; 16],
+        prefix_len: u32,
+        nexthop_ipv6: [u8; 16],
+        is_external: bool,
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        g.routes6.upsert(
+            vni,
+            ipv6,
+            prefix_len,
+            RouteValue {
+                nexthop_vni: vni,
+                nexthop_ipv6,
+                is_external: is_external as u8,
+                _pad: [0; 3],
+            },
+        )
     }
 
     /// Register a load balancer: allocate a Maglev table id and program the `LB` map for each
