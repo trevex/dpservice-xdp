@@ -26,6 +26,9 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     if ethertype != ETH_P_IP {
         return Ok(xdp_action::XDP_PASS);
     }
+    // LB return path: if this egress flow matches a tracked LB conntrack entry, restore the source
+    // from the backend address back to the LB IP before VIP-SNAT / routing.
+    crate::lb::ct_reverse_snat(ctx, ETH_LEN);
     // SNAT: rewrite inner IPv4 source if a VIP mapping exists (G->V).
     crate::vip::snat_egress(ctx, ETH_LEN, meta.vni);
     // inner IPv4 dst at ETH_LEN + 16

@@ -76,3 +76,57 @@ pub fn lb_select_dnat(ctx: &XdpContext, ip_off: usize, vni: u32) -> Option<[u8; 
     let _ = CONNTRACK.insert(&key, &CtVal { lb_ipv4: dst }, 0u64);
     Some(backend)
 }
+
+/// On a guest's egress, if this flow is a tracked LB return, SNAT the source back to the LB IP.
+#[inline(always)]
+pub fn ct_reverse_snat(ctx: &XdpContext, ip_off: usize) {
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + ip_off + 20 > data_end {
+        return;
+    }
+    let p = data as *mut u8;
+    let src = unsafe { core::ptr::read_unaligned(p.add(ip_off + 12) as *const [u8; 4]) };
+    let dst = unsafe { core::ptr::read_unaligned(p.add(ip_off + 16) as *const [u8; 4]) };
+    let (proto, sport, dport) = match l4_ports(data, data_end, ip_off) {
+        Some(v) => v,
+        None => return,
+    };
+    let key = CtKey {
+        src_ip: src,
+        dst_ip: dst,
+        src_port: sport,
+        dst_port: dport,
+        proto,
+        _pad: [0; 3],
+    };
+    let lb = match unsafe { CONNTRACK.get(&key) } {
+        Some(v) => v.lb_ipv4,
+        None => return,
+    };
+    let ihl = (unsafe { *p.add(ip_off) } & 0x0f) as usize * 4;
+    unsafe {
+        core::ptr::write_unaligned(p.add(ip_off + 12) as *mut [u8; 4], lb);
+        let ipc = u16::from_be(core::ptr::read_unaligned(p.add(ip_off + 10) as *const u16));
+        core::ptr::write_unaligned(
+            p.add(ip_off + 10) as *mut u16,
+            csum_replace4(ipc, &src, &lb).to_be(),
+        );
+        let l4 = ip_off + ihl;
+        if proto == 6 && data + l4 + 18 <= data_end {
+            let c = u16::from_be(core::ptr::read_unaligned(p.add(l4 + 16) as *const u16));
+            core::ptr::write_unaligned(
+                p.add(l4 + 16) as *mut u16,
+                csum_replace4(c, &src, &lb).to_be(),
+            );
+        } else if proto == 17 && data + l4 + 8 <= data_end {
+            let c = u16::from_be(core::ptr::read_unaligned(p.add(l4 + 6) as *const u16));
+            if c != 0 {
+                core::ptr::write_unaligned(
+                    p.add(l4 + 6) as *mut u16,
+                    csum_replace4(c, &src, &lb).to_be(),
+                );
+            }
+        }
+    }
+}
