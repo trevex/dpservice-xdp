@@ -258,6 +258,17 @@ impl Conntrack {
         Ok(Self { map })
     }
 
+    /// Adopt a previously-pinned CONNTRACK map (HA restart) instead of taking it from a loaded
+    /// eBPF object.  The pinned file must reside on a bpffs (e.g. `/sys/fs/bpf`).
+    pub fn from_pin(path: &str) -> anyhow::Result<Self> {
+        use aya::maps::Map;
+        let map_data = aya::maps::MapData::from_pin(path).context("open pinned CONNTRACK")?;
+        // CONNTRACK is BPF_MAP_TYPE_LRU_HASH; wrap in the matching Map variant so
+        // HashMap::try_from can validate + construct the typed wrapper.
+        let map = HashMap::try_from(Map::LruHashMap(map_data))?;
+        Ok(Self { map })
+    }
+
     pub fn upsert(&mut self, key: CtKey, val: CtEntry) -> anyhow::Result<()> {
         self.map.insert(key, val, 0).context("insert conntrack")
     }

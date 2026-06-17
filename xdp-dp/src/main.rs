@@ -171,6 +171,15 @@ enum Cmd {
         /// for a NAT-gateway node that does not host a local interface.
         #[arg(long = "underlay-marker")]
         underlay_markers: Vec<String>,
+        /// Pin the XDP links + CONNTRACK under this bpffs dir so the datapath survives a
+        /// control-plane restart (HA). Requires bpffs (e.g. /sys/fs/bpf). Unset = non-HA
+        /// (default behavior, unchanged).
+        #[arg(long)]
+        pin_dir: Option<String>,
+        /// Adopt an already-running pinned datapath (after a restart): do NOT load/attach; just
+        /// re-open the pinned CONNTRACK and resume aging. Requires --pin-dir.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        adopt: bool,
     },
 }
 
@@ -234,7 +243,19 @@ async fn main() -> anyhow::Result<()> {
             firewall_enforce,
             neigh_nats,
             underlay_markers,
+            pin_dir,
+            adopt,
         } => {
+            // HA adopt path: re-open the pinned CONNTRACK and resume GC; no load/attach.
+            if adopt {
+                let dir = pin_dir.as_deref().context("--adopt requires --pin-dir")?;
+                let ct = maps::Conntrack::from_pin(&format!("{dir}/CONNTRACK"))?;
+                tokio::spawn(conntrack_gc::run(ct, std::time::Duration::from_secs(10)));
+                println!("adopted pinned datapath at {dir}; resuming conntrack GC; ctrl-c to stop");
+                tokio::signal::ctrl_c().await?;
+                return Ok(());
+            }
+
             if let Some(n) = conntrack_max {
                 // SAFETY: single-threaded CLI startup, before any datapath thread is spawned.
                 std::env::set_var("XDP_DP_CONNTRACK_MAX", n.to_string());
@@ -244,15 +265,27 @@ async fn main() -> anyhow::Result<()> {
             // Pass 1: attach ALL XDP programs while ebpf is still fully intact
             // (take_map consumes map entries, but programs are separate — still need &mut ebpf).
             // uplink_rx: load + attach once.
-            loader::attach_xdp(&mut ebpf, "uplink_rx", &uplink)?;
+            match pin_dir.as_deref() {
+                Some(dir) => {
+                    loader::attach_xdp_pinned(&mut ebpf, "uplink_rx", &uplink, dir, false)?
+                }
+                None => loader::attach_xdp(&mut ebpf, "uplink_rx", &uplink)?,
+            }
             // guest_tx: load once (first guest), then attach-only for additional guests.
             for (idx, g) in guests.iter().enumerate() {
                 let mut it = g.splitn(3, '=');
                 let ifname = it.next().context("--guest must be ifname=ipv4=mac")?;
-                if idx == 0 {
-                    loader::attach_xdp(&mut ebpf, "guest_tx", ifname)?;
-                } else {
-                    loader::attach_xdp_extra(&mut ebpf, "guest_tx", ifname)?;
+                match pin_dir.as_deref() {
+                    Some(dir) => {
+                        loader::attach_xdp_pinned(&mut ebpf, "guest_tx", ifname, dir, idx != 0)?
+                    }
+                    None => {
+                        if idx == 0 {
+                            loader::attach_xdp(&mut ebpf, "guest_tx", ifname)?;
+                        } else {
+                            loader::attach_xdp_extra(&mut ebpf, "guest_tx", ifname)?;
+                        }
+                    }
                 }
             }
 
@@ -636,6 +669,11 @@ async fn main() -> anyhow::Result<()> {
             }
             neigh_nat_count_map.set(neigh_nat_idx)?;
 
+            // Pin CONNTRACK BEFORE take_map (Conntrack::open) — take_map removes the map from
+            // the Ebpf object's collection, so map_mut("CONNTRACK") would return None afterward.
+            if let Some(dir) = pin_dir.as_deref() {
+                loader::pin_map(&mut ebpf, "CONNTRACK", dir)?;
+            }
             let ct = maps::Conntrack::open(&mut ebpf)?;
             tokio::spawn(conntrack_gc::run(ct, std::time::Duration::from_secs(10)));
 

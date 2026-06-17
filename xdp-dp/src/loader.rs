@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::Context;
 use aya::programs::{Xdp, XdpFlags};
 use aya::Ebpf;
@@ -70,6 +72,63 @@ pub fn attach_uplink(iface: &str) -> anyhow::Result<Ebpf> {
     let mut ebpf = load_ebpf()?;
     attach_xdp(&mut ebpf, "uplink_rx", iface)?;
     Ok(ebpf)
+}
+
+/// Attach `prog` to `iface` and pin the resulting XDP link to
+/// `<pin_dir>/links/<prog>-<iface>`, so the attachment (and thus the program + all its maps)
+/// survives this process exiting.
+///
+/// `already_loaded` mirrors the "load the program once, attach-only afterward" pattern used
+/// when the same program is attached to multiple interfaces.
+pub fn attach_xdp_pinned(
+    ebpf: &mut Ebpf,
+    prog: &str,
+    iface: &str,
+    pin_dir: &str,
+    already_loaded: bool,
+) -> anyhow::Result<()> {
+    use aya::programs::links::FdLink;
+
+    let p: &mut Xdp = ebpf
+        .program_mut(prog)
+        .with_context(|| format!("program {prog} missing"))?
+        .try_into()?;
+    if !already_loaded {
+        p.load().with_context(|| format!("load {prog}"))?;
+    }
+    let id = p
+        .attach(iface, XdpFlags::default())
+        .or_else(|_| p.attach(iface, XdpFlags::SKB_MODE))
+        .with_context(|| format!("attach {prog} to {iface}"))?;
+    let link = p.take_link(id).context("take xdp link")?;
+    // XdpLink wraps an FdLink on kernels >= 5.9 (bpf_link_create path); convert to pin.
+    let fd_link: FdLink = link.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "XDP link is not an FdLink (kernel < 5.9?); pinning requires bpf_link_create support"
+        )
+    })?;
+    let links_dir = format!("{pin_dir}/links");
+    std::fs::create_dir_all(&links_dir).ok();
+    let link_path = format!("{links_dir}/{prog}-{iface}");
+    let _ = std::fs::remove_file(&link_path);
+    fd_link
+        .pin(Path::new(&link_path))
+        .with_context(|| format!("pin link {link_path}"))?;
+    Ok(())
+}
+
+/// Pin a loaded map to `<pin_dir>/<name>` so a restarted control plane can re-acquire it.
+/// Must be called BEFORE `take_map` / `Conntrack::open` on the same map name, because
+/// `take_map` removes the map from the `Ebpf` object's collection.
+pub fn pin_map(ebpf: &mut Ebpf, name: &str, pin_dir: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(pin_dir).ok();
+    let path = format!("{pin_dir}/{name}");
+    let _ = std::fs::remove_file(&path);
+    ebpf.map_mut(name)
+        .with_context(|| format!("map {name} missing"))?
+        .pin(Path::new(&path))
+        .with_context(|| format!("pin map {path}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
