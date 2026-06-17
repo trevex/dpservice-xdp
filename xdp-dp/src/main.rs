@@ -171,6 +171,10 @@ enum Cmd {
         /// for a NAT-gateway node that does not host a local interface.
         #[arg(long = "underlay-marker")]
         underlay_markers: Vec<String>,
+        /// Per-interface egress rate cap, repeatable: "<ifname>=<total_mbps>:<public_mbps>".
+        /// Programs the METER map token bucket for the named interface (opt-in; 0 = unlimited).
+        #[arg(long = "meter")]
+        meters: Vec<String>,
         /// Pin the XDP links + CONNTRACK under this bpffs dir so the datapath survives a
         /// control-plane restart (HA). Requires bpffs (e.g. /sys/fs/bpf). Unset = non-HA
         /// (default behavior, unchanged).
@@ -243,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
             firewall_enforce,
             neigh_nats,
             underlay_markers,
+            meters,
             pin_dir,
             adopt,
         } => {
@@ -669,6 +674,37 @@ async fn main() -> anyhow::Result<()> {
             }
             neigh_nat_count_map.set(neigh_nat_idx)?;
 
+            // --meter: "<ifname>=<total_mbps>:<public_mbps>" — program per-interface egress
+            // token-bucket rate caps. Opt-in: interfaces without an entry are unlimited.
+            let mut meter_map = maps::Meter::open(&mut ebpf)?;
+            let mbps_to_bps = |mbps: u64| mbps.saturating_mul(1_000_000) / 8;
+            for spec in &meters {
+                let (ifname, rates) = spec
+                    .split_once('=')
+                    .context("--meter must be <ifname>=<total_mbps>:<public_mbps>")?;
+                let (total_s, public_s) = rates
+                    .split_once(':')
+                    .context("--meter rates must be <total_mbps>:<public_mbps>")?;
+                let total_mbps: u64 = total_s.parse().context("--meter: bad total_mbps")?;
+                let public_mbps: u64 = public_s.parse().context("--meter: bad public_mbps")?;
+                let tap = ifindex(ifname)?;
+                let tb = mbps_to_bps(total_mbps);
+                let pb = mbps_to_bps(public_mbps);
+                meter_map.upsert(
+                    tap,
+                    xdp_dp_common::MeterState {
+                        total_bps: tb,
+                        total_burst: (tb / 8).max(2000),
+                        total_tokens: tb / 8,
+                        total_last_ns: 0,
+                        public_bps: pb,
+                        public_burst: (pb / 8).max(2000),
+                        public_tokens: pb / 8,
+                        public_last_ns: 0,
+                    },
+                )?;
+            }
+
             // Pin CONNTRACK BEFORE take_map (Conntrack::open) — take_map removes the map from
             // the Ebpf object's collection, so map_mut("CONNTRACK") would return None afterward.
             if let Some(dir) = pin_dir.as_deref() {
@@ -678,14 +714,15 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(conntrack_gc::run(ct, std::time::Duration::from_secs(10)));
 
             println!(
-                "bringup: uplink={uplink} guests={} routes={} vips={} lbs={} nats={} fw={} neigh_nats={}; ctrl-c to stop",
+                "bringup: uplink={uplink} guests={} routes={} vips={} lbs={} nats={} fw={} neigh_nats={} meters={}; ctrl-c to stop",
                 guests.len(),
                 remotes.len(),
                 vips_args.len(),
                 lbs.len(),
                 nats.len(),
                 fw_rules.len(),
-                neigh_nats.len()
+                neigh_nats.len(),
+                meters.len()
             );
             tokio::signal::ctrl_c().await?;
         }

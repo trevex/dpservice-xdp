@@ -11,6 +11,7 @@ mod ingress;
 mod inspect;
 mod lb;
 mod maps;
+mod meter;
 mod nat;
 mod parse;
 mod vip;

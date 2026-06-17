@@ -4,8 +4,8 @@ use aya_ebpf::{
 };
 use xdp_dp_common::{
     Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
-    LbValue, Local, MaglevKey, NatKey, NatValue, NeighborNatEntry, PortMeta, RouteLpmData,
-    RouteValue, UnderlayValue, VipKey,
+    LbValue, Local, MaglevKey, MeterState, NatKey, NatValue, NeighborNatEntry, PortMeta,
+    RouteLpmData, RouteValue, UnderlayValue, VipKey,
 };
 
 #[map]
@@ -50,3 +50,5 @@ pub static NEIGHBOR_NAT: HashMap<u32, NeighborNatEntry> = HashMap::with_max_entr
 /// Entry 0: number of populated NEIGHBOR_NAT slots (datapath scans 0..count).
 #[map]
 pub static NEIGHBOR_NAT_COUNT: Array<u32> = Array::with_max_entries(1, 0);
+#[map]
+pub static METER: HashMap<u32, MeterState> = HashMap::with_max_entries(1024, 0);

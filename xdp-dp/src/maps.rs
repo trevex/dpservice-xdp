@@ -6,8 +6,8 @@ use aya::maps::{
 use aya::Ebpf;
 use xdp_dp_common::{
     Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
-    LbValue, Local, MaglevKey, NatKey, NatValue, NeighborNatEntry, PortMeta, RouteLpmData,
-    RouteValue, UnderlayValue, VipKey,
+    LbValue, Local, MaglevKey, MeterState, NatKey, NatValue, NeighborNatEntry, PortMeta,
+    RouteLpmData, RouteValue, UnderlayValue, VipKey,
 };
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
@@ -434,6 +434,28 @@ impl NeighborNat {
 
     pub fn remove(&mut self, idx: &u32) -> anyhow::Result<()> {
         self.map.remove(idx).context("remove neighbor_nat")
+    }
+}
+
+/// Typed handle over the `METER` BPF map (ifindex -> per-interface token bucket state).
+#[allow(dead_code)]
+pub struct Meter {
+    map: HashMap<MapData, u32, MeterState>,
+}
+
+#[allow(dead_code)]
+impl Meter {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(ebpf.take_map("METER").context("METER map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, ifindex: u32, val: MeterState) -> anyhow::Result<()> {
+        self.map.insert(ifindex, val, 0).context("insert meter")
+    }
+
+    pub fn remove(&mut self, ifindex: &u32) -> anyhow::Result<()> {
+        self.map.remove(ifindex).context("remove meter")
     }
 }
 

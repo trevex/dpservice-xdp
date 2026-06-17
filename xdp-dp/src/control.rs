@@ -11,7 +11,7 @@ use xdp_dp_common::{
 
 use crate::loader;
 use crate::maps::{
-    Conntrack, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev, Nat, NeighborNat,
+    Conntrack, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev, Meter, Nat, NeighborNat,
     NeighborNatCount, PortMetaMap, Routes, Vips,
 };
 
@@ -46,6 +46,7 @@ struct Inner {
     fw_rules: FwRules,
     fw_meta: FwMetaMap,
     underlay: crate::maps::Underlay,
+    meter: Meter,
     neigh_nat: NeighborNat,
     neigh_nat_count: NeighborNatCount,
     /// In-memory neighbor NAT entries (drives the BPF map reprogram).
@@ -93,6 +94,7 @@ impl Control {
         let fw_rules = FwRules::open(&mut ebpf)?;
         let fw_meta = FwMetaMap::open(&mut ebpf)?;
         let underlay = crate::maps::Underlay::open(&mut ebpf)?;
+        let meter = Meter::open(&mut ebpf)?;
         let neigh_nat = NeighborNat::open(&mut ebpf)?;
         let neigh_nat_count = NeighborNatCount::open(&mut ebpf)?;
         let conntrack = Conntrack::open(&mut ebpf)?;
@@ -110,6 +112,7 @@ impl Control {
                 fw_rules,
                 fw_meta,
                 underlay,
+                meter,
                 neigh_nat,
                 neigh_nat_count,
                 neigh_nats: Vec::new(),
@@ -130,6 +133,36 @@ impl Control {
         self.conntrack.lock().unwrap().take()
     }
 
+    fn meter_state(total_mbps: u64, public_mbps: u64) -> xdp_dp_common::MeterState {
+        let tb = total_mbps.saturating_mul(1_000_000) / 8;
+        let pb = public_mbps.saturating_mul(1_000_000) / 8;
+        xdp_dp_common::MeterState {
+            total_bps: tb,
+            total_burst: (tb / 8).max(2000),
+            total_tokens: tb / 8,
+            total_last_ns: 0,
+            public_bps: pb,
+            public_burst: (pb / 8).max(2000),
+            public_tokens: pb / 8,
+            public_last_ns: 0,
+        }
+    }
+
+    pub fn set_meter(
+        &self,
+        interface_id: &[u8],
+        total_mbps: u64,
+        public_mbps: u64,
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let ifindex = *g
+            .by_ifindex
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        g.meter
+            .upsert(ifindex, Self::meter_state(total_mbps, public_mbps))
+    }
+
     /// Program a LOCAL interface: attach guest_tx to its device, set PORT_META + INTERFACES.
     pub fn create_interface(
         &self,
@@ -139,6 +172,8 @@ impl Control {
         ipv4: [u8; 4],
         gateway_ipv4: [u8; 4],
         underlay_ipv6: [u8; 16],
+        total_mbps: u64,
+        public_mbps: u64,
     ) -> anyhow::Result<()> {
         let tap = crate::ifindex(device)?;
         let mac = crate::mac_of(device)?;
@@ -183,6 +218,11 @@ impl Control {
                 _pad: [0; 2],
             },
         )?;
+        // Opt-in metering: only program the METER map if a rate cap is requested.
+        if total_mbps != 0 || public_mbps != 0 {
+            g.meter
+                .upsert(tap, Self::meter_state(total_mbps, public_mbps))?;
+        }
         Ok(())
     }
 

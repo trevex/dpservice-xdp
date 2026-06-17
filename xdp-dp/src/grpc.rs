@@ -359,8 +359,23 @@ impl DpdKironcore for Service {
         underlay[8..12].copy_from_slice(&vni.to_be_bytes());
         underlay[12..16].copy_from_slice(&ipv4);
 
+        // Decode optional metering parameters (0 = unlimited).
+        let (total_mbps, public_mbps) = r
+            .metering_parameters
+            .map(|mp| (mp.total_rate, mp.public_rate))
+            .unwrap_or((0, 0));
+
         control
-            .create_interface(&interface_id, &device, vni, ipv4, gateway_ipv4, underlay)
+            .create_interface(
+                &interface_id,
+                &device,
+                vni,
+                ipv4,
+                gateway_ipv4,
+                underlay,
+                total_mbps,
+                public_mbps,
+            )
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(CreateInterfaceResponse {

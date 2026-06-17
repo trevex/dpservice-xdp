@@ -107,6 +107,22 @@ pub struct RouteValue {
     pub _pad: [u8; 3],
 }
 
+/// Per-interface egress token buckets. `*_bps` are bytes/sec (0 = unlimited); `*_tokens`/`*_last_ns`
+/// are mutable runtime state refilled from bpf_ktime. `total` gates all egress; `public` gates
+/// south-north (external) egress.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct MeterState {
+    pub total_bps: u64,
+    pub total_burst: u64,
+    pub total_tokens: u64,
+    pub total_last_ns: u64,
+    pub public_bps: u64,
+    pub public_burst: u64,
+    pub public_tokens: u64,
+    pub public_last_ns: u64,
+}
+
 /// This hypervisor's uplink + underlay gateway, written once into LOCAL[0] by the control plane.
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
@@ -380,6 +396,7 @@ mod user_impls {
     unsafe impl aya::Pod for FwRule {}
     unsafe impl aya::Pod for FwMeta {}
     unsafe impl aya::Pod for NeighborNatEntry {}
+    unsafe impl aya::Pod for MeterState {}
 }
 
 #[cfg(test)]
@@ -456,6 +473,13 @@ mod tests {
         assert_eq!(core::mem::size_of::<FwRule>(), 32);
         // 4 (ingress_count) + 4 (egress_count) = 8.
         assert_eq!(core::mem::size_of::<FwMeta>(), 8);
+    }
+
+    #[test]
+    fn meter_state_layout() {
+        // 8 fields * 8 bytes each = 64 bytes.
+        assert_eq!(core::mem::size_of::<MeterState>(), 64);
+        assert_eq!(core::mem::align_of::<MeterState>(), 8);
     }
 
     #[test]

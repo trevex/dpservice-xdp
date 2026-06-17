@@ -72,6 +72,11 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
             crate::conntrack::ct_ensure_default(ctx, ETH_LEN, &key);
         }
     }
+    // Rate metering: per-source-interface token bucket on the egress frame.
+    let frame_len = (ctx.data_end() - ctx.data()) as u64;
+    if !crate::meter::meter_pass(ifindex, frame_len, route.is_external != 0) {
+        return Ok(xdp_action::XDP_DROP);
+    }
     let inner_len = (data_end - data - ETH_LEN) as u16;
     let local = LOCAL.get(0).ok_or(())?;
     encap_and_redirect(ctx, local, &meta.underlay_ipv6, route, inner_len)
