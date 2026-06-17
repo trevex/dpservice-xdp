@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
+use crate::control::Control;
 use crate::pb::dpd_kironcore_server::DpdKironcore;
 use crate::pb::{
     CaptureStartRequest, CaptureStartResponse, CaptureStatusRequest, CaptureStatusResponse,
@@ -33,12 +34,34 @@ use crate::state::State;
 
 pub struct Service {
     pub state: Arc<State>,
+    /// Live datapath control; `None` when serving without a loaded eBPF object.
+    pub control: Option<Arc<Control>>,
+    /// This server's underlay IPv6 address, returned in CreateInterface responses.
+    pub underlay: [u8; 16],
 }
 
 fn ok() -> Option<DpStatus> {
     Some(DpStatus {
         code: 0,
         message: "OK".into(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Address-decoding helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a `Vec<u8>` into a `[u8; 4]`, returning `Status::invalid_argument` on wrong length.
+fn decode_ipv4(bytes: &[u8]) -> Result<[u8; 4], Status> {
+    bytes.try_into().map_err(|_| {
+        Status::invalid_argument(format!("expected 4-byte IPv4, got {} bytes", bytes.len()))
+    })
+}
+
+/// Convert a `Vec<u8>` into a `[u8; 16]`, returning `Status::invalid_argument` on wrong length.
+fn decode_ipv6(bytes: &[u8]) -> Result<[u8; 16], Status> {
+    bytes.try_into().map_err(|_| {
+        Status::invalid_argument(format!("expected 16-byte IPv6, got {} bytes", bytes.len()))
     })
 }
 
@@ -75,6 +98,84 @@ impl DpdKironcore for Service {
         }))
     }
 
+    // --- CreateInterface ---
+
+    async fn create_interface(
+        &self,
+        req: Request<CreateInterfaceRequest>,
+    ) -> Result<Response<CreateInterfaceResponse>, Status> {
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+
+        let r = req.into_inner();
+
+        // Extract IPv4 from ipv4_config.primary_address
+        let ipv4_config = r
+            .ipv4_config
+            .ok_or_else(|| Status::invalid_argument("ipv4_config is required"))?;
+        let ipv4 = decode_ipv4(&ipv4_config.primary_address)?;
+
+        // Derive gateway: same /24 prefix but last octet = 1
+        let gateway_ipv4 = [ipv4[0], ipv4[1], ipv4[2], 1];
+
+        let device = r.device_name;
+        let vni = r.vni;
+        let underlay = self.underlay;
+
+        control
+            .create_interface(&device, vni, ipv4, gateway_ipv4, underlay)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(CreateInterfaceResponse {
+            status: ok(),
+            underlay_route: underlay.to_vec(),
+            vf: None,
+        }))
+    }
+
+    // --- CreateRoute ---
+
+    async fn create_route(
+        &self,
+        req: Request<CreateRouteRequest>,
+    ) -> Result<Response<CreateRouteResponse>, Status> {
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+
+        let r = req.into_inner();
+        let vni = r.vni;
+
+        let route = r
+            .route
+            .ok_or_else(|| Status::invalid_argument("route is required"))?;
+
+        // Decode prefix IPv4
+        let prefix = route
+            .prefix
+            .ok_or_else(|| Status::invalid_argument("route.prefix is required"))?;
+        let prefix_len = prefix.length;
+        let prefix_ip = prefix
+            .ip
+            .ok_or_else(|| Status::invalid_argument("route.prefix.ip is required"))?;
+        let ipv4 = decode_ipv4(&prefix_ip.address)?;
+
+        // Decode nexthop IPv6
+        let nexthop_addr = route
+            .nexthop_address
+            .ok_or_else(|| Status::invalid_argument("route.nexthop_address is required"))?;
+        let nexthop_ipv6 = decode_ipv6(&nexthop_addr.address)?;
+
+        control
+            .create_route(vni, ipv4, prefix_len, nexthop_ipv6)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(CreateRouteResponse { status: ok() }))
+    }
+
     // --- stubs ---
 
     async fn list_interfaces(
@@ -88,13 +189,6 @@ impl DpdKironcore for Service {
         &self,
         _req: Request<GetInterfaceRequest>,
     ) -> Result<Response<GetInterfaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
-    }
-
-    async fn create_interface(
-        &self,
-        _req: Request<CreateInterfaceRequest>,
-    ) -> Result<Response<CreateInterfaceResponse>, Status> {
         Err(Status::unimplemented("not implemented"))
     }
 
@@ -273,13 +367,6 @@ impl DpdKironcore for Service {
         Err(Status::unimplemented("not implemented"))
     }
 
-    async fn create_route(
-        &self,
-        _req: Request<CreateRouteRequest>,
-    ) -> Result<Response<CreateRouteResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
-    }
-
     async fn delete_route(
         &self,
         _req: Request<DeleteRouteRequest>,
@@ -348,5 +435,39 @@ impl DpdKironcore for Service {
         _req: Request<CaptureStatusRequest>,
     ) -> Result<Response<CaptureStatusResponse>, Status> {
         Err(Status::unimplemented("not implemented"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for address-decoding helpers (no root required)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_ipv4, decode_ipv6};
+
+    #[test]
+    fn decode_ipv4_valid() {
+        assert_eq!(decode_ipv4(&[10, 0, 0, 5]).unwrap(), [10u8, 0, 0, 5]);
+    }
+
+    #[test]
+    fn decode_ipv4_rejects_wrong_length() {
+        assert!(decode_ipv4(&[10, 0, 0]).is_err());
+        assert!(decode_ipv4(&[10, 0, 0, 5, 6]).is_err());
+    }
+
+    #[test]
+    fn decode_ipv6_valid() {
+        let mut b = [0u8; 16];
+        b[0] = 0xfd;
+        b[15] = 0x01;
+        assert_eq!(decode_ipv6(&b).unwrap(), b);
+    }
+
+    #[test]
+    fn decode_ipv6_rejects_wrong_length() {
+        assert!(decode_ipv6(&[0u8; 4]).is_err());
+        assert!(decode_ipv6(&[0u8; 17]).is_err());
     }
 }

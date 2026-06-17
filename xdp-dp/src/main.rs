@@ -2,6 +2,7 @@ pub mod pb {
     tonic::include_proto!("dpdkironcore.v1");
 }
 
+mod control;
 mod grpc;
 mod loader;
 mod maps;
@@ -15,14 +16,14 @@ use clap::{Parser, Subcommand};
 // ---------------------------------------------------------------------------
 
 /// Read `/sys/class/net/<iface>/ifindex` and parse it as a u32.
-fn ifindex(iface: &str) -> anyhow::Result<u32> {
+pub(crate) fn ifindex(iface: &str) -> anyhow::Result<u32> {
     let s = std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
         .with_context(|| format!("read ifindex for {iface}"))?;
     Ok(s.trim().parse()?)
 }
 
 /// Read `/sys/class/net/<iface>/address` and return 6 MAC bytes.
-fn mac_of(iface: &str) -> anyhow::Result<[u8; 6]> {
+pub(crate) fn mac_of(iface: &str) -> anyhow::Result<[u8; 6]> {
     let s = std::fs::read_to_string(format!("/sys/class/net/{iface}/address"))
         .with_context(|| format!("read mac for {iface}"))?;
     parse_mac(s.trim())
@@ -73,10 +74,20 @@ enum Cmd {
         #[arg(long)]
         uplink: String,
     },
-    /// Start the gRPC control-plane server.
+    /// Start the gRPC control-plane server with a live datapath.
     Serve {
+        /// Address to listen on (e.g. 127.0.0.1:1337).
         #[arg(long)]
         addr: String,
+        /// Uplink interface (uplink_rx attaches here).
+        #[arg(long)]
+        uplink: String,
+        /// This hypervisor's underlay IPv6 (outer src on encap).
+        #[arg(long)]
+        local_underlay: String,
+        /// Underlay next-hop MAC — outer eth dst for ALL encapped traffic.
+        #[arg(long)]
+        gateway_mac: String,
     },
     /// Attach the trivial xdp_pass program to an interface (redirect-target enabler), then idle.
     Pass {
@@ -119,9 +130,24 @@ async fn main() -> anyhow::Result<()> {
             println!("attached uplink_rx to {uplink}; ctrl-c to detach");
             tokio::signal::ctrl_c().await?;
         }
-        Cmd::Serve { addr } => {
+        Cmd::Serve {
+            addr,
+            uplink,
+            local_underlay,
+            gateway_mac,
+        } => {
+            let underlay = parse_ipv6(&local_underlay)?;
+            let ctrl = control::Control::bring_up(
+                &uplink,
+                ifindex(&uplink)?,
+                mac_of(&uplink)?,
+                parse_mac(&gateway_mac)?,
+                underlay,
+            )?;
             let svc = grpc::Service {
                 state: std::sync::Arc::new(state::State::default()),
+                control: Some(std::sync::Arc::new(ctrl)),
+                underlay,
             };
             let server = crate::pb::dpd_kironcore_server::DpdKironcoreServer::new(svc);
             println!("serving DPDKironcore on {addr}");
