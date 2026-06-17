@@ -258,6 +258,8 @@ async fn main() -> anyhow::Result<()> {
                     xdp_dp_common::RouteValue {
                         nexthop_vni: 0,
                         nexthop_ipv6: nh,
+                        is_external: 0,
+                        _pad: [0; 3],
                     },
                 )?;
             }

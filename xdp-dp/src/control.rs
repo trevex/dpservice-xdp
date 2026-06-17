@@ -130,6 +130,7 @@ impl Control {
         ipv4: [u8; 4],
         prefix_len: u32,
         nexthop_ipv6: [u8; 16],
+        is_external: bool,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
         g.routes.upsert(
@@ -141,6 +142,8 @@ impl Control {
             RouteValue {
                 nexthop_vni: vni,
                 nexthop_ipv6,
+                is_external: is_external as u8,
+                _pad: [0; 3],
             },
         )?;
         Ok(())

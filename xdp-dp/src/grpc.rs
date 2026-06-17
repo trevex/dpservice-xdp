@@ -171,7 +171,7 @@ impl DpdKironcore for Service {
         let nexthop_ipv6 = decode_ipv6(&nexthop_addr.address)?;
 
         control
-            .create_route(vni, ipv4, prefix_len, nexthop_ipv6)
+            .create_route(vni, ipv4, prefix_len, nexthop_ipv6, false)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(CreateRouteResponse { status: ok() }))

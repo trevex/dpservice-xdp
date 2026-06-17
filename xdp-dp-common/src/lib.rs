@@ -82,6 +82,9 @@ pub struct RouteKey {
 pub struct RouteValue {
     pub nexthop_vni: u32,
     pub nexthop_ipv6: [u8; 16],
+    /// 1 = the nexthop is the external/public network (NAT-eligible egress); 0 = overlay peer.
+    pub is_external: u8,
+    pub _pad: [u8; 3],
 }
 
 /// This hypervisor's uplink + underlay gateway, written once into LOCAL[0] by the control plane.
@@ -159,6 +162,33 @@ pub struct CtVal {
     pub lb_ipv4: [u8; 4],
 }
 
+/// NAT-GW config key: (vni, local guest IPv4).
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct NatKey {
+    pub vni: u32,
+    pub ipv4: [u8; 4],
+}
+
+/// NAT-GW config value: the public NAT IPv4 + the source-port range [port_min, port_max).
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct NatValue {
+    pub nat_ipv4: [u8; 4],
+    pub port_min: u16,
+    pub port_max: u16,
+}
+
+/// NAT conntrack value: an address + L4 port. Reverse entries hold the guest (ipv4, l4) to
+/// restore on ingress; forward entries hold the (nat_ipv4, nat_port) allocated for the flow.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct NatCtVal {
+    pub ipv4: [u8; 4],
+    pub port: u16,
+    pub _pad: [u8; 2],
+}
+
 /// Single-entry `CONFIG` map: per-hypervisor datapath parameters for the PoC's
 /// CONFIG-driven single-peer overlay (one guest + one peer hypervisor). The XDP programs
 /// read entry 0; the control plane populates it. MACs/ifindexes are filled at e2e time.
@@ -202,6 +232,9 @@ mod user_impls {
     unsafe impl aya::Pod for MaglevKey {}
     unsafe impl aya::Pod for CtKey {}
     unsafe impl aya::Pod for CtVal {}
+    unsafe impl aya::Pod for NatKey {}
+    unsafe impl aya::Pod for NatValue {}
+    unsafe impl aya::Pod for NatCtVal {}
 }
 
 #[cfg(test)]
@@ -220,9 +253,9 @@ mod tests {
     #[test]
     fn route_types_have_stable_layout() {
         // 4 (vni) + 4 (prefix_len) + 4 (ipv4) = 12.
-        // 4 (nexthop_vni) + 16 (ipv6) = 20.
+        // 4 (nexthop_vni) + 16 (ipv6) + 1 (is_external) + 3 (_pad) = 24.
         assert_eq!(core::mem::size_of::<RouteKey>(), 12);
-        assert_eq!(core::mem::size_of::<RouteValue>(), 20);
+        assert_eq!(core::mem::size_of::<RouteValue>(), 24);
         // 4 (uplink_ifindex) + 6 (uplink_mac) + 6 (gateway_mac) + 16 (underlay_ipv6) = 32.
         assert_eq!(core::mem::size_of::<Local>(), 32);
     }
@@ -253,6 +286,13 @@ mod tests {
         assert_eq!(core::mem::size_of::<MaglevKey>(), 8);
         assert_eq!(core::mem::size_of::<CtKey>(), 16);
         assert_eq!(core::mem::size_of::<CtVal>(), 4);
+    }
+
+    #[test]
+    fn nat_layouts() {
+        assert_eq!(core::mem::size_of::<NatKey>(), 8);
+        assert_eq!(core::mem::size_of::<NatValue>(), 8);
+        assert_eq!(core::mem::size_of::<NatCtVal>(), 8);
     }
 }
 
