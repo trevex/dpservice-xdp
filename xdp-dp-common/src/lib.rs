@@ -189,6 +189,37 @@ pub struct NatCtVal {
     pub _pad: [u8; 2],
 }
 
+/// Unified conntrack entry value. Keyed by the 5-tuple (`CtKey`) of the packet that will be SEEN;
+/// the datapath's `ct_apply` rewrites that packet's src or dst address (+L4 port) to
+/// `xlate_ip`/`xlate_port`. Replaces the feature-private `CtVal`/`NatCtVal` (removed later in M5).
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct CtEntry {
+    pub last_seen: u64,
+    pub xlate_ip: [u8; 4],
+    pub xlate_port: u16,
+    pub flags: u8,
+    pub tcp_state: u8,
+    pub fwall_action: u8,
+    pub _pad: [u8; 7],
+}
+
+// CtEntry.flags bits
+pub const CT_REWRITE_SRC: u8 = 0x01;
+pub const CT_REWRITE_DST: u8 = 0x02;
+pub const CT_F_SRC_NAT: u8 = 0x04;
+pub const CT_F_DST_LB: u8 = 0x08;
+pub const CT_F_DEFAULT: u8 = 0x10;
+pub const CT_F_FIREWALL: u8 = 0x20;
+
+// CtEntry.tcp_state values (mirror dpservice dp_flow_tcp_state)
+pub const TCP_NONE: u8 = 0;
+pub const TCP_NEW_SYN: u8 = 1;
+pub const TCP_NEW_SYNACK: u8 = 2;
+pub const TCP_ESTABLISHED: u8 = 3;
+pub const TCP_FINWAIT: u8 = 4;
+pub const TCP_RST_FIN: u8 = 5;
+
 /// Single-entry `CONFIG` map: per-hypervisor datapath parameters for the PoC's
 /// CONFIG-driven single-peer overlay (one guest + one peer hypervisor). The XDP programs
 /// read entry 0; the control plane populates it. MACs/ifindexes are filled at e2e time.
@@ -235,6 +266,7 @@ mod user_impls {
     unsafe impl aya::Pod for NatKey {}
     unsafe impl aya::Pod for NatValue {}
     unsafe impl aya::Pod for NatCtVal {}
+    unsafe impl aya::Pod for CtEntry {}
 }
 
 #[cfg(test)]
@@ -293,6 +325,13 @@ mod tests {
         assert_eq!(core::mem::size_of::<NatKey>(), 8);
         assert_eq!(core::mem::size_of::<NatValue>(), 8);
         assert_eq!(core::mem::size_of::<NatCtVal>(), 8);
+    }
+
+    #[test]
+    fn ct_entry_layout() {
+        // 8 (last_seen) + 4 (xlate_ip) + 2 (xlate_port) + 1 (flags) + 1 (tcp_state)
+        // + 1 (fwall_action) + 7 (_pad) = 24, u64-aligned.
+        assert_eq!(core::mem::size_of::<CtEntry>(), 24);
     }
 }
 
