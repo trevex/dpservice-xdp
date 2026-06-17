@@ -1,7 +1,9 @@
 use anyhow::Context;
 use aya::maps::{Array, HashMap, MapData};
 use aya::Ebpf;
-use xdp_dp_common::{Config, IfaceKey, IfaceValue, Local, PortMeta, RouteKey, RouteValue};
+use xdp_dp_common::{
+    Config, IfaceKey, IfaceValue, InspectEntry, Local, PortMeta, RouteKey, RouteValue,
+};
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
 // Exercised by the roundtrip test now; wired into the gRPC control plane in Task 12.
@@ -96,6 +98,22 @@ impl PortMetaMap {
 
     pub fn get(&self, ifindex: u32) -> Option<PortMeta> {
         self.map.get(&ifindex, 0).ok()
+    }
+}
+
+/// Typed handle over the single-entry `INSPECT` Array map (debug packet inspector).
+pub struct InspectMap {
+    map: Array<MapData, InspectEntry>,
+}
+
+impl InspectMap {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = Array::try_from(ebpf.take_map("INSPECT").context("INSPECT map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn get(&self) -> anyhow::Result<InspectEntry> {
+        self.map.get(&0, 0).context("read INSPECT[0]")
     }
 }
 

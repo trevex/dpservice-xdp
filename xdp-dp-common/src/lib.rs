@@ -69,6 +69,16 @@ pub struct Local {
     pub underlay_ipv6: [u8; 16],
 }
 
+/// Debug-only type for the `INSPECT` map: records the first 32 bytes of the first packet an
+/// XDP program sees, plus the total length and a per-packet counter.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct InspectEntry {
+    pub len: u32,
+    pub seen: u32,
+    pub bytes: [u8; 32],
+}
+
 /// Single-entry `CONFIG` map: per-hypervisor datapath parameters for the PoC's
 /// CONFIG-driven single-peer overlay (one guest + one peer hypervisor). The XDP programs
 /// read entry 0; the control plane populates it. MACs/ifindexes are filled at e2e time.
@@ -105,6 +115,7 @@ mod user_impls {
     unsafe impl aya::Pod for RouteValue {}
     unsafe impl aya::Pod for Config {}
     unsafe impl aya::Pod for Local {}
+    unsafe impl aya::Pod for InspectEntry {}
 }
 
 #[cfg(test)]

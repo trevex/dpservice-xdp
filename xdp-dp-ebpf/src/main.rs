@@ -5,6 +5,7 @@ mod arp_nd;
 mod egress;
 mod encap;
 mod ingress;
+mod inspect;
 mod maps;
 mod parse;
 
@@ -31,6 +32,11 @@ pub fn uplink_rx(ctx: XdpContext) -> u32 {
         Ok(act) => act,
         Err(()) => xdp_action::XDP_PASS,
     }
+}
+
+#[xdp]
+pub fn xdp_inspect(ctx: XdpContext) -> u32 {
+    inspect::try_inspect(&ctx)
 }
 
 #[cfg(not(test))]
