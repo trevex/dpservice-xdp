@@ -267,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
                         gateway_ipv4: gw,
                         guest_mac,
                         _pad: [0; 2],
+                        underlay_ipv6: [0u8; 16],
                     },
                 )?;
                 ifaces.upsert(

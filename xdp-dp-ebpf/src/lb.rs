@@ -70,6 +70,7 @@ pub fn lb_select_dnat(ctx: &XdpContext, ip_off: usize, vni: u32) -> Option<[u8; 
     }
     // reverse conntrack: backend->client expected on the return; restore lb (= dst) on egress.
     let key = CtKey {
+        vni,
         src_ip: backend,
         dst_ip: src,
         src_port: dport, // backend replies from the LB port

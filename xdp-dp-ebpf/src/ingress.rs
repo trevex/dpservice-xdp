@@ -43,7 +43,7 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     let nat_guest = if lb_backend.is_none() {
         let d = ctx.data();
         let de = ctx.data_end();
-        match crate::conntrack::ct_key(d, de, ETH_LEN + IPV6_LEN) {
+        match crate::conntrack::ct_key(d, de, ETH_LEN + IPV6_LEN, 0) {
             Some(key) => match unsafe { crate::maps::CONNTRACK.get(&key) } {
                 Some(e) if e.flags & CT_REWRITE_DST != 0 => {
                     let mut e = *e;
@@ -75,7 +75,7 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     // Ingress firewall: enforce the DESTINATION interface's INGRESS rules on NEW inbound flows
     // (established flows — including seeded returns — already have a conntrack entry, so they are
     // allowed without re-evaluation). Runs on the post-LB/NAT-DNAT inner 5-tuple.
-    if let Some(key) = crate::conntrack::ct_key(ctx.data(), ctx.data_end(), ETH_LEN + IPV6_LEN) {
+    if let Some(key) = crate::conntrack::ct_key(ctx.data(), ctx.data_end(), ETH_LEN + IPV6_LEN, 0) {
         if unsafe { crate::maps::CONNTRACK.get(&key) }.is_none()
             && crate::firewall::fw_eval_dir(
                 ctx.data(),
@@ -93,7 +93,8 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     // Track every flow: refresh an existing inbound DEFAULT entry, or create one on miss.
     // Only for non-LB/non-NAT flows; the inner IPv4 is at ETH_LEN + IPV6_LEN pre-adjust_head.
     if lb_backend.is_none() && nat_guest.is_none() {
-        if let Some(key) = crate::conntrack::ct_key(ctx.data(), ctx.data_end(), ETH_LEN + IPV6_LEN)
+        if let Some(key) =
+            crate::conntrack::ct_key(ctx.data(), ctx.data_end(), ETH_LEN + IPV6_LEN, 0)
         {
             match unsafe { crate::maps::CONNTRACK.get(&key) } {
                 Some(e) => {

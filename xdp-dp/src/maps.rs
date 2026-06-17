@@ -3,7 +3,8 @@ use aya::maps::{Array, HashMap, MapData};
 use aya::Ebpf;
 use xdp_dp_common::{
     Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
-    LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteKey, RouteValue, VipKey,
+    LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteKey, RouteValue, UnderlayValue,
+    VipKey,
 };
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
@@ -348,6 +349,32 @@ impl FwConfig {
 
     pub fn set(&mut self, enforce: u32) -> anyhow::Result<()> {
         self.map.set(0, &enforce, 0).context("write FW_CONFIG[0]")
+    }
+}
+
+/// Typed handle over the `UNDERLAY` BPF map (underlay IPv6 -> VNI + tap + guest MAC).
+#[allow(dead_code)]
+pub struct Underlay {
+    map: HashMap<MapData, [u8; 16], UnderlayValue>,
+}
+
+#[allow(dead_code)]
+impl Underlay {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(ebpf.take_map("UNDERLAY").context("UNDERLAY map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, key: [u8; 16], val: UnderlayValue) -> anyhow::Result<()> {
+        self.map.insert(key, val, 0).context("insert underlay")
+    }
+
+    pub fn remove(&mut self, key: &[u8; 16]) -> anyhow::Result<()> {
+        self.map.remove(key).context("remove underlay")
+    }
+
+    pub fn get(&self, key: &[u8; 16]) -> Option<UnderlayValue> {
+        self.map.get(key, 0).ok()
     }
 }
 

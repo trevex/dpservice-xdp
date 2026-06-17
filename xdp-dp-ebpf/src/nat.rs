@@ -51,6 +51,7 @@ pub fn nat_snat_egress(ctx: &XdpContext, ip_off: usize, vni: u32, is_external: b
 
     // Forward conntrack: reuse the allocated port for an already-tracked flow.
     let fwd_key = CtKey {
+        vni,
         src_ip: src,
         dst_ip: dst,
         src_port: sport,
@@ -71,6 +72,7 @@ pub fn nat_snat_egress(ctx: &XdpContext, ip_off: usize, vni: u32, is_external: b
                 // nat_port too; for TCP/UDP it is the unchanged ext (original dst) port.
                 let rev_src_port = if proto == IPPROTO_ICMP { cand } else { dport };
                 let rev_key = CtKey {
+                    vni,
                     src_ip: dst,
                     dst_ip: nat.nat_ipv4,
                     src_port: rev_src_port,

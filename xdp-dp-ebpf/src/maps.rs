@@ -4,7 +4,8 @@ use aya_ebpf::{
 };
 use xdp_dp_common::{
     Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
-    LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteKey, RouteValue, VipKey,
+    LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteKey, RouteValue, UnderlayValue,
+    VipKey,
 };
 
 #[map]
@@ -40,3 +41,5 @@ pub static FW_META: HashMap<u32, FwMeta> = HashMap::with_max_entries(1024, 0);
 /// Entry 0: firewall enforcement flag (1 = drop on deny, 0 = evaluate-only).
 #[map]
 pub static FW_CONFIG: Array<u32> = Array::with_max_entries(1, 0);
+#[map]
+pub static UNDERLAY: HashMap<[u8; 16], UnderlayValue> = HashMap::with_max_entries(4096, 0);

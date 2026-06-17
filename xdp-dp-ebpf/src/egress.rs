@@ -28,7 +28,7 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     }
     // Conntrack + egress firewall. Established flows: apply translation + refresh. New flows:
     // enforce the SOURCE interface's EGRESS firewall (whitelist; no rules => accept).
-    if let Some(key) = crate::conntrack::ct_key(data, data_end, ETH_LEN) {
+    if let Some(key) = crate::conntrack::ct_key(data, data_end, ETH_LEN, meta.vni) {
         match unsafe { crate::maps::CONNTRACK.get(&key) } {
             Some(e) => {
                 let mut e = *e;
@@ -67,7 +67,7 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     let is_ext = route.is_external != 0;
     crate::nat::nat_snat_egress(ctx, ETH_LEN, meta.vni, is_ext);
     // Track every flow: if no conntrack entry exists for this (post-NAT) 5-tuple, insert DEFAULT.
-    if let Some(key) = crate::conntrack::ct_key(ctx.data(), ctx.data_end(), ETH_LEN) {
+    if let Some(key) = crate::conntrack::ct_key(ctx.data(), ctx.data_end(), ETH_LEN, meta.vni) {
         if unsafe { crate::maps::CONNTRACK.get(&key) }.is_none() {
             crate::conntrack::ct_ensure_default(ctx, ETH_LEN, &key);
         }

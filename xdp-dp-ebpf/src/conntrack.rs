@@ -21,9 +21,9 @@ pub fn now() -> u64 {
     unsafe { bpf_ktime_get_ns() }
 }
 
-/// Build the 5-tuple key for the packet at `ip_off` (host-order ports; ICMP id in both ports).
+/// Build the VNI-keyed 5-tuple key for the packet at `ip_off` (host-order ports; ICMP id in both ports).
 #[inline(always)]
-pub fn ct_key(data: usize, data_end: usize, ip_off: usize) -> Option<CtKey> {
+pub fn ct_key(data: usize, data_end: usize, ip_off: usize, vni: u32) -> Option<CtKey> {
     let p = data as *const u8;
     if data + ip_off + 20 > data_end {
         return None;
@@ -32,6 +32,7 @@ pub fn ct_key(data: usize, data_end: usize, ip_off: usize) -> Option<CtKey> {
     let dst = unsafe { core::ptr::read_unaligned(p.add(ip_off + 16) as *const [u8; 4]) };
     let (proto, sport, dport) = l4_ports(data, data_end, ip_off)?;
     Some(CtKey {
+        vni,
         src_ip: src,
         dst_ip: dst,
         src_port: sport,
@@ -227,6 +228,7 @@ pub fn ct_touch(ctx: &XdpContext, ip_off: usize, key: &CtKey, e: &mut CtEntry) {
 #[inline(always)]
 pub fn invert_key(k: &CtKey) -> CtKey {
     CtKey {
+        vni: k.vni,
         src_ip: k.dst_ip,
         dst_ip: k.src_ip,
         src_port: k.dst_port,

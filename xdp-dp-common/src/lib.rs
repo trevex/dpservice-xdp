@@ -49,6 +49,16 @@ pub struct IfaceValue {
     pub _pad: [u8; 2],
 }
 
+/// Ingress delivery entry: an interface's underlay IPv6 -> its VNI + local tap + guest MAC.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct UnderlayValue {
+    pub vni: u32,
+    pub tap_ifindex: u32,
+    pub guest_mac: [u8; 6],
+    pub _pad: [u8; 2],
+}
+
 /// Per-port metadata, keyed by the guest tap's host-side ifindex.
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
@@ -58,6 +68,7 @@ pub struct PortMeta {
     pub gateway_ipv4: [u8; 4],
     pub guest_mac: [u8; 6],
     pub _pad: [u8; 2],
+    pub underlay_ipv6: [u8; 16],
 }
 
 impl IfaceKey {
@@ -143,10 +154,11 @@ pub struct MaglevKey {
     pub slot: u32,
 }
 
-/// Conntrack key: the 5-tuple (host-order ports; for ICMP the ports hold the id).
+/// Conntrack key: the VNI + 5-tuple (host-order ports; for ICMP the ports hold the id).
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
 pub struct CtKey {
+    pub vni: u32,
     pub src_ip: [u8; 4],
     pub dst_ip: [u8; 4],
     pub src_port: u16,
@@ -322,6 +334,7 @@ mod user_impls {
     use super::*;
     unsafe impl aya::Pod for IfaceKey {}
     unsafe impl aya::Pod for IfaceValue {}
+    unsafe impl aya::Pod for UnderlayValue {}
     unsafe impl aya::Pod for PortMeta {}
     unsafe impl aya::Pod for RouteKey {}
     unsafe impl aya::Pod for RouteValue {}
@@ -366,7 +379,7 @@ mod tests {
 
     #[test]
     fn port_meta_and_iface_layout() {
-        assert_eq!(core::mem::size_of::<PortMeta>(), 20);
+        assert_eq!(core::mem::size_of::<PortMeta>(), 36);
         assert_eq!(core::mem::size_of::<IfaceValue>(), 32);
         assert_eq!(core::mem::align_of::<PortMeta>(), 4);
     }
@@ -388,7 +401,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<LbKey>(), 12);
         assert_eq!(core::mem::size_of::<LbValue>(), 8);
         assert_eq!(core::mem::size_of::<MaglevKey>(), 8);
-        assert_eq!(core::mem::size_of::<CtKey>(), 16);
+        assert_eq!(core::mem::size_of::<CtKey>(), 20);
+        assert_eq!(core::mem::size_of::<UnderlayValue>(), 16);
     }
 
     #[test]
