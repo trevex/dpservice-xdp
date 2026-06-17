@@ -1,4 +1,5 @@
 use aya_ebpf::{
+    bindings::xdp_action,
     helpers::{bpf_redirect, bpf_xdp_adjust_head},
     programs::XdpContext,
 };
@@ -44,4 +45,30 @@ pub fn encap_and_redirect(
         write16(ip.add(24), &route.nexthop_ipv6);
     }
     Ok(unsafe { bpf_redirect(local.uplink_ifindex, 0) } as u32)
+}
+
+/// Re-forward an already-encapped packet to a new backend underlay (LB remote backend): rewrite
+/// the outer Ethernet (dst=gateway_mac, src=uplink_mac) + outer IPv6 (src=lb_underlay,
+/// dst=backend) and redirect out the uplink WITHOUT decap. Returns the XDP action.
+#[inline(always)]
+pub fn reforward(
+    ctx: &XdpContext,
+    local: &Local,
+    lb_underlay: &[u8; 16],
+    backend: &[u8; 16],
+) -> u32 {
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + ETH_LEN + IPV6_LEN > data_end {
+        return xdp_action::XDP_DROP;
+    }
+    let p = data as *mut u8;
+    unsafe {
+        write6(p, &local.gateway_mac);
+        write6(p.add(6), &local.uplink_mac);
+        let ip = p.add(ETH_LEN);
+        write16(ip.add(8), lb_underlay);
+        write16(ip.add(24), backend);
+        bpf_redirect(local.uplink_ifindex, 0) as u32
+    }
 }

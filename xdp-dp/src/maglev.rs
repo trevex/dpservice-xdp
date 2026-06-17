@@ -12,8 +12,8 @@ fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
 }
 
 /// Build a Maglev lookup table of size `TABLE_SIZE` over `backends` (each identified by its
-/// 4-byte IPv4). Returns `table[slot] = backend_index`. Empty backends -> empty vec.
-pub fn build(backends: &[[u8; 4]]) -> Vec<u32> {
+/// 16-byte underlay IPv6). Returns `table[slot] = backend_index`. Empty backends -> empty vec.
+pub fn build(backends: &[[u8; 16]]) -> Vec<u32> {
     let n = backends.len();
     let m = TABLE_SIZE as usize;
     if n == 0 {
@@ -53,7 +53,9 @@ mod tests {
 
     #[test]
     fn distributes_evenly_across_two_backends() {
-        let table = build(&[[10, 0, 0, 5], [10, 0, 0, 7]]);
+        let b0: [u8; 16] = [10, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let b1: [u8; 16] = [10, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let table = build(&[b0, b1]);
         assert_eq!(table.len(), TABLE_SIZE as usize);
         let c0 = table.iter().filter(|&&x| x == 0).count();
         let c1 = table.iter().filter(|&&x| x == 1).count();
@@ -72,8 +74,10 @@ mod tests {
 
     #[test]
     fn deterministic() {
-        let a = build(&[[10, 0, 0, 5], [10, 0, 0, 7]]);
-        let b = build(&[[10, 0, 0, 5], [10, 0, 0, 7]]);
+        let b0: [u8; 16] = [10, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let b1: [u8; 16] = [10, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let a = build(&[b0, b1]);
+        let b = build(&[b0, b1]);
         assert_eq!(a, b);
     }
 }

@@ -133,13 +133,16 @@ enum Cmd {
         /// VIP mapping, repeatable: "<interface_ipv4>=<vip_ipv4>" (programs both VIPS directions).
         #[arg(long = "vip")]
         vips: Vec<String>,
-        /// Load balancer service, repeatable: "<ipv4>:<port>:<proto>" (proto numeric: 1=ICMP,
-        /// 6=TCP, 17=UDP). For ICMP use port 0. Allocates a Maglev table; add backends via
-        /// --lb-target.
+        /// Load balancer service, repeatable:
+        /// "<ipv4>:<port>:<proto>:<lb_underlay_ipv6>" (proto numeric: 1=ICMP, 6=TCP, 17=UDP).
+        /// For ICMP use port 0. The lb_underlay_ipv6 is the LB's own underlay /128 (programs
+        /// UNDERLAY so the datapath can identify arriving LB-destined packets). Allocates a
+        /// Maglev table; add backends via --lb-target.
         #[arg(long = "lb")]
         lbs: Vec<String>,
-        /// LB backend, repeatable: "<ipv4>:<port>:<proto>=<backend_ipv4>". References an --lb
-        /// service and appends a backend, rebuilding that service's Maglev table.
+        /// LB backend, repeatable: "<ipv4>:<port>:<proto>:<lb_underlay_ipv6>=<backend_underlay_ipv6>".
+        /// References an --lb service and appends a backend underlay /128, rebuilding that
+        /// service's Maglev table.
         #[arg(long = "lb-target")]
         lb_targets: Vec<String>,
         /// NAT config, repeatable: "<guest_ipv4>=<nat_ipv4>:<port_min>:<port_max>".
@@ -345,27 +348,36 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Load balancers: each --lb allocates a Maglev table_id and an LB service entry;
-            // each --lb-target appends a backend to the named service. After collecting all
-            // backends we build + write the Maglev table for every service.
+            // each --lb-target appends a backend underlay /128 to the named service. After
+            // collecting all backends we build + write the Maglev table for every service.
+            //
+            // --lb spec: "<ipv4>:<port>:<proto>:<lb_underlay_ipv6>"
+            // --lb-target spec: "<ipv4>:<port>:<proto>:<lb_underlay_ipv6>=<backend_underlay_ipv6>"
             let mut lb_map = maps::Lb::open(&mut ebpf)?;
             let mut maglev_map = maps::Maglev::open(&mut ebpf)?;
-            let parse_lb_spec = |spec: &str| -> anyhow::Result<([u8; 4], u16, u8)> {
+            // Parse "<ipv4>:<port>:<proto>:<lb_underlay_ipv6>" -> (ip, port, proto, lb_underlay).
+            let parse_lb_spec = |spec: &str| -> anyhow::Result<([u8; 4], u16, u8, [u8; 16])> {
                 let mut it = spec.split(':');
                 let ip = parse_ipv4(it.next().context("--lb: missing ipv4")?)?;
                 let port: u16 = it.next().context("--lb: missing port")?.parse()?;
                 let proto: u8 = it.next().context("--lb: missing proto")?.parse()?;
-                Ok((ip, port, proto))
+                // The remaining fields (potentially multiple ':'-separated groups in the IPv6)
+                // must be reassembled because parse_ipv6 expects the full address string.
+                let rest: String = it.collect::<Vec<_>>().join(":");
+                let lb_underlay = parse_ipv6(rest.trim())?;
+                Ok((ip, port, proto, lb_underlay))
             };
-            let mut table_ids: std::collections::HashMap<([u8; 4], u16, u8), u32> =
+            // Key: (ip, port, proto, lb_underlay) -> table_id
+            let mut table_ids: std::collections::HashMap<([u8; 4], u16, u8, [u8; 16]), u32> =
                 std::collections::HashMap::new();
-            let mut backends: std::collections::HashMap<u32, Vec<[u8; 4]>> =
+            let mut backends: std::collections::HashMap<u32, Vec<[u8; 16]>> =
                 std::collections::HashMap::new();
             let mut next_table_id = 1u32;
             for lb in &lbs {
-                let (ip, port, proto) = parse_lb_spec(lb)?;
+                let (ip, port, proto, lb_underlay) = parse_lb_spec(lb)?;
                 let tid = next_table_id;
                 next_table_id += 1;
-                table_ids.insert((ip, port, proto), tid);
+                table_ids.insert((ip, port, proto, lb_underlay), tid);
                 backends.insert(tid, Vec::new());
                 lb_map.upsert(
                     xdp_dp_common::LbKey {
@@ -380,15 +392,25 @@ async fn main() -> anyhow::Result<()> {
                         size: maglev::TABLE_SIZE,
                     },
                 )?;
+                // Program the LB's own underlay /128 so ingress recognises LB-destined packets.
+                underlay_map.upsert(
+                    lb_underlay,
+                    xdp_dp_common::UnderlayValue {
+                        vni: 0,
+                        tap_ifindex: 0,
+                        guest_mac: [0; 6],
+                        _pad: [0; 2],
+                    },
+                )?;
             }
             for t in &lb_targets {
                 let (spec, backend_str) = t
                     .split_once('=')
-                    .context("--lb-target must be spec=backend")?;
-                let (ip, port, proto) = parse_lb_spec(spec)?;
-                let backend = parse_ipv4(backend_str)?;
+                    .context("--lb-target must be spec=backend_underlay_ipv6")?;
+                let (ip, port, proto, lb_underlay) = parse_lb_spec(spec)?;
+                let backend = parse_ipv6(backend_str)?;
                 let tid = *table_ids
-                    .get(&(ip, port, proto))
+                    .get(&(ip, port, proto, lb_underlay))
                     .context("--lb-target references an unknown --lb service")?;
                 backends.get_mut(&tid).unwrap().push(backend);
             }

@@ -219,7 +219,7 @@ impl Lb {
 /// Typed handle over the `MAGLEV` BPF map.
 #[allow(dead_code)]
 pub struct Maglev {
-    map: HashMap<MapData, MaglevKey, [u8; 4]>,
+    map: HashMap<MapData, MaglevKey, [u8; 16]>,
 }
 
 #[allow(dead_code)]
@@ -229,7 +229,7 @@ impl Maglev {
         Ok(Self { map })
     }
 
-    pub fn upsert(&mut self, key: MaglevKey, val: [u8; 4]) -> anyhow::Result<()> {
+    pub fn upsert(&mut self, key: MaglevKey, val: [u8; 16]) -> anyhow::Result<()> {
         self.map.insert(key, val, 0).context("insert maglev")
     }
 
@@ -237,7 +237,7 @@ impl Maglev {
         self.map.remove(key).context("remove maglev")
     }
 
-    pub fn get(&self, key: &MaglevKey) -> Option<[u8; 4]> {
+    pub fn get(&self, key: &MaglevKey) -> Option<[u8; 16]> {
         self.map.get(key, 0).ok()
     }
 }

@@ -609,12 +609,17 @@ impl DpdKironcore for Service {
             .iter()
             .map(|p| (p.port as u16, p.protocol as u8))
             .collect();
+        // Derive a deterministic LB underlay /128: same scheme as create_interface
+        // (hypervisor_prefix[0..8] ++ vni_be(4) ++ ipv4(4)).
+        let mut lb_underlay = self.underlay;
+        lb_underlay[8..12].copy_from_slice(&r.vni.to_be_bytes());
+        lb_underlay[12..16].copy_from_slice(&ip);
         control
-            .create_lb(&r.loadbalancer_id, r.vni, ip, ports)
+            .create_lb(&r.loadbalancer_id, r.vni, ip, lb_underlay, ports)
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(CreateLoadBalancerResponse {
             status: ok(),
-            underlay_route: self.underlay.to_vec(),
+            underlay_route: lb_underlay.to_vec(),
         }))
     }
 
@@ -649,23 +654,15 @@ impl DpdKironcore for Service {
 
     async fn create_load_balancer_target(
         &self,
-        req: Request<CreateLoadBalancerTargetRequest>,
+        _req: Request<CreateLoadBalancerTargetRequest>,
     ) -> Result<Response<CreateLoadBalancerTargetResponse>, Status> {
-        let control = self
-            .control
-            .as_ref()
-            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
-        let r = req.into_inner();
-        let tgt = r
-            .target_ip
-            .ok_or_else(|| Status::invalid_argument("target_ip is required"))?;
-        let backend = decode_ipv4(&tgt.address)?;
-        control
-            .add_lb_target(&r.loadbalancer_id, backend)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(CreateLoadBalancerTargetResponse {
-            status: ok(),
-        }))
+        // M9: LB backends are now underlay /128 addresses, but the proto target_ip is an IPv4
+        // with no VNI field — not enough information to synthesize a backend underlay via gRPC.
+        // LB backend underlay programming via gRPC lands with the ioiab integration (M10+).
+        // The CLI bringup path (--lb-target) is used for M9.
+        Err(Status::unimplemented(
+            "LB target programming via gRPC requires ioiab integration (M10+); use --lb-target CLI flag",
+        ))
     }
 
     async fn list_load_balancer_targets(

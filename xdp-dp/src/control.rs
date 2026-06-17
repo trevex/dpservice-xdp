@@ -18,9 +18,10 @@ use crate::maps::{
 struct LbEntry {
     vni: u32,
     ip: [u8; 4],
+    lb_underlay: [u8; 16],
     ports: Vec<(u16, u8)>,
     table_id: u32,
-    backends: Vec<[u8; 4]>,
+    backends: Vec<[u8; 16]>,
 }
 
 /// Owns the loaded eBPF object + map handles; mutated by the gRPC handlers.
@@ -204,6 +205,7 @@ impl Control {
         id: &[u8],
         vni: u32,
         ip: [u8; 4],
+        lb_underlay: [u8; 16],
         ports: Vec<(u16, u8)>,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
@@ -224,11 +226,23 @@ impl Control {
                 },
             )?;
         }
+        // Program the LB's own underlay /128 into UNDERLAY so ingress can identify it.
+        // tap_ifindex=0 and guest_mac=[0;6] because the LB VIP is anycast (no local tap).
+        g.underlay.upsert(
+            lb_underlay,
+            xdp_dp_common::UnderlayValue {
+                vni,
+                tap_ifindex: 0,
+                guest_mac: [0; 6],
+                _pad: [0; 2],
+            },
+        )?;
         g.lbs.insert(
             id.to_vec(),
             LbEntry {
                 vni,
                 ip,
+                lb_underlay,
                 ports,
                 table_id,
                 backends: Vec::new(),
@@ -237,8 +251,8 @@ impl Control {
         Ok(())
     }
 
-    /// Append a backend to a registered LB and rebuild + write its Maglev table.
-    pub fn add_lb_target(&self, id: &[u8], backend: [u8; 4]) -> anyhow::Result<()> {
+    /// Append a backend underlay /128 to a registered LB and rebuild + write its Maglev table.
+    pub fn add_lb_target(&self, id: &[u8], backend: [u8; 16]) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
         let (table_id, backends) = {
             let entry = g
