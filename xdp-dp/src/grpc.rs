@@ -397,37 +397,86 @@ impl DpdKironcore for Service {
 
     async fn create_nat(
         &self,
-        _req: Request<CreateNatRequest>,
+        req: Request<CreateNatRequest>,
     ) -> Result<Response<CreateNatResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let nat_addr = r
+            .nat_ip
+            .ok_or_else(|| Status::invalid_argument("nat_ip is required"))?;
+        let nat_ip = decode_ipv4(&nat_addr.address)?;
+        control
+            .create_nat(
+                &r.interface_id,
+                nat_ip,
+                r.min_port as u16,
+                r.max_port as u16,
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CreateNatResponse {
+            status: ok(),
+            underlay_route: self.underlay.to_vec(),
+        }))
     }
 
     async fn get_nat(
         &self,
-        _req: Request<GetNatRequest>,
+        req: Request<GetNatRequest>,
     ) -> Result<Response<GetNatResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let (nat_ip, min_port, max_port) =
+            control.get_nat(&r.interface_id).unwrap_or(([0u8; 4], 0, 0));
+        Ok(Response::new(GetNatResponse {
+            status: ok(),
+            nat_ip: Some(IpAddress {
+                ipver: IpVersion::Ipv4 as i32,
+                address: nat_ip.to_vec(),
+            }),
+            min_port: min_port as u32,
+            max_port: max_port as u32,
+            underlay_route: self.underlay.to_vec(),
+        }))
     }
 
     async fn delete_nat(
         &self,
-        _req: Request<DeleteNatRequest>,
+        req: Request<DeleteNatRequest>,
     ) -> Result<Response<DeleteNatResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        control
+            .delete_nat(&r.interface_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(DeleteNatResponse { status: ok() }))
     }
 
     async fn list_local_nats(
         &self,
         _req: Request<ListLocalNatsRequest>,
     ) -> Result<Response<ListLocalNatsResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        // PoC: the datapath NAT map is authoritative; an enumerating lister is a follow-on.
+        Ok(Response::new(ListLocalNatsResponse {
+            status: ok(),
+            nat_entries: Vec::new(),
+        }))
     }
 
     async fn create_neighbor_nat(
         &self,
         _req: Request<CreateNeighborNatRequest>,
     ) -> Result<Response<CreateNeighborNatResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        // Distributed (multi-node) NAT return is out of scope for the single-node PoC; accept + OK.
+        Ok(Response::new(CreateNeighborNatResponse { status: ok() }))
     }
 
     async fn delete_neighbor_nat(

@@ -4,11 +4,12 @@ use std::sync::Mutex;
 use anyhow::Context as _;
 use aya::Ebpf;
 use xdp_dp_common::{
-    IfaceKey, IfaceValue, LbKey, LbValue, Local, MaglevKey, PortMeta, RouteKey, RouteValue, VipKey,
+    IfaceKey, IfaceValue, LbKey, LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteKey,
+    RouteValue, VipKey,
 };
 
 use crate::loader;
-use crate::maps::{Interfaces, Lb, LocalMap, Maglev, PortMetaMap, Routes, Vips};
+use crate::maps::{Interfaces, Lb, LocalMap, Maglev, Nat, PortMetaMap, Routes, Vips};
 
 /// Registered load balancer: its Maglev table id, the (port,proto) services it answers, and the
 /// ordered backend list (drives the Maglev table). Keyed in `Inner.lbs` by the LB's id.
@@ -34,6 +35,7 @@ struct Inner {
     vips: Vips,
     lb: Lb,
     maglev: Maglev,
+    nat: Nat,
     /// loadbalancer_id -> its LB state.
     lbs: HashMap<Vec<u8>, LbEntry>,
     next_table_id: u32,
@@ -65,6 +67,7 @@ impl Control {
         let vips = Vips::open(&mut ebpf)?;
         let lb = Lb::open(&mut ebpf)?;
         let maglev = Maglev::open(&mut ebpf)?;
+        let nat = Nat::open(&mut ebpf)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 ebpf,
@@ -75,6 +78,7 @@ impl Control {
                 vips,
                 lb,
                 maglev,
+                nat,
                 lbs: HashMap::new(),
                 next_table_id: 1,
                 by_id: HashMap::new(),
@@ -271,5 +275,48 @@ impl Control {
         let g = self.inner.lock().unwrap();
         let (vni, gip) = *g.by_id.get(interface_id)?;
         g.vips.get(&VipKey { vni, ipv4: gip })
+    }
+
+    /// Program a guest's NAT config: (vni, guest_ip) -> (nat_ip, port_min, port_max).
+    pub fn create_nat(
+        &self,
+        interface_id: &[u8],
+        nat_ip: [u8; 4],
+        port_min: u16,
+        port_max: u16,
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let (vni, gip) = *g
+            .by_id
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        g.nat.upsert(
+            NatKey { vni, ipv4: gip },
+            NatValue {
+                nat_ipv4: nat_ip,
+                port_min,
+                port_max,
+            },
+        )
+    }
+
+    /// Return a guest's NAT config (nat_ip, port_min, port_max), if set.
+    pub fn get_nat(&self, interface_id: &[u8]) -> Option<([u8; 4], u16, u16)> {
+        let g = self.inner.lock().unwrap();
+        let (vni, gip) = *g.by_id.get(interface_id)?;
+        g.nat
+            .get(&NatKey { vni, ipv4: gip })
+            .map(|v| (v.nat_ipv4, v.port_min, v.port_max))
+    }
+
+    /// Remove a guest's NAT config.
+    pub fn delete_nat(&self, interface_id: &[u8]) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let (vni, gip) = *g
+            .by_id
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        let _ = g.nat.remove(&NatKey { vni, ipv4: gip });
+        Ok(())
     }
 }
