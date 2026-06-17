@@ -216,6 +216,7 @@ cmd_up() {
         --lb-target "10.0.0.200:0:1=10.0.0.5" \
         --lb-target "10.0.0.200:0:1=10.0.0.7" \
         --remote "10.0.0.8=fd00:b::8=0" \
+        --remote "10.0.0.0/24=fd00:b::8=0" \
         --external "10.0.0.8" \
         --nat "10.0.0.5=10.0.0.50:20000:30000" \
         --remote "10.0.0.6=fd00:b::206=100" &
@@ -442,6 +443,32 @@ cmd_test() {
             echo "  ISOLATION OK: vni=100 traffic never reached the vni=0 guestb (overlapping 10.0.0.6)"
         fi
         rm -f /tmp/iso.txt
+    fi
+    echo ""
+
+    echo "=== Test 11: LPM routing — /32 to guestb wins over a /24 supernet to extsrv ==="
+    # hypa has 10.0.0.6/32 -> guestb AND 10.0.0.0/24 -> extsrv (fd00:b::8). A guesta ping to
+    # 10.0.0.6 must take the more-specific /32 (reach guestb), NOT the /24 (extsrv).
+    if [[ -n "$TCPDUMP" ]]; then
+        sudo ip netns exec extsrv "$TCPDUMP" -ni gE 'icmp and host 10.0.0.6' -c 3 >/tmp/lpm.txt 2>&1 &
+        TDL=$!
+        sleep 0.3
+    fi
+    if sudo ip netns exec guesta ping -c 2 -W 2 10.0.0.6 >/dev/null 2>&1; then
+        echo "  /32 route OK: guesta -> 10.0.0.6 reaches guestb"
+    else
+        echo "  WARNING: guesta -> 10.0.0.6 failed under LPM"
+    fi
+    if [[ -n "$TCPDUMP" ]]; then
+        sudo kill "$TDL" 2>/dev/null || true
+        wait "$TDL" 2>/dev/null || true
+        if grep -q 'ICMP' /tmp/lpm.txt; then
+            echo "  WARNING: traffic to 10.0.0.6 hit the /24 supernet (extsrv) — LPM not most-specific"
+            cat /tmp/lpm.txt
+        else
+            echo "  LPM OK: the /32 beat the /24 supernet (extsrv saw nothing for 10.0.0.6)"
+        fi
+        rm -f /tmp/lpm.txt
     fi
     echo ""
 
