@@ -61,6 +61,28 @@ pub fn l4_ports(data: usize, data_end: usize, ip_off: usize) -> Option<(u8, u16,
     }
 }
 
+/// Read the TCP flags byte for an IPv4 packet at `ip_off`, or None if not TCP / out of bounds /
+/// IP options present (IHL != 5). The TCP flags are at the standard offset 13 of the TCP header.
+#[inline(always)]
+pub fn tcp_flags(data: usize, data_end: usize, ip_off: usize) -> Option<u8> {
+    let p = data as *const u8;
+    if data + ip_off + 20 > data_end {
+        return None;
+    }
+    if unsafe { *p.add(ip_off + 9) } != IPPROTO_TCP {
+        return None;
+    }
+    // Constrain to no IP options so the L4 offset is a constant (BPF verifier friendliness).
+    if unsafe { *p.add(ip_off) } & 0x0f != 5 {
+        return None;
+    }
+    let l4 = ip_off + 20;
+    if data + l4 + 14 > data_end {
+        return None;
+    }
+    Some(unsafe { *p.add(l4 + 13) })
+}
+
 /// Stable 5-tuple hash (FNV-1a-ish) for Maglev slot selection.
 /// Loops are fully unrolled to satisfy the BPF verifier (no iterator-based loops).
 #[inline(always)]

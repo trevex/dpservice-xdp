@@ -29,8 +29,9 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     // Conntrack: apply any established translation (LB reverse; later NAT/DEFAULT) before SNAT/route.
     if let Some(key) = crate::conntrack::ct_key(data, data_end, ETH_LEN) {
         if let Some(e) = unsafe { crate::maps::CONNTRACK.get(&key) } {
-            let e = *e;
+            let mut e = *e;
             crate::conntrack::ct_apply(ctx, ETH_LEN, &e);
+            crate::conntrack::ct_touch(ctx, ETH_LEN, &key, &mut e);
         }
     }
     // SNAT: rewrite inner IPv4 source if a VIP mapping exists (G->V).

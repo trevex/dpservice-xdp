@@ -46,8 +46,9 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
         match crate::conntrack::ct_key(d, de, ETH_LEN + IPV6_LEN) {
             Some(key) => match unsafe { crate::maps::CONNTRACK.get(&key) } {
                 Some(e) if e.flags & CT_REWRITE_DST != 0 => {
-                    let e = *e;
+                    let mut e = *e;
                     crate::conntrack::ct_apply(ctx, ETH_LEN + IPV6_LEN, &e);
+                    crate::conntrack::ct_touch(ctx, ETH_LEN + IPV6_LEN, &key, &mut e);
                     Some(e.xlate_ip)
                 }
                 _ => None,

@@ -1,5 +1,8 @@
 use aya_ebpf::{helpers::bpf_ktime_get_ns, programs::XdpContext};
-use xdp_dp_common::{CtEntry, CtKey, CT_REWRITE_SRC};
+use xdp_dp_common::{
+    CtEntry, CtKey, CT_REWRITE_SRC, TCP_ESTABLISHED, TCP_FINWAIT, TCP_NEW_SYN, TCP_NEW_SYNACK,
+    TCP_RST_FIN,
+};
 
 use crate::csum::csum_replace4;
 use crate::parse::l4_ports;
@@ -175,4 +178,43 @@ pub fn ct_apply(ctx: &XdpContext, ip_off: usize, e: &CtEntry) {
             core::ptr::write_unaligned(p.add(l4 + 4) as *mut u16, e.xlate_port.to_be());
         }
     }
+}
+
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const TCP_ACK: u8 = 0x10;
+
+/// Advance the TCP state for a flow given a packet's TCP flags (functional parity with dpservice's
+/// NONE->NEW_SYN->NEW_SYNACK->ESTABLISHED->FINWAIT->RST_FIN progression).
+#[inline(always)]
+pub fn tcp_advance(state: u8, flags: u8) -> u8 {
+    if flags & TCP_RST != 0 {
+        return TCP_RST_FIN;
+    }
+    if flags & TCP_FIN != 0 {
+        return TCP_FINWAIT;
+    }
+    if flags & TCP_SYN != 0 {
+        if flags & TCP_ACK != 0 {
+            return TCP_NEW_SYNACK;
+        }
+        return TCP_NEW_SYN;
+    }
+    if flags & TCP_ACK != 0
+        && (state == TCP_NEW_SYNACK || state == TCP_NEW_SYN || state == TCP_ESTABLISHED)
+    {
+        return TCP_ESTABLISHED;
+    }
+    state
+}
+
+/// Refresh last_seen (and TCP state for TCP) on a matched entry, writing it back.
+#[inline(always)]
+pub fn ct_touch(ctx: &XdpContext, ip_off: usize, key: &CtKey, e: &mut CtEntry) {
+    e.last_seen = now();
+    if let Some(fl) = crate::parse::tcp_flags(ctx.data(), ctx.data_end(), ip_off) {
+        e.tcp_state = tcp_advance(e.tcp_state, fl);
+    }
+    let _ = crate::maps::CONNTRACK.insert(key, e, 0);
 }
