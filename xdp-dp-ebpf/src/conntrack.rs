@@ -223,8 +223,22 @@ pub fn ct_touch(ctx: &XdpContext, ip_off: usize, key: &CtKey, e: &mut CtEntry) {
     let _ = crate::maps::CONNTRACK.insert(key, e, 0);
 }
 
+/// Invert a 5-tuple key (swap src/dst addr + port) — the expected reverse-direction key.
+#[inline(always)]
+pub fn invert_key(k: &CtKey) -> CtKey {
+    CtKey {
+        src_ip: k.dst_ip,
+        dst_ip: k.src_ip,
+        src_port: k.dst_port,
+        dst_port: k.src_port,
+        proto: k.proto,
+        _pad: [0; 3],
+    }
+}
+
 /// Insert a no-translation DEFAULT conntrack entry for a flow on conntrack-miss, so every flow is
-/// tracked (firewall + aging see it). Records last_seen + initial TCP state.
+/// tracked (firewall + aging see it). Records last_seen + initial TCP state. Also pre-seeds the
+/// reverse-direction entry so return traffic is immediately recognised as established.
 #[inline(always)]
 pub fn ct_ensure_default(ctx: &XdpContext, ip_off: usize, key: &CtKey) {
     let tcp = crate::parse::tcp_flags(ctx.data(), ctx.data_end(), ip_off)
@@ -240,4 +254,10 @@ pub fn ct_ensure_default(ctx: &XdpContext, ip_off: usize, key: &CtKey) {
         _pad: [0; 7],
     };
     let _ = crate::maps::CONNTRACK.insert(key, &e, 0);
+    // Pre-seed the reverse direction so return traffic is immediately recognised as established,
+    // but only if no entry already exists (NAT reverse entries must not be overwritten).
+    let rev = invert_key(key);
+    if unsafe { crate::maps::CONNTRACK.get(&rev) }.is_none() {
+        let _ = crate::maps::CONNTRACK.insert(&rev, &e, 0);
+    }
 }

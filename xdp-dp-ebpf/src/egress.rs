@@ -26,12 +26,28 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     if ethertype != ETH_P_IP {
         return Ok(xdp_action::XDP_PASS);
     }
-    // Conntrack: apply any established translation (LB reverse; later NAT/DEFAULT) before SNAT/route.
+    // Conntrack + egress firewall. Established flows: apply translation + refresh. New flows:
+    // enforce the SOURCE interface's EGRESS firewall (whitelist; no rules => accept).
     if let Some(key) = crate::conntrack::ct_key(data, data_end, ETH_LEN) {
-        if let Some(e) = unsafe { crate::maps::CONNTRACK.get(&key) } {
-            let mut e = *e;
-            crate::conntrack::ct_apply(ctx, ETH_LEN, &e);
-            crate::conntrack::ct_touch(ctx, ETH_LEN, &key, &mut e);
+        match unsafe { crate::maps::CONNTRACK.get(&key) } {
+            Some(e) => {
+                let mut e = *e;
+                crate::conntrack::ct_apply(ctx, ETH_LEN, &e);
+                crate::conntrack::ct_touch(ctx, ETH_LEN, &key, &mut e);
+            }
+            None => {
+                if crate::firewall::fw_eval_dir(
+                    data,
+                    data_end,
+                    ETH_LEN,
+                    ifindex,
+                    xdp_dp_common::FW_DIR_EGRESS,
+                ) == xdp_dp_common::FW_ACTION_DROP
+                    && crate::firewall::fw_enforcing()
+                {
+                    return Ok(xdp_action::XDP_DROP);
+                }
+            }
         }
     }
     // SNAT: rewrite inner IPv4 source if a VIP mapping exists (G->V).
