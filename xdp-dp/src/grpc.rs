@@ -5,7 +5,7 @@ use tonic::{Request, Response, Status};
 use crate::control::Control;
 use crate::pb::dpd_kironcore_server::DpdKironcore;
 use crate::pb::{
-    CaptureStartRequest, CaptureStartResponse, CaptureStatusRequest, CaptureStatusResponse,
+    self, CaptureStartRequest, CaptureStartResponse, CaptureStatusRequest, CaptureStatusResponse,
     CaptureStopRequest, CaptureStopResponse, CheckInitializedRequest, CheckInitializedResponse,
     CheckVniInUseRequest, CheckVniInUseResponse, CreateFirewallRuleRequest,
     CreateFirewallRuleResponse, CreateInterfaceRequest, CreateInterfaceResponse,
@@ -19,16 +19,17 @@ use crate::pb::{
     DeleteLoadBalancerTargetRequest, DeleteLoadBalancerTargetResponse, DeleteNatRequest,
     DeleteNatResponse, DeleteNeighborNatRequest, DeleteNeighborNatResponse, DeletePrefixRequest,
     DeletePrefixResponse, DeleteRouteRequest, DeleteRouteResponse, DeleteVipRequest,
-    DeleteVipResponse, GetFirewallRuleRequest, GetFirewallRuleResponse, GetInterfaceRequest,
-    GetInterfaceResponse, GetLoadBalancerRequest, GetLoadBalancerResponse, GetNatRequest,
-    GetNatResponse, GetVersionRequest, GetVersionResponse, GetVipRequest, GetVipResponse,
-    InitializeRequest, InitializeResponse, IpAddress, IpVersion, ListFirewallRulesRequest,
-    ListFirewallRulesResponse, ListInterfacesRequest, ListInterfacesResponse,
-    ListLoadBalancerPrefixesRequest, ListLoadBalancerPrefixesResponse,
+    DeleteVipResponse, FirewallAction, FirewallRule, GetFirewallRuleRequest,
+    GetFirewallRuleResponse, GetInterfaceRequest, GetInterfaceResponse, GetLoadBalancerRequest,
+    GetLoadBalancerResponse, GetNatRequest, GetNatResponse, GetVersionRequest, GetVersionResponse,
+    GetVipRequest, GetVipResponse, InitializeRequest, InitializeResponse, IpAddress, IpVersion,
+    ListFirewallRulesRequest, ListFirewallRulesResponse, ListInterfacesRequest,
+    ListInterfacesResponse, ListLoadBalancerPrefixesRequest, ListLoadBalancerPrefixesResponse,
     ListLoadBalancerTargetsRequest, ListLoadBalancerTargetsResponse, ListLoadBalancersRequest,
     ListLoadBalancersResponse, ListLocalNatsRequest, ListLocalNatsResponse,
     ListNeighborNatsRequest, ListNeighborNatsResponse, ListPrefixesRequest, ListPrefixesResponse,
-    ListRoutesRequest, ListRoutesResponse, ResetVniRequest, ResetVniResponse, Status as DpStatus,
+    ListRoutesRequest, ListRoutesResponse, Prefix, ProtocolFilter, ResetVniRequest,
+    ResetVniResponse, Status as DpStatus, TrafficDirection,
 };
 use crate::state::State;
 
@@ -63,6 +64,235 @@ fn decode_ipv6(bytes: &[u8]) -> Result<[u8; 16], Status> {
     bytes.try_into().map_err(|_| {
         Status::invalid_argument(format!("expected 16-byte IPv6, got {} bytes", bytes.len()))
     })
+}
+
+// ---------------------------------------------------------------------------
+// Firewall helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a prefix length (0-32) into a big-endian netmask.
+fn mask_from_len(len: u32) -> [u8; 4] {
+    let len = len.min(32);
+    let m: u32 = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    m.to_be_bytes()
+}
+
+/// Synthesise a unique rule id from the current wall-clock nanos.
+fn gen_rule_id() -> Vec<u8> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    format!("fw-{nanos}").into_bytes()
+}
+
+/// Decode a proto `FirewallRule` into the eBPF-level `FwRule`.
+fn decode_fw_rule(r: &FirewallRule) -> Result<xdp_dp_common::FwRule, Status> {
+    use pb::protocol_filter::Filter;
+    use xdp_dp_common::{FW_ACTION_ACCEPT, FW_ACTION_DROP, FW_DIR_EGRESS, FW_DIR_INGRESS};
+
+    let direction = if r.direction == TrafficDirection::Egress as i32 {
+        FW_DIR_EGRESS
+    } else {
+        FW_DIR_INGRESS
+    };
+    let action = if r.action == FirewallAction::Accept as i32 {
+        FW_ACTION_ACCEPT
+    } else {
+        FW_ACTION_DROP
+    };
+
+    let (src_ip, src_mask) = match &r.source_prefix {
+        Some(Prefix {
+            ip: Some(addr),
+            length,
+            ..
+        }) => (decode_ipv4(&addr.address)?, mask_from_len(*length)),
+        _ => ([0u8; 4], [0u8; 4]),
+    };
+    let (dst_ip, dst_mask) = match &r.destination_prefix {
+        Some(Prefix {
+            ip: Some(addr),
+            length,
+            ..
+        }) => (decode_ipv4(&addr.address)?, mask_from_len(*length)),
+        _ => ([0u8; 4], [0u8; 4]),
+    };
+
+    let (proto, src_port_min, src_port_max, dst_port_min, dst_port_max, icmp_type, icmp_code) =
+        match r.protocol_filter.as_ref().and_then(|pf| pf.filter.as_ref()) {
+            None => (0u8, 0u16, 65535u16, 0u16, 65535u16, 0xffffu16, 0xffffu16),
+            Some(Filter::Tcp(f)) => (
+                6u8,
+                if f.src_port_lower < 0 {
+                    0
+                } else {
+                    f.src_port_lower as u16
+                },
+                if f.src_port_upper < 0 {
+                    65535
+                } else {
+                    f.src_port_upper as u16
+                },
+                if f.dst_port_lower < 0 {
+                    0
+                } else {
+                    f.dst_port_lower as u16
+                },
+                if f.dst_port_upper < 0 {
+                    65535
+                } else {
+                    f.dst_port_upper as u16
+                },
+                0xffffu16,
+                0xffffu16,
+            ),
+            Some(Filter::Udp(f)) => (
+                17u8,
+                if f.src_port_lower < 0 {
+                    0
+                } else {
+                    f.src_port_lower as u16
+                },
+                if f.src_port_upper < 0 {
+                    65535
+                } else {
+                    f.src_port_upper as u16
+                },
+                if f.dst_port_lower < 0 {
+                    0
+                } else {
+                    f.dst_port_lower as u16
+                },
+                if f.dst_port_upper < 0 {
+                    65535
+                } else {
+                    f.dst_port_upper as u16
+                },
+                0xffffu16,
+                0xffffu16,
+            ),
+            Some(Filter::Icmp(f)) => (
+                1u8,
+                0u16,
+                65535u16,
+                0u16,
+                65535u16,
+                if f.icmp_type < 0 {
+                    0xffff
+                } else {
+                    f.icmp_type as u16
+                },
+                if f.icmp_code < 0 {
+                    0xffff
+                } else {
+                    f.icmp_code as u16
+                },
+            ),
+        };
+
+    Ok(xdp_dp_common::FwRule {
+        src_ip,
+        src_mask,
+        dst_ip,
+        dst_mask,
+        src_port_min,
+        src_port_max,
+        dst_port_min,
+        dst_port_max,
+        icmp_type,
+        icmp_code,
+        proto,
+        action,
+        direction,
+        enabled: 1,
+    })
+}
+
+/// Re-encode an eBPF `FwRule` back into a proto `FirewallRule`.
+fn encode_fw_rule(rule_id: Vec<u8>, r: xdp_dp_common::FwRule) -> FirewallRule {
+    use pb::protocol_filter::Filter;
+    use xdp_dp_common::{FW_ACTION_ACCEPT, FW_DIR_EGRESS};
+
+    let direction = if r.direction == FW_DIR_EGRESS {
+        TrafficDirection::Egress as i32
+    } else {
+        TrafficDirection::Ingress as i32
+    };
+    let action = if r.action == FW_ACTION_ACCEPT {
+        FirewallAction::Accept as i32
+    } else {
+        FirewallAction::Drop as i32
+    };
+
+    let source_prefix = if r.src_ip != [0u8; 4] || r.src_mask != [0u8; 4] {
+        Some(Prefix {
+            ip: Some(IpAddress {
+                ipver: IpVersion::Ipv4 as i32,
+                address: r.src_ip.to_vec(),
+            }),
+            length: u32::from_be_bytes(r.src_mask).count_ones(),
+            underlay_route: Vec::new(),
+        })
+    } else {
+        None
+    };
+    let destination_prefix = if r.dst_ip != [0u8; 4] || r.dst_mask != [0u8; 4] {
+        Some(Prefix {
+            ip: Some(IpAddress {
+                ipver: IpVersion::Ipv4 as i32,
+                address: r.dst_ip.to_vec(),
+            }),
+            length: u32::from_be_bytes(r.dst_mask).count_ones(),
+            underlay_route: Vec::new(),
+        })
+    } else {
+        None
+    };
+
+    let protocol_filter = match r.proto {
+        6 => Some(ProtocolFilter {
+            filter: Some(Filter::Tcp(pb::TcpFilter {
+                src_port_lower: r.src_port_min as i32,
+                src_port_upper: r.src_port_max as i32,
+                dst_port_lower: r.dst_port_min as i32,
+                dst_port_upper: r.dst_port_max as i32,
+            })),
+        }),
+        17 => Some(ProtocolFilter {
+            filter: Some(Filter::Udp(pb::UdpFilter {
+                src_port_lower: r.src_port_min as i32,
+                src_port_upper: r.src_port_max as i32,
+                dst_port_lower: r.dst_port_min as i32,
+                dst_port_upper: r.dst_port_max as i32,
+            })),
+        }),
+        1 => Some(ProtocolFilter {
+            filter: Some(Filter::Icmp(pb::IcmpFilter {
+                icmp_type: if r.icmp_type == 0xffff {
+                    -1
+                } else {
+                    r.icmp_type as i32
+                },
+                icmp_code: if r.icmp_code == 0xffff {
+                    -1
+                } else {
+                    r.icmp_code as i32
+                },
+            })),
+        }),
+        _ => None,
+    };
+
+    FirewallRule {
+        id: rule_id,
+        direction,
+        action,
+        priority: 1000,
+        source_prefix,
+        destination_prefix,
+        protocol_filter,
+    }
 }
 
 #[tonic::async_trait]
@@ -523,30 +753,82 @@ impl DpdKironcore for Service {
 
     async fn list_firewall_rules(
         &self,
-        _req: Request<ListFirewallRulesRequest>,
+        req: Request<ListFirewallRulesRequest>,
     ) -> Result<Response<ListFirewallRulesResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let pairs = control.list_fw_rules(&r.interface_id);
+        let rules = pairs
+            .into_iter()
+            .map(|(id, rule)| encode_fw_rule(id, rule))
+            .collect();
+        Ok(Response::new(ListFirewallRulesResponse {
+            status: ok(),
+            rules,
+        }))
     }
 
     async fn create_firewall_rule(
         &self,
-        _req: Request<CreateFirewallRuleRequest>,
+        req: Request<CreateFirewallRuleRequest>,
     ) -> Result<Response<CreateFirewallRuleResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let pbrule = r
+            .rule
+            .ok_or_else(|| Status::invalid_argument("rule is required"))?;
+        let rule_id = if pbrule.id.is_empty() {
+            gen_rule_id()
+        } else {
+            pbrule.id.clone()
+        };
+        let fw = decode_fw_rule(&pbrule)?;
+        control
+            .add_fw_rule(&r.interface_id, rule_id.clone(), fw)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CreateFirewallRuleResponse {
+            status: ok(),
+            rule_id,
+        }))
     }
 
     async fn get_firewall_rule(
         &self,
-        _req: Request<GetFirewallRuleRequest>,
+        req: Request<GetFirewallRuleRequest>,
     ) -> Result<Response<GetFirewallRuleResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let rule = control
+            .get_fw_rule(&r.interface_id, &r.rule_id)
+            .map(|fw| encode_fw_rule(r.rule_id, fw));
+        Ok(Response::new(GetFirewallRuleResponse {
+            status: ok(),
+            rule,
+        }))
     }
 
     async fn delete_firewall_rule(
         &self,
-        _req: Request<DeleteFirewallRuleRequest>,
+        req: Request<DeleteFirewallRuleRequest>,
     ) -> Result<Response<DeleteFirewallRuleResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        control
+            .del_fw_rule(&r.interface_id, &r.rule_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(DeleteFirewallRuleResponse { status: ok() }))
     }
 
     async fn capture_start(

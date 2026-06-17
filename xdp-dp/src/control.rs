@@ -4,12 +4,14 @@ use std::sync::Mutex;
 use anyhow::Context as _;
 use aya::Ebpf;
 use xdp_dp_common::{
-    IfaceKey, IfaceValue, LbKey, LbValue, Local, MaglevKey, NatKey, NatValue, PortMeta, RouteKey,
-    RouteValue, VipKey,
+    FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, LbKey, LbValue, Local, MaglevKey, NatKey,
+    NatValue, PortMeta, RouteKey, RouteValue, VipKey, FW_DIR_EGRESS, FW_MAX_RULES,
 };
 
 use crate::loader;
-use crate::maps::{Conntrack, Interfaces, Lb, LocalMap, Maglev, Nat, PortMetaMap, Routes, Vips};
+use crate::maps::{
+    Conntrack, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev, Nat, PortMetaMap, Routes, Vips,
+};
 
 /// Registered load balancer: its Maglev table id, the (port,proto) services it answers, and the
 /// ordered backend list (drives the Maglev table). Keyed in `Inner.lbs` by the LB's id.
@@ -38,11 +40,17 @@ struct Inner {
     lb: Lb,
     maglev: Maglev,
     nat: Nat,
+    fw_rules: FwRules,
+    fw_meta: FwMetaMap,
     /// loadbalancer_id -> its LB state.
     lbs: HashMap<Vec<u8>, LbEntry>,
     next_table_id: u32,
     /// interface_id -> (vni, guest_ipv4)
     by_id: HashMap<Vec<u8>, (u32, [u8; 4])>,
+    /// interface_id -> ifindex
+    by_ifindex: HashMap<Vec<u8>, u32>,
+    /// ifindex -> ordered (rule_id, rule) pairs
+    fw: HashMap<u32, Vec<(Vec<u8>, FwRule)>>,
 }
 
 impl Control {
@@ -70,6 +78,8 @@ impl Control {
         let lb = Lb::open(&mut ebpf)?;
         let maglev = Maglev::open(&mut ebpf)?;
         let nat = Nat::open(&mut ebpf)?;
+        let fw_rules = FwRules::open(&mut ebpf)?;
+        let fw_meta = FwMetaMap::open(&mut ebpf)?;
         let conntrack = Conntrack::open(&mut ebpf)?;
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -82,9 +92,13 @@ impl Control {
                 lb,
                 maglev,
                 nat,
+                fw_rules,
+                fw_meta,
                 lbs: HashMap::new(),
                 next_table_id: 1,
                 by_id: HashMap::new(),
+                by_ifindex: HashMap::new(),
+                fw: HashMap::new(),
             }),
             conntrack: Mutex::new(Some(conntrack)),
         })
@@ -109,6 +123,7 @@ impl Control {
         let mac = crate::mac_of(device)?;
         let mut g = self.inner.lock().unwrap();
         g.by_id.insert(interface_id.to_vec(), (vni, ipv4));
+        g.by_ifindex.insert(interface_id.to_vec(), tap);
         // Try attach-only first (program already loaded for a previous interface).
         // Fall back to full load+attach for the first guest interface.
         loader::attach_xdp_extra(&mut g.ebpf, "guest_tx", device)
@@ -327,5 +342,101 @@ impl Control {
             .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
         let _ = g.nat.remove(&NatKey { vni, ipv4: gip });
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Firewall rule management
+    // -----------------------------------------------------------------------
+
+    /// Reprogram all firewall slots for one interface from the in-memory `fw` vec.
+    fn fw_reprogram(g: &mut Inner, ifindex: u32) -> anyhow::Result<()> {
+        let rules = g.fw.get(&ifindex).cloned().unwrap_or_default();
+        // Clear all slots.
+        for idx in 0..FW_MAX_RULES {
+            let _ = g.fw_rules.remove(&FwRuleKey { ifindex, idx });
+        }
+        let mut ingress = 0u32;
+        let mut egress = 0u32;
+        for (i, (_id, r)) in rules.iter().enumerate() {
+            g.fw_rules.upsert(
+                FwRuleKey {
+                    ifindex,
+                    idx: i as u32,
+                },
+                *r,
+            )?;
+            if r.direction == FW_DIR_EGRESS {
+                egress += 1;
+            } else {
+                ingress += 1;
+            }
+        }
+        g.fw_meta.upsert(
+            ifindex,
+            FwMeta {
+                ingress_count: ingress,
+                egress_count: egress,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Add or replace a firewall rule on an interface.
+    pub fn add_fw_rule(
+        &self,
+        interface_id: &[u8],
+        rule_id: Vec<u8>,
+        rule: FwRule,
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let ifindex = *g
+            .by_ifindex
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        let entry = g.fw.entry(ifindex).or_default();
+        if entry.len() >= FW_MAX_RULES as usize {
+            anyhow::bail!(
+                "too many firewall rules for interface (max {})",
+                FW_MAX_RULES
+            );
+        }
+        if let Some(slot) = entry.iter_mut().find(|(id, _)| id == &rule_id) {
+            slot.1 = rule;
+        } else {
+            entry.push((rule_id, rule));
+        }
+        Self::fw_reprogram(&mut g, ifindex)
+    }
+
+    /// Remove a firewall rule by id from an interface.
+    pub fn del_fw_rule(&self, interface_id: &[u8], rule_id: &[u8]) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let ifindex = *g
+            .by_ifindex
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        if let Some(entry) = g.fw.get_mut(&ifindex) {
+            entry.retain(|(id, _)| id.as_slice() != rule_id);
+        }
+        Self::fw_reprogram(&mut g, ifindex)
+    }
+
+    /// Get a single firewall rule by id.
+    pub fn get_fw_rule(&self, interface_id: &[u8], rule_id: &[u8]) -> Option<FwRule> {
+        let g = self.inner.lock().unwrap();
+        let ifindex = *g.by_ifindex.get(interface_id)?;
+        g.fw.get(&ifindex)?
+            .iter()
+            .find(|(id, _)| id.as_slice() == rule_id)
+            .map(|(_, r)| *r)
+    }
+
+    /// List all firewall rules for an interface as (rule_id, rule) pairs.
+    pub fn list_fw_rules(&self, interface_id: &[u8]) -> Vec<(Vec<u8>, FwRule)> {
+        let g = self.inner.lock().unwrap();
+        match g.by_ifindex.get(interface_id) {
+            Some(ifindex) => g.fw.get(ifindex).cloned().unwrap_or_default(),
+            None => Vec::new(),
+        }
     }
 }
