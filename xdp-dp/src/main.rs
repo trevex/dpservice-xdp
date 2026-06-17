@@ -48,6 +48,13 @@ fn parse_ipv6(s: &str) -> anyhow::Result<[u8; 16]> {
         .octets())
 }
 
+/// Parse an IPv4 literal into 4 octets.
+fn parse_ipv4(s: &str) -> anyhow::Result<[u8; 4]> {
+    Ok(s.parse::<std::net::Ipv4Addr>()
+        .with_context(|| format!("bad IPv4 {s}"))?
+        .octets())
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -76,29 +83,23 @@ enum Cmd {
         #[arg(long)]
         iface: String,
     },
-    /// Attach both XDP programs and populate CONFIG[0], then idle until ctrl-c.
+    /// Bring up the map-driven datapath: attach programs and program all maps, then idle.
     Bringup {
-        /// Guest-facing interface name (guest_tx is attached here).
-        #[arg(long)]
-        guest: String,
-        /// Uplink-facing interface name (uplink_rx is attached here).
+        /// Uplink interface (uplink_rx attaches here).
         #[arg(long)]
         uplink: String,
-        /// Overlay VNI.
-        #[arg(long)]
-        vni: u32,
-        /// This hypervisor's underlay IPv6 address (outer src on encap).
+        /// This hypervisor's underlay IPv6 (outer src on encap).
         #[arg(long)]
         local_underlay: String,
-        /// Peer hypervisor's underlay IPv6 address (outer dst on encap).
+        /// Overlay gateway IPv4 the datapath answers ARP for (e.g. 10.0.0.1).
         #[arg(long)]
-        peer_underlay: String,
-        /// Peer uplink MAC address (outer eth dst on encap), e.g. 02:00:00:00:00:02.
-        #[arg(long)]
-        peer_mac: String,
-        /// Guest MAC address (inner eth dst on decap), e.g. 02:00:00:00:00:0a.
-        #[arg(long)]
-        guest_mac: String,
+        gateway: String,
+        /// Local guest, repeatable: "<ifname>=<overlay_ipv4>" (guest_tx attaches to <ifname>).
+        #[arg(long = "guest")]
+        guests: Vec<String>,
+        /// Remote guest route, repeatable: "<overlay_ipv4>=<nexthop_ipv6>=<nexthop_mac>".
+        #[arg(long = "remote")]
+        remotes: Vec<String>,
     },
 }
 
@@ -123,34 +124,86 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
         }
         Cmd::Bringup {
-            guest,
             uplink,
-            vni,
             local_underlay,
-            peer_underlay,
-            peer_mac,
-            guest_mac,
+            gateway,
+            guests,
+            remotes,
         } => {
             let mut ebpf = loader::load_ebpf()?;
-            loader::attach_xdp(&mut ebpf, "guest_tx", &guest)?;
+
+            // Pass 1: attach ALL XDP programs while ebpf is still fully intact
+            // (take_map consumes map entries, but programs are separate — still need &mut ebpf).
             loader::attach_xdp(&mut ebpf, "uplink_rx", &uplink)?;
-            let cfg = xdp_dp_common::Config {
-                vni,
+            for g in &guests {
+                let (ifname, _ip) = g.split_once('=').context("--guest must be ifname=ipv4")?;
+                loader::attach_xdp(&mut ebpf, "guest_tx", ifname)?;
+            }
+
+            // Pass 2: open map wrappers (each calls take_map, consuming the map slot).
+            let mut local_map = maps::LocalMap::open(&mut ebpf)?;
+            local_map.set(&xdp_dp_common::Local {
                 uplink_ifindex: ifindex(&uplink)?,
-                guest_ifindex: ifindex(&guest)?,
-                _pad: 0,
-                local_underlay_ipv6: parse_ipv6(&local_underlay)?,
-                peer_underlay_ipv6: parse_ipv6(&peer_underlay)?,
-                local_mac: mac_of(&uplink)?,
-                peer_mac: parse_mac(&peer_mac)?,
-                guest_mac: parse_mac(&guest_mac)?,
-                _pad2: [0; 2],
-            };
-            let mut config_map = maps::ConfigMap::open(&mut ebpf)?;
-            config_map.set(&cfg)?;
+                uplink_mac: mac_of(&uplink)?,
+                _pad: [0; 2],
+                underlay_ipv6: parse_ipv6(&local_underlay)?,
+            })?;
+
+            let gw = parse_ipv4(&gateway)?;
+            let mut ports = maps::PortMetaMap::open(&mut ebpf)?;
+            let mut ifaces = maps::Interfaces::open(&mut ebpf)?;
+            for g in &guests {
+                let (ifname, ip) = g.split_once('=').context("--guest must be ifname=ipv4")?;
+                let ip = parse_ipv4(ip)?;
+                let tap = ifindex(ifname)?;
+                let mac = mac_of(ifname)?;
+                ports.upsert(
+                    tap,
+                    xdp_dp_common::PortMeta {
+                        vni: 0,
+                        guest_ipv4: ip,
+                        gateway_ipv4: gw,
+                        guest_mac: mac,
+                        _pad: [0; 2],
+                    },
+                )?;
+                ifaces.upsert(
+                    xdp_dp_common::IfaceKey::new(0, ip),
+                    xdp_dp_common::IfaceValue {
+                        tap_ifindex: tap,
+                        is_local: 1,
+                        underlay_ipv6: parse_ipv6(&local_underlay)?,
+                        guest_mac: mac,
+                        _pad: [0; 2],
+                    },
+                )?;
+            }
+
+            let mut routes = maps::Routes::open(&mut ebpf)?;
+            for r in &remotes {
+                let mut it = r.split('=');
+                let ip = parse_ipv4(it.next().context("remote: missing overlay ipv4")?)?;
+                let nh = parse_ipv6(it.next().context("remote: missing nexthop ipv6")?)?;
+                let mac = parse_mac(it.next().context("remote: missing nexthop mac")?)?;
+                routes.upsert(
+                    xdp_dp_common::RouteKey {
+                        vni: 0,
+                        prefix_len: 32,
+                        ipv4: ip,
+                    },
+                    xdp_dp_common::RouteValue {
+                        nexthop_vni: 0,
+                        nexthop_ipv6: nh,
+                        nexthop_mac: mac,
+                        _pad: [0; 2],
+                    },
+                )?;
+            }
+
             println!(
-                "bringup: guest={guest}(if{}) uplink={uplink}(if{}) vni={vni}; CONFIG written; ctrl-c to stop",
-                cfg.guest_ifindex, cfg.uplink_ifindex
+                "bringup: uplink={uplink} guests={} routes={}; ctrl-c to stop",
+                guests.len(),
+                remotes.len()
             );
             tokio::signal::ctrl_c().await?;
         }
@@ -190,6 +243,16 @@ mod tests {
     #[test]
     fn parse_mac_rejects_too_long() {
         assert!(parse_mac("02:00:00:00:00:01:ff").is_err());
+    }
+
+    #[test]
+    fn parse_ipv4_basic() {
+        assert_eq!(parse_ipv4("10.0.0.5").unwrap(), [10, 0, 0, 5]);
+    }
+
+    #[test]
+    fn parse_ipv4_rejects_garbage() {
+        assert!(parse_ipv4("not-an-ip").is_err());
     }
 
     #[test]

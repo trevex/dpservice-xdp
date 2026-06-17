@@ -1,7 +1,7 @@
 use anyhow::Context;
 use aya::maps::{Array, HashMap, MapData};
 use aya::Ebpf;
-use xdp_dp_common::{Config, IfaceKey, IfaceValue, PortMeta, RouteKey, RouteValue};
+use xdp_dp_common::{Config, IfaceKey, IfaceValue, Local, PortMeta, RouteKey, RouteValue};
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
 // Exercised by the roundtrip test now; wired into the gRPC control plane in Task 12.
@@ -27,6 +27,24 @@ impl Interfaces {
 
     pub fn get(&self, key: &IfaceKey) -> Option<IfaceValue> {
         self.map.get(key, 0).ok()
+    }
+}
+
+/// Typed handle over the single-entry `LOCAL` Array map.
+#[allow(dead_code)]
+pub struct LocalMap {
+    map: Array<MapData, Local>,
+}
+
+#[allow(dead_code)]
+impl LocalMap {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = Array::try_from(ebpf.take_map("LOCAL").context("LOCAL map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn set(&mut self, local: &Local) -> anyhow::Result<()> {
+        self.map.set(0, local, 0).context("write LOCAL[0]")
     }
 }
 
