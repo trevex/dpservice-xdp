@@ -90,6 +90,9 @@ enum Cmd {
         /// Underlay next-hop MAC — outer eth dst for ALL encapped traffic.
         #[arg(long)]
         gateway_mac: String,
+        /// Override the CONNTRACK map capacity (entries). Also settable via XDP_DP_CONNTRACK_MAX.
+        #[arg(long)]
+        conntrack_max: Option<u32>,
     },
     /// Attach the trivial xdp_pass program to an interface (redirect-target enabler), then idle.
     Pass {
@@ -143,6 +146,9 @@ enum Cmd {
         /// Mark a remote route external (NAT-eligible egress), repeatable: "<overlay_ipv4>".
         #[arg(long = "external")]
         externals: Vec<String>,
+        /// Override the CONNTRACK map capacity (entries). Also settable via XDP_DP_CONNTRACK_MAX.
+        #[arg(long)]
+        conntrack_max: Option<u32>,
     },
 }
 
@@ -160,7 +166,12 @@ async fn main() -> anyhow::Result<()> {
             uplink,
             local_underlay,
             gateway_mac,
+            conntrack_max,
         } => {
+            if let Some(n) = conntrack_max {
+                // SAFETY: single-threaded CLI startup, before any datapath thread is spawned.
+                std::env::set_var("XDP_DP_CONNTRACK_MAX", n.to_string());
+            }
             let underlay = parse_ipv6(&local_underlay)?;
             let ctrl = control::Control::bring_up(
                 &uplink,
@@ -196,7 +207,12 @@ async fn main() -> anyhow::Result<()> {
             lb_targets,
             nats,
             externals,
+            conntrack_max,
         } => {
+            if let Some(n) = conntrack_max {
+                // SAFETY: single-threaded CLI startup, before any datapath thread is spawned.
+                std::env::set_var("XDP_DP_CONNTRACK_MAX", n.to_string());
+            }
             let mut ebpf = loader::load_ebpf()?;
 
             // Pass 1: attach ALL XDP programs while ebpf is still fully intact

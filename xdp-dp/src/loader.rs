@@ -3,12 +3,42 @@ use aya::programs::{Xdp, XdpFlags};
 use aya::Ebpf;
 
 /// Load the eBPF object that aya-build compiled to bpfel and placed in OUT_DIR.
+///
+/// BPF map sizes can be overridden at load time via environment variables, allowing operators to
+/// tune hot maps per node role without recompiling:
+///
+/// | Map        | Env var                  | Compile-time default |
+/// |------------|--------------------------|----------------------|
+/// | CONNTRACK  | XDP_DP_CONNTRACK_MAX     | 1_048_576            |
+/// | ROUTES     | XDP_DP_ROUTES_MAX        | 4_096                |
+/// | INTERFACES | XDP_DP_INTERFACES_MAX    | 1_024                |
+/// | MAGLEV     | XDP_DP_MAGLEV_MAX        | 65_536               |
+/// | NAT        | XDP_DP_NAT_MAX           | 1_024                |
+/// | LB         | XDP_DP_LB_MAX            | 1_024                |
+/// | PORT_META  | XDP_DP_PORT_META_MAX     | 1_024                |
+///
+/// Unset variables leave the compile-time `with_max_entries` default in place.
 pub fn load_ebpf() -> anyhow::Result<Ebpf> {
-    Ebpf::load(aya::include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/xdp-dp-prog"
-    )))
-    .context("load ebpf object")
+    let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/xdp-dp-prog"));
+    let mut loader = aya::EbpfLoader::new();
+    // Map name -> env var. Unset => keep the compile-time `with_max_entries` default.
+    for (map, var) in [
+        ("CONNTRACK", "XDP_DP_CONNTRACK_MAX"),
+        ("ROUTES", "XDP_DP_ROUTES_MAX"),
+        ("INTERFACES", "XDP_DP_INTERFACES_MAX"),
+        ("MAGLEV", "XDP_DP_MAGLEV_MAX"),
+        ("NAT", "XDP_DP_NAT_MAX"),
+        ("LB", "XDP_DP_LB_MAX"),
+        ("PORT_META", "XDP_DP_PORT_META_MAX"),
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            let n: u32 = v
+                .parse()
+                .with_context(|| format!("{var} must be a u32, got {v:?}"))?;
+            loader.set_max_entries(map, n);
+        }
+    }
+    loader.load(bytes).context("load ebpf object")
 }
 
 /// Load (verify) and attach a named XDP program to one interface. Call this for the first
