@@ -26,8 +26,8 @@ pub fn encap_and_redirect(
     }
     let p = data as *mut u8;
     unsafe {
-        // Outer Ethernet: dst = nexthop uplink MAC, src = our uplink MAC, ethertype IPv6.
-        write6(p, &route.nexthop_mac);
+        // Outer Ethernet: dst = underlay gateway MAC, src = our uplink MAC, ethertype IPv6.
+        write6(p, &local.gateway_mac);
         write6(p.add(6), &local.uplink_mac);
         core::ptr::write_unaligned(p.add(12) as *mut u16, ETH_P_IPV6.to_be());
         // Outer IPv6.

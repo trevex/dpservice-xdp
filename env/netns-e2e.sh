@@ -162,23 +162,27 @@ cmd_up() {
     echo "=== Bringing up XDP datapath ==="
 
     # hypa: two local guests (gA=10.0.0.5, gA2=10.0.0.7) + remote route to hypb guest (10.0.0.6)
+    # --gateway-mac = peer uplink MAC (flat-L2 lab: the bridge forwards to UB_MAC directly)
     sudo ip netns exec hypa "$BIN" bringup \
         --uplink uA \
         --local-underlay fd00::1 \
         --gateway 10.0.0.1 \
+        --gateway-mac "$UB_MAC" \
         --guest "gA-h=10.0.0.5=${GA_MAC}" \
         --guest "gA2-h=10.0.0.7=${GA2_MAC}" \
-        --remote "10.0.0.6=fd00::2=${UB_MAC}" &
+        --remote "10.0.0.6=fd00::2" &
     echo $! >> "$PIDFILE"
 
     # hypb: one local guest (gB=10.0.0.6) + remote routes to both hypa guests
+    # --gateway-mac = peer uplink MAC (flat-L2 lab: the bridge forwards to UA_MAC directly)
     sudo ip netns exec hypb "$BIN" bringup \
         --uplink uB \
         --local-underlay fd00::2 \
         --gateway 10.0.0.1 \
+        --gateway-mac "$UA_MAC" \
         --guest "gB-h=10.0.0.6=${GB_MAC}" \
-        --remote "10.0.0.5=fd00::1=${UA_MAC}" \
-        --remote "10.0.0.7=fd00::1=${UA_MAC}" &
+        --remote "10.0.0.5=fd00::1" \
+        --remote "10.0.0.7=fd00::1" &
     echo $! >> "$PIDFILE"
 
     sleep 2

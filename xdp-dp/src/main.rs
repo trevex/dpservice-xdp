@@ -94,12 +94,17 @@ enum Cmd {
         /// Overlay gateway IPv4 the datapath answers ARP for (e.g. 10.0.0.1).
         #[arg(long)]
         gateway: String,
+        /// Underlay next-hop (gateway/ToR router) MAC — outer eth dst for ALL encapped traffic.
+        /// In a flat-L2 lab this is the peer hypervisor's uplink MAC.
+        #[arg(long)]
+        gateway_mac: String,
         /// Local guest, repeatable: "<ifname>=<overlay_ipv4>=<guest_mac>" where <guest_mac> is
         /// the MAC of the guest interface inside the guest netns (inner eth dst on decap delivery).
         /// guest_tx attaches to <ifname> (the hypervisor-side veth peer).
         #[arg(long = "guest")]
         guests: Vec<String>,
-        /// Remote guest route, repeatable: "<overlay_ipv4>=<nexthop_ipv6>=<nexthop_mac>".
+        /// Remote guest route, repeatable: "<overlay_ipv4>=<nexthop_ipv6>". MAC-free — the outer
+        /// L2 next-hop is the single underlay gateway set via --gateway-mac, not per-route.
         #[arg(long = "remote")]
         remotes: Vec<String>,
     },
@@ -129,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
             uplink,
             local_underlay,
             gateway,
+            gateway_mac,
             guests,
             remotes,
         } => {
@@ -154,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
             local_map.set(&xdp_dp_common::Local {
                 uplink_ifindex: ifindex(&uplink)?,
                 uplink_mac: mac_of(&uplink)?,
-                _pad: [0; 2],
+                gateway_mac: parse_mac(&gateway_mac)?,
                 underlay_ipv6: parse_ipv6(&local_underlay)?,
             })?;
 
@@ -193,10 +199,9 @@ async fn main() -> anyhow::Result<()> {
 
             let mut routes = maps::Routes::open(&mut ebpf)?;
             for r in &remotes {
-                let mut it = r.split('=');
+                let mut it = r.splitn(2, '=');
                 let ip = parse_ipv4(it.next().context("remote: missing overlay ipv4")?)?;
                 let nh = parse_ipv6(it.next().context("remote: missing nexthop ipv6")?)?;
-                let mac = parse_mac(it.next().context("remote: missing nexthop mac")?)?;
                 routes.upsert(
                     xdp_dp_common::RouteKey {
                         vni: 0,
@@ -206,8 +211,6 @@ async fn main() -> anyhow::Result<()> {
                     xdp_dp_common::RouteValue {
                         nexthop_vni: 0,
                         nexthop_ipv6: nh,
-                        nexthop_mac: mac,
-                        _pad: [0; 2],
                     },
                 )?;
             }

@@ -49,24 +49,23 @@ pub struct RouteKey {
     pub ipv4: [u8; 4],
 }
 
-/// Value for the `routes` map: how to reach the overlay prefix's nexthop on the underlay.
+/// Value for the `routes` map: the underlay IPv6 nexthop (tunnel dst). MAC-free — the outer
+/// L2 next-hop is the single underlay gateway in `Local`, not per-route.
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct RouteValue {
     pub nexthop_vni: u32,
     pub nexthop_ipv6: [u8; 16],
-    /// Underlay MAC of the nexthop hypervisor's uplink (outer eth dst on encap).
-    pub nexthop_mac: [u8; 6],
-    pub _pad: [u8; 2],
 }
 
-/// This hypervisor's uplink, written once by the control plane into `LOCAL[0]`.
+/// This hypervisor's uplink + underlay gateway, written once into LOCAL[0] by the control plane.
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct Local {
     pub uplink_ifindex: u32,
     pub uplink_mac: [u8; 6],
-    pub _pad: [u8; 2],
+    /// Underlay next-hop (gateway/ToR router) MAC — outer eth dst for ALL encapped traffic.
+    pub gateway_mac: [u8; 6],
     pub underlay_ipv6: [u8; 16],
 }
 
@@ -124,11 +123,11 @@ mod tests {
     #[test]
     fn route_types_have_stable_layout() {
         // 4 (vni) + 4 (prefix_len) + 4 (ipv4) = 12.
-        // 4 (nexthop_vni) + 16 (ipv6) + 6 (mac) + 2 (pad) = 28.
+        // 4 (nexthop_vni) + 16 (ipv6) = 20.
         assert_eq!(core::mem::size_of::<RouteKey>(), 12);
-        assert_eq!(core::mem::size_of::<RouteValue>(), 28);
-        // 4 (uplink_ifindex) + 6 (uplink_mac) + 2 (pad) + 16 (underlay_ipv6) = 28.
-        assert_eq!(core::mem::size_of::<Local>(), 28);
+        assert_eq!(core::mem::size_of::<RouteValue>(), 20);
+        // 4 (uplink_ifindex) + 6 (uplink_mac) + 6 (gateway_mac) + 16 (underlay_ipv6) = 32.
+        assert_eq!(core::mem::size_of::<Local>(), 32);
     }
 
     #[test]
