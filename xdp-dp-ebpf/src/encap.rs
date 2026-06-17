@@ -13,6 +13,7 @@ use crate::parse::{write16, write6, ETH_LEN, ETH_P_IPV6, IPPROTO_IPIP, IPV6_LEN}
 pub fn encap_and_redirect(
     ctx: &XdpContext,
     local: &Local,
+    src_underlay: &[u8; 16],
     route: &RouteValue,
     inner_len: u16,
 ) -> Result<u32, ()> {
@@ -39,7 +40,7 @@ pub fn encap_and_redirect(
         core::ptr::write_unaligned(ip.add(4) as *mut u16, inner_len.to_be());
         *ip.add(6) = IPPROTO_IPIP;
         *ip.add(7) = 64;
-        write16(ip.add(8), &local.underlay_ipv6);
+        write16(ip.add(8), src_underlay);
         write16(ip.add(24), &route.nexthop_ipv6);
     }
     Ok(unsafe { bpf_redirect(local.uplink_ifindex, 0) } as u32)

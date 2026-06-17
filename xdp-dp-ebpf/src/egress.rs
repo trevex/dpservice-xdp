@@ -74,5 +74,5 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     }
     let inner_len = (data_end - data - ETH_LEN) as u16;
     let local = LOCAL.get(0).ok_or(())?;
-    encap_and_redirect(ctx, local, route, inner_len)
+    encap_and_redirect(ctx, local, &meta.underlay_ipv6, route, inner_len)
 }
