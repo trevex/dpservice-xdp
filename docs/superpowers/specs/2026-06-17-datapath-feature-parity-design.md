@@ -121,6 +121,13 @@ Per-milestone acceptance gates:
 Plus userspace unit tests: Maglev table correctness/even distribution, NAT port allocation,
 and proto→map translation. eBPF programs continue to be gated by a verifier-load test.
 
+**Tap-based test mode (cross-cutting).** Beyond the netns+veth lab, add a **tap-based guest
+mode** to the harness so the datapath is exercised on real tap devices
+(`IFF_TAP|IFF_VNET_HDR`), matching the production VM environment (vnet_hdr stripping, native XDP
+attach, redirect-into-tap delivery — proven in the XDP-on-tap spike). Introduce this as an early
+enabling task in the first feature plan (VIP/M2) so VIP/LB/NAT are all validated on taps, not
+only veth. (Shared with sub-project 2, which uses the same tap harness.)
+
 ## 8. Milestones
 
 1. **M1 — Generalize datapath**: map-driven multi-interface pipeline; in-datapath ARP/ND

@@ -65,13 +65,21 @@ our existing datapath offsets work unchanged on real VM taps.
   - node `setup-network.sh`: adapt the uplink/underlay wiring to the XDP model (drop the
     `ip6tnl` path; point `uplink_rx` at the inter-node device; set the gateway MAC).
 
-## 4. New feature: in-datapath DHCPv4 responder
+## 4. New feature: in-datapath DHCP (v4 + v6) and IPv6 ND responders
 
-ironcore VMs obtain their IP/gateway/MTU/DNS via **DHCP served by the dataplane** (dpservice's
-`--dhcp-*`; confirmed by the CirrOS spike VM emitting `DHCPDISCOVER`). So `xdp-dp` must answer
-DHCPv4 in XDP on the guest tap: respond to `DISCOVER`/`REQUEST` with the interface's configured
-IPv4, gateway (`=<subnet>.1`, the address the ARP responder already owns), MTU (1450), and DNS.
-This is a new datapath module (`dhcp`). DHCPv6 + IPv6 ND are deferred (§8).
+ironcore VMs obtain their addressing via **DHCP/ND served by the dataplane** (dpservice's
+`--dhcp-*`/`--dhcpv6-*` and `--enable-ipv6-overlay`; confirmed by the CirrOS spike VM emitting
+`DHCPDISCOVER`). `xdp-dp` answers these in XDP on the guest tap:
+- **DHCPv4** — respond to `DISCOVER`/`REQUEST` with the interface's IPv4, gateway (`=<subnet>.1`,
+  owned by the ARP responder), MTU (1450), DNS.
+- **DHCPv6** — respond to `SOLICIT`/`REQUEST` with the interface's IPv6 + DNS.
+- **IPv6 ND** — answer Neighbor Solicitations for the gateway with the gateway MAC (the IPv6
+  analogue of the M1 ARP responder; this completes the M1 "Task 4b" ND deferral).
+
+These imply **IPv6-overlay support** in the datapath: the pipeline must carry inner IPv6 packets
+alongside IPv4 (parse/encap/decap/route IPv6 inner). New eBPF modules: `dhcp` (v4+v6) and `nd`
+(extending `arp_nd`); the maps/pipeline gain inner-IPv6 handling. Phasing within the drop-in:
+DHCPv4 + ARP (IPv4 overlay) first, then DHCPv6 + ND (IPv6 overlay).
 
 ## 5. Components & isolation
 
@@ -88,27 +96,37 @@ This is a new datapath module (`dhcp`). DHCPv6 + IPv6 ND are deferred (§8).
 1. **Packaging + dynamic taps (standalone):** container image; `CreateInterface` auto-creates a
    tap + attaches XDP + programs maps + returns the name; `DeleteInterface` cleans up. Validated
    with `grpcurl`/`dpservice-cli` + a netns-style harness (no full ioiab yet).
-2. **DHCPv4 responder + VM boot:** add the XDP DHCPv4 responder; boot a real libvirt/QEMU VM on
-   an auto-created tap; confirm it DHCPs its IP and reaches its gateway (datapath ARP).
-3. **Two-node underlay overlay:** uplink attach + gateway-MAC + metalbond-driven `ROUTES`;
-   VM-to-VM across two nodes/hosts with `proto 4` IP-in-IPv6 on the underlay.
-4. **Full ironcore-in-a-box fork:** replace the dpservice DaemonSet with `xdp-dp`; patch
+2. **DHCPv4 + ARP + VM boot (IPv4 overlay):** add the XDP DHCPv4 responder; boot a real
+   libvirt/QEMU VM on an auto-created tap; confirm it DHCPs its IPv4 and reaches its gateway via
+   the datapath ARP responder.
+3. **DHCPv6 + ND + inner-IPv6 overlay:** add the DHCPv6 + IPv6 ND responders and inner-IPv6
+   handling in the pipeline; a VM autoconfigures IPv6 and reaches its IPv6 gateway.
+4. **Two-node underlay overlay:** uplink attach + gateway-MAC + metalbond-driven `ROUTES`;
+   VM-to-VM (IPv4 and IPv6) across two nodes/hosts with `proto 4`/IP-in-IPv6 on the underlay.
+5. **Full ironcore-in-a-box fork:** replace the dpservice DaemonSet with `xdp-dp`; patch
    metalnet (pool→dynamic), libvirt attach, and node `setup-network.sh`; `make up`, spin a
    `Machine`, demonstrate VM-to-VM.
 
-## 7. Testing
+## 7. Testing — including a tap-based harness
+
+A first-class goal of this sub-project is to **test on real taps**, not only veth. Extend the
+test suite with a **tap-based lab mode**: each "guest" is a tap device (created as `xdp-dp` does
+in production, `IFF_TAP|IFF_VNET_HDR`) with either (a) a lightweight userspace endpoint that
+emits/consumes frames, or (b) a tiny real QEMU VM (as in the XDP-on-tap spike) for full-fidelity
+DHCP/ND/boot tests. This validates tap-specific behavior (vnet_hdr stripping, native XDP attach,
+redirect-into-tap delivery) that veth does not exercise. The `xdp_inspect` tool aids debugging.
 
 Per milestone: `grpcurl`/`dpservice-cli` conformance + tap-created/XDP-attached assertions (M1);
-a VM DHCPs an IP and pings its gateway (M2); cross-node VM-to-VM + `tcpdump` `proto 4` underlay
-(M3); full ioiab `make up` + a `Machine` reachable end-to-end (M4). Reuse the netns-lab style
-before standing up the full kind stack where possible.
+a real VM DHCPs (v4 then v6) and pings its gateway over a tap (M2/M3); cross-node VM-to-VM +
+`tcpdump` underlay encap (M4); full ioiab `make up` + a `Machine` reachable end-to-end (M5).
+Reuse the netns-lab style for fast checks; use the tap/VM harness for fidelity.
 
 ## 8. Out of scope
 
-VIP/LB/NAT-GW (sub-project 1); DHCPv6 + IPv6 ND (deferred — IPv4 DHCP first); multi-tenant VNI
-encoding (M1 single-tenant `vni=0` carries over until a feature needs it); performance/HA tuning;
-SmartNIC hardware offload (the offload-ready software path is preserved). Upstreaming the
-metalnet/libvirt patches (we work in a fork).
+VIP/LB/NAT-GW (sub-project 1); multi-tenant VNI encoding (M1 single-tenant `vni=0` carries over
+until a feature needs it); performance/HA tuning; SmartNIC hardware offload (the offload-ready
+software path is preserved); upstreaming the metalnet/libvirt patches (we work in a fork).
+(DHCPv4/v6 + IPv6 ND + inner-IPv6 overlay are now IN scope — see §4/§6.)
 
 ## 9. Build-order note (decided at plan time)
 
