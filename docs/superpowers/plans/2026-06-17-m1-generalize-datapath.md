@@ -311,9 +311,22 @@ git add xdp-dp-ebpf
 git commit -m "feat(ebpf): in-datapath ARP responder for the overlay gateway"
 ```
 
-## Task 5: Map-driven encap (`encap.rs`) using `bpf_fib_lookup`
+## Task 5: Map-driven encap (`encap.rs`) — control-plane-resolved underlay L2
+
+> **SUPERSEDED APPROACH (do this instead of the `bpf_fib_lookup` sketch below):** the aya-ebpf
+> `bpf_fib_lookup` binding uses fiddly `__bindgen_anon_*` unions and is verifier-risky. Instead,
+> resolve the outer L2 from the control plane (which already knows the underlay topology):
+> extend `RouteValue` with `nexthop_mac: [u8;6]` (the peer uplink MAC) and add a 1-entry `LOCAL`
+> `Array<Local>` map holding this hypervisor's `{uplink_ifindex, uplink_mac, underlay_ipv6}`.
+> `encap_and_redirect(ctx, local, route, inner_len)` then writes outer eth dst=`route.nexthop_mac`,
+> src=`local.uplink_mac`, outer IPv6 src=`local.underlay_ipv6` dst=`route.nexthop_ipv6`, and
+> `bpf_redirect(local.uplink_ifindex)`. This reuses the proven CONFIG-era encap (verifier-trivial)
+> and is closer to dpservice (underlay routing comes from the control plane, not the kernel FIB).
+> The `fib_lookup` code below is kept for reference only — do NOT implement it.
 
 **Files:**
+- Modify: `xdp-dp-common/src/lib.rs` (extend `RouteValue`; add `Local`)
+- Modify: `xdp-dp-ebpf/src/maps.rs` (add `LOCAL`)
 - Create: `xdp-dp-ebpf/src/encap.rs`
 - Modify: `xdp-dp-ebpf/src/main.rs`
 
