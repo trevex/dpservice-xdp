@@ -69,6 +69,8 @@
             pkgs.iproute2
             pkgs.bridge-utils
             pkgs.kubectl
+            pkgs.socat
+            pkgs.python3  # serial-console driver for env/tap-vm-smoke.sh
           ];
 
           packages = [
