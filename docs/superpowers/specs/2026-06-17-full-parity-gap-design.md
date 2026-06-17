@@ -128,11 +128,18 @@ Two distinct sub-features:
 Both in scope (no deferral). NAT64 needs IPv6 overlay support (§4.10) to be fully exercisable but
 the translation logic is independent. **Milestone M10.**
 
-### 4.6 Virtual services (`virtsvc`)
+### 4.6 Virtual services (`virtsvc`) — DROPPED FROM SCOPE (2026-06-17)
 dpservice `virtsvc_node` + `dp_virtsvc.h`: a guest reaching a **virtual address:port** is DNAT'd
-to a real backend service reached over the underlay (used for platform services — metadata, DNS,
-etc.), with its own per-connection port mapping (and it participates in HA sync, §4.8). Add a
-`VIRTSVC` config map + connection conntrack. **Milestone M11.**
+to a real backend service reached over the underlay (platform services — metadata, DNS), with
+per-connection port mapping and full IPv4↔IPv6 packet translation.
+
+**Decision — out of scope.** Two findings remove virtsvc from the parity goal: (1) it is **not in
+the `DPDKironcore` gRPC contract** (grep of the vendored proto returns zero virtual-service RPCs —
+dpservice configures it via `--virtual-service` startup args, not metalnet); and (2) the **drop-in
+target, ironcore-in-a-box, does not configure it** (`base/dpservice/dpservice-tap.yaml` has no
+`--virtual-service` arg). Implementing the heaviest datapath transform (v4↔v6 rebuild + connection
+PAT) for a feature the drop-in never uses is not justified. ~~Milestone M11~~ is **removed**; if a
+deployment ever needs platform-service virtsvc it can be added later as a static-config feature.
 
 ### 4.7 Packet relay + rate metering
 - `packet_relay_node`: relays ICMP errors / certain NAT-associated packets that can't be handled
@@ -192,21 +199,18 @@ enforced as a design review criterion on every milestone.
 ## 5. Proposed milestone sequence & dependencies
 
 ```
-M5  Unified conntrack (TCP state + last_seen + userspace GC aging)   [keystone]
-        |-> M6  Firewall (stateful, conntrack-cached, enforcement-gated)
-        |-> M9  Remote LB backends (re-encap)         (refactor LB onto unified CT)
-        |-> M10 NAT64 + NeighborNat                   (refactor NAT onto unified CT)
-        |-> M13 HA flow-state (pinned maps + adopt-on-restart)
-M7  Multi-VNI tenancy            (independent; touches all RPCs + lab)
-M8  LPM routing + alias prefixes (independent)
-M11 Virtual services             (depends on M5)
-M12 Packet relay + rate metering (depends on M5 for relay; metering independent)
-M14 Packet capture               (independent)
-M15 IPv6 overlay tenants         (pairs with M10/NAT64)
+M5  Unified conntrack ✅   M6 Firewall ✅   M7 Multi-VNI ✅   M8 LPM routing ✅
+M9  Remote LB backends ✅   M10 NeighborNat ✅ (NAT64 moved to M15)
+M11 Virtual services  — DROPPED (not in gRPC contract; not used by ioiab; see §4.6)
+M12 Packet relay + rate metering   (metering independent; relay depends on M5)
+M13 HA flow-state (pinned maps + adopt-on-restart)
+M14 Packet capture                 (independent)
+M15 IPv6 overlay tenants + NAT64   (ioiab runs --enable-ipv6-overlay → required for the drop-in)
 ```
 
-Order: **M5 → M6 → M7 → M8** (the high-value parity core: conntrack, firewall, tenancy, routing),
-then **M9/M10/M11** (advanced NAT/LB/virtsvc), then **M12/M13/M14/M15**.
+Remaining order (post-M10): **M13 (HA) → M12 (rate metering) → M14 (capture) → M15 (IPv6 + NAT64)**.
+M15 is elevated: ironcore-in-a-box runs `--enable-ipv6-overlay`, so dual-stack tenants are required
+for the drop-in (and unblock NAT64). M11 (virtsvc) is removed (§4.6).
 
 Relationship to **sub-project 2 (ioiab drop-in)**: **decision — complete full parity (M5–M15)
 before ioiab.** ioiab needs **ND + DHCPv4/v6 + dynamic taps** (its own spec) and does not depend on
