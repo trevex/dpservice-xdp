@@ -52,7 +52,7 @@ cmd_up() {
     sudo ip link set br-ul type bridge mcast_snooping 0
 
     # ---- namespaces ----
-    for ns in hypa hypb guesta guestb guesta2 extsrv; do
+    for ns in hypa hypb guesta guestb guesta2 extsrv guestc guestd; do
         sudo ip netns add "$ns" 2>/dev/null || true
         sudo ip netns exec "$ns" ip link set lo up
     done
@@ -116,6 +116,25 @@ cmd_up() {
     sudo ip netns exec extsrv ip route add 10.0.0.1/32 dev gE 2>/dev/null || true
     sudo ip netns exec extsrv ip route add default via 10.0.0.1 2>/dev/null || true
 
+    # ---- second tenant (vni=100), OVERLAPPING IP 10.0.0.5 ----
+    # guestc on hypa (gC-h<->gC) and guestd on hypb (gD-h<->gD), both 10.0.0.5 in vni=100.
+    if ! sudo ip netns exec hypa ip link show gC-h &>/dev/null; then
+        sudo ip link add gC-h netns hypa type veth peer name gC netns guestc
+    fi
+    sudo ip netns exec hypa ip link set gC-h up
+    sudo ip netns exec guestc ip link set gC up
+    sudo ip netns exec guestc ip addr add 10.0.0.5/32 dev gC 2>/dev/null || true
+    sudo ip netns exec guestc ip route add 10.0.0.1/32 dev gC 2>/dev/null || true
+    sudo ip netns exec guestc ip route add default via 10.0.0.1 2>/dev/null || true
+    if ! sudo ip netns exec hypb ip link show gD-h &>/dev/null; then
+        sudo ip link add gD-h netns hypb type veth peer name gD netns guestd
+    fi
+    sudo ip netns exec hypb ip link set gD-h up
+    sudo ip netns exec guestd ip link set gD up
+    sudo ip netns exec guestd ip addr add 10.0.0.6/32 dev gD 2>/dev/null || true
+    sudo ip netns exec guestd ip route add 10.0.0.1/32 dev gD 2>/dev/null || true
+    sudo ip netns exec guestd ip route add default via 10.0.0.1 2>/dev/null || true
+
     # ---- ip6tables: allow bridge forwarding on br-ul ----
     # Docker sets ip6tables FORWARD policy to DROP with bridge-nf-call-ip6tables=1.
     # We add scoped ACCEPT rules for br-ul instead of touching any global sysctl.
@@ -140,8 +159,11 @@ cmd_up() {
     GB_MAC=$(sudo ip netns exec guestb cat /sys/class/net/gB/address)
     GA2_MAC=$(sudo ip netns exec guesta2 cat /sys/class/net/gA2/address)
     GE_MAC=$(sudo ip netns exec extsrv cat /sys/class/net/gE/address)
+    GC_MAC=$(sudo ip netns exec guestc cat /sys/class/net/gC/address)
+    GD_MAC=$(sudo ip netns exec guestd cat /sys/class/net/gD/address)
     echo "UA_MAC=$UA_MAC  UB_MAC=$UB_MAC"
     echo "GA_MAC=$GA_MAC  GB_MAC=$GB_MAC  GA2_MAC=$GA2_MAC  GE_MAC=$GE_MAC"
+    echo "GC_MAC=$GC_MAC  GD_MAC=$GD_MAC  (vni=100 tenant, overlapping 10.0.0.5)"
 
     # NOTE: No static guest neigh entries — the XDP datapath answers ARP for 10.0.0.1 in-kernel.
     # Guests use /32 + link route + default via 10.0.0.1, so they only ARP for the gateway.
@@ -168,6 +190,10 @@ cmd_up() {
     echo $! >> "$PIDFILE"
     sudo ip netns exec extsrv "$BIN" pass --iface gE &
     echo $! >> "$PIDFILE"
+    sudo ip netns exec guestc "$BIN" pass --iface gC &
+    echo $! >> "$PIDFILE"
+    sudo ip netns exec guestd "$BIN" pass --iface gD &
+    echo $! >> "$PIDFILE"
 
     sleep 1
 
@@ -181,16 +207,18 @@ cmd_up() {
         --local-underlay fd00::1 \
         --gateway 10.0.0.1 \
         --gateway-mac "$UB_MAC" \
-        --guest "gA-h=10.0.0.5=${GA_MAC}" \
-        --guest "gA2-h=10.0.0.7=${GA2_MAC}" \
-        --remote "10.0.0.6=fd00::2" \
+        --guest "gA-h=10.0.0.5=${GA_MAC}=fd00:a::5=0" \
+        --guest "gA2-h=10.0.0.7=${GA2_MAC}=fd00:a::7=0" \
+        --guest "gC-h=10.0.0.5=${GC_MAC}=fd00:a::205=100" \
+        --remote "10.0.0.6=fd00:b::6=0" \
         --vip "10.0.0.7=10.0.0.100" \
         --lb "10.0.0.200:0:1" \
         --lb-target "10.0.0.200:0:1=10.0.0.5" \
         --lb-target "10.0.0.200:0:1=10.0.0.7" \
-        --remote "10.0.0.8=fd00::2" \
+        --remote "10.0.0.8=fd00:b::8=0" \
         --external "10.0.0.8" \
-        --nat "10.0.0.5=10.0.0.50:20000:30000" &
+        --nat "10.0.0.5=10.0.0.50:20000:30000" \
+        --remote "10.0.0.6=fd00:b::206=100" &
     echo $! >> "$PIDFILE"
 
     # hypb: one local guest (gB=10.0.0.6) + remote routes to both hypa guests
@@ -200,13 +228,15 @@ cmd_up() {
         --local-underlay fd00::2 \
         --gateway 10.0.0.1 \
         --gateway-mac "$UA_MAC" \
-        --guest "gB-h=10.0.0.6=${GB_MAC}" \
-        --guest "gE-h=10.0.0.8=${GE_MAC}" \
-        --remote "10.0.0.5=fd00::1" \
-        --remote "10.0.0.7=fd00::1" \
-        --remote "10.0.0.100=fd00::1" \
-        --remote "10.0.0.200=fd00::1" \
-        --remote "10.0.0.50=fd00::1" \
+        --guest "gB-h=10.0.0.6=${GB_MAC}=fd00:b::6=0" \
+        --guest "gE-h=10.0.0.8=${GE_MAC}=fd00:b::8=0" \
+        --guest "gD-h=10.0.0.6=${GD_MAC}=fd00:b::206=100" \
+        --remote "10.0.0.5=fd00:a::5=0" \
+        --remote "10.0.0.7=fd00:a::7=0" \
+        --remote "10.0.0.100=fd00:a::7=0" \
+        --remote "10.0.0.200=fd00:a::5=0" \
+        --remote "10.0.0.50=fd00:a::5=0" \
+        --remote "10.0.0.5=fd00:a::205=100" \
         --firewall-enforce true \
         --fw-rule "gB-h:in:accept:icmp:10.0.0.5/32:0.0.0.0/0:*" \
         --fw-rule "gB-h:in:drop:icmp:10.0.0.7/32:0.0.0.0/0:*" &
@@ -386,6 +416,35 @@ cmd_test() {
     fi
     echo ""
 
+    echo "=== Test 10: multi-VNI isolation — vni=100 tenant with IPs overlapping vni=0 ==="
+    # guestc (vni=100, 10.0.0.5 on hypa) -> guestd (vni=100, 10.0.0.6 on hypb): same-tenant, reaches.
+    # Both IPs overlap vni=0 (guesta=10.0.0.5, guestb=10.0.0.6) but the per-interface underlay +
+    # vni-keyed maps keep the tenants separate.
+    if sudo ip netns exec guestc ping -c 2 -W 2 10.0.0.6 >/dev/null 2>&1; then
+        echo "  vni=100 intra-tenant OK: guestc(10.0.0.5) -> guestd(10.0.0.6) reaches"
+    else
+        echo "  WARNING: vni=100 guestc could not reach guestd"
+    fi
+    # Isolation: guestc's vni=100 traffic to 10.0.0.6 must reach guestd (vni=100), NOT guestb
+    # (vni=0, also 10.0.0.6). Capture on guestb's tap while guestc pings; guestb must see nothing.
+    if [[ -n "$TCPDUMP" ]]; then
+        sudo ip netns exec guestb "$TCPDUMP" -ni gB 'icmp' -c 3 >/tmp/iso.txt 2>&1 &
+        TDI=$!
+        sleep 0.3
+        sudo ip netns exec guestc ping -c 3 -W 2 10.0.0.6 >/dev/null 2>&1 || true
+        sleep 0.5
+        sudo kill "$TDI" 2>/dev/null || true
+        wait "$TDI" 2>/dev/null || true
+        if grep -q 'ICMP' /tmp/iso.txt; then
+            echo "  WARNING: vni=100 traffic leaked onto the vni=0 guestb interface"
+            cat /tmp/iso.txt
+        else
+            echo "  ISOLATION OK: vni=100 traffic never reached the vni=0 guestb (overlapping 10.0.0.6)"
+        fi
+        rm -f /tmp/iso.txt
+    fi
+    echo ""
+
     echo "=== All tests passed ==="
 }
 
@@ -415,7 +474,7 @@ cmd_down() {
     sudo ip6tables -D FORWARD -i uB-br -j ACCEPT -m comment --comment "$IP6TABLES_MARK" 2>/dev/null || true
 
     # Delete namespaces (also removes veth pairs whose netns-end lives inside them)
-    for ns in hypa hypb guesta guestb guesta2 extsrv; do
+    for ns in hypa hypb guesta guestb guesta2 extsrv guestc guestd; do
         sudo ip netns del "$ns" 2>/dev/null || true
     done
 
