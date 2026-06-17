@@ -62,20 +62,24 @@ pub fn l4_ports(data: usize, data_end: usize, ip_off: usize) -> Option<(u8, u16,
 }
 
 /// Stable 5-tuple hash (FNV-1a-ish) for Maglev slot selection.
+/// Loops are fully unrolled to satisfy the BPF verifier (no iterator-based loops).
 #[inline(always)]
 pub fn hash5(src: &[u8; 4], dst: &[u8; 4], sport: u16, dport: u16, proto: u8) -> u32 {
     let mut h: u32 = 2166136261;
-    for b in src.iter().chain(dst.iter()) {
-        h = (h ^ *b as u32).wrapping_mul(16777619);
-    }
-    for b in [
-        sport as u8,
-        (sport >> 8) as u8,
-        dport as u8,
-        (dport >> 8) as u8,
-        proto,
-    ] {
-        h = (h ^ b as u32).wrapping_mul(16777619);
-    }
+    // Unroll src[0..4] and dst[0..4] explicitly — iterator-based loops over slices
+    // confuse the BPF verifier into thinking the loop may be unbounded.
+    h = (h ^ src[0] as u32).wrapping_mul(16777619);
+    h = (h ^ src[1] as u32).wrapping_mul(16777619);
+    h = (h ^ src[2] as u32).wrapping_mul(16777619);
+    h = (h ^ src[3] as u32).wrapping_mul(16777619);
+    h = (h ^ dst[0] as u32).wrapping_mul(16777619);
+    h = (h ^ dst[1] as u32).wrapping_mul(16777619);
+    h = (h ^ dst[2] as u32).wrapping_mul(16777619);
+    h = (h ^ dst[3] as u32).wrapping_mul(16777619);
+    h = (h ^ sport as u8 as u32).wrapping_mul(16777619);
+    h = (h ^ (sport >> 8) as u8 as u32).wrapping_mul(16777619);
+    h = (h ^ dport as u8 as u32).wrapping_mul(16777619);
+    h = (h ^ (dport >> 8) as u8 as u32).wrapping_mul(16777619);
+    h = (h ^ proto as u32).wrapping_mul(16777619);
     h
 }

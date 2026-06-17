@@ -7,6 +7,7 @@ mod egress;
 mod encap;
 mod ingress;
 mod inspect;
+mod lb;
 mod maps;
 mod parse;
 mod vip;

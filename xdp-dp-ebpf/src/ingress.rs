@@ -37,10 +37,14 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
         Some(g) => *g,
         None => inner_dst,
     };
+    // LB takes precedence: if the inner dst+port is a balanced service, Maglev-select a backend,
+    // DNAT in place (pre-adjust_head the inner IPv4 is at ETH_LEN + IPV6_LEN), and deliver there.
+    let lb_backend = crate::lb::lb_select_dnat(ctx, ETH_LEN + IPV6_LEN, 0);
+    let deliver_ip = lb_backend.unwrap_or(target);
     let iface = unsafe {
         INTERFACES.get(&IfaceKey {
             vni: 0,
-            ipv4: target,
+            ipv4: deliver_ip,
         })
     }
     .ok_or(())?;
@@ -65,7 +69,9 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
         write6(q.add(6), &GW_MAC);
         core::ptr::write_unaligned(q.add(12) as *mut u16, ETH_P_IP.to_be());
     }
-    // DNAT: rewrite inner IPv4 dest if inner_dst was a VIP (V->G).
-    crate::vip::dnat_ingress(ctx, ETH_LEN, 0);
+    // DNAT: rewrite inner IPv4 dest if inner_dst was a VIP (V->G). Skip for LB packets (already DNAT'd).
+    if lb_backend.is_none() {
+        crate::vip::dnat_ingress(ctx, ETH_LEN, 0);
+    }
     Ok(unsafe { bpf_redirect(tap_ifindex, 0) } as u32)
 }
