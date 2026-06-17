@@ -113,6 +113,52 @@ pub struct VipKey {
     pub ipv4: [u8; 4],
 }
 
+/// LB service key: (vni, balanced IPv4, L4 port, proto). proto: 6=TCP, 17=UDP, 1=ICMP.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct LbKey {
+    pub vni: u32,
+    pub ipv4: [u8; 4],
+    pub port: u16,
+    pub proto: u8,
+    pub _pad: u8,
+}
+
+/// LB value: the Maglev table id + its size (number of slots).
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct LbValue {
+    pub table_id: u32,
+    pub size: u32,
+}
+
+/// Maglev slot key: (table_id, slot). Value in the map is the backend IPv4 (`[u8;4]`).
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct MaglevKey {
+    pub table_id: u32,
+    pub slot: u32,
+}
+
+/// Conntrack key: the 5-tuple (host-order ports; for ICMP the ports hold the id).
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct CtKey {
+    pub src_ip: [u8; 4],
+    pub dst_ip: [u8; 4],
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub proto: u8,
+    pub _pad: [u8; 3],
+}
+
+/// Conntrack value: the original LB IPv4 to restore on the reverse path.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct CtVal {
+    pub lb_ipv4: [u8; 4],
+}
+
 /// Single-entry `CONFIG` map: per-hypervisor datapath parameters for the PoC's
 /// CONFIG-driven single-peer overlay (one guest + one peer hypervisor). The XDP programs
 /// read entry 0; the control plane populates it. MACs/ifindexes are filled at e2e time.
@@ -151,6 +197,11 @@ mod user_impls {
     unsafe impl aya::Pod for Local {}
     unsafe impl aya::Pod for InspectEntry {}
     unsafe impl aya::Pod for VipKey {}
+    unsafe impl aya::Pod for LbKey {}
+    unsafe impl aya::Pod for LbValue {}
+    unsafe impl aya::Pod for MaglevKey {}
+    unsafe impl aya::Pod for CtKey {}
+    unsafe impl aya::Pod for CtVal {}
 }
 
 #[cfg(test)]
@@ -193,6 +244,15 @@ mod tests {
     #[test]
     fn vip_key_layout() {
         assert_eq!(core::mem::size_of::<VipKey>(), 8);
+    }
+
+    #[test]
+    fn lb_ct_layouts() {
+        assert_eq!(core::mem::size_of::<LbKey>(), 12);
+        assert_eq!(core::mem::size_of::<LbValue>(), 8);
+        assert_eq!(core::mem::size_of::<MaglevKey>(), 8);
+        assert_eq!(core::mem::size_of::<CtKey>(), 16);
+        assert_eq!(core::mem::size_of::<CtVal>(), 4);
     }
 }
 
