@@ -15,6 +15,23 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(act);
     }
 
+    // Answer IPv6 Neighbor Discovery for the gateway in-datapath.
+    if let Some(act) = crate::arp_nd::try_nd_reply(ctx, meta) {
+        return Ok(act);
+    }
+    // IPv6 inner frames take the v6 overlay path.
+    {
+        let d = ctx.data();
+        if d + 14 <= ctx.data_end() {
+            let et = u16::from_be(unsafe {
+                core::ptr::read_unaligned((d as *const u8).add(12) as *const u16)
+            });
+            if et == crate::parse::ETH_P_IPV6 {
+                return crate::v6::v6_guest_tx(ctx, meta);
+            }
+        }
+    }
+
     let data = ctx.data();
     let data_end = ctx.data_end();
     if data + ETH_LEN + 20 > data_end {

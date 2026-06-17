@@ -21,7 +21,11 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     if ethertype != ETH_P_IPV6 {
         return Ok(xdp_action::XDP_PASS);
     }
-    if unsafe { *p.add(ETH_LEN + 6) } != IPPROTO_IPIP {
+    let nexthdr = unsafe { *p.add(ETH_LEN + 6) };
+    if nexthdr == crate::parse::IPPROTO_IPV6 {
+        return crate::v6::v6_uplink_rx(ctx);
+    }
+    if nexthdr != IPPROTO_IPIP {
         return Ok(xdp_action::XDP_PASS);
     }
     // Resolve the destination interface from the OUTER IPv6 dst (uniquely identifies the iface and

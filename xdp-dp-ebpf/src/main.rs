@@ -14,6 +14,7 @@ mod maps;
 mod meter;
 mod nat;
 mod parse;
+mod v6;
 mod vip;
 
 use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
