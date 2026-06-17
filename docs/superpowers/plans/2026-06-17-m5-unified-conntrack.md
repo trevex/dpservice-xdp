@@ -742,6 +742,80 @@ git add xdp-dp env/netns-e2e.sh
 git commit -m "test(ct): conntrack aging unit tests + sustained-flow lab gate (Test 9)"
 ```
 
+## Task 8: Configurable BPF map sizes (env vars + flag override)
+
+**Files:** Modify `xdp-dp/src/loader.rs`, `xdp-dp/src/main.rs`
+
+Operators must be able to size the hot maps per node role without recompiling. Make `load_ebpf`
+apply `EbpfLoader::set_max_entries` overrides read from env vars (uniform across every subcommand
+that loads the datapath), with the compile-time `with_max_entries` values as defaults.
+
+- [ ] **Step 1: Env-driven `set_max_entries` in `loader.rs`**
+
+Replace `load_ebpf` with an `EbpfLoader`-based version that overrides sizes from env vars when set:
+```rust
+pub fn load_ebpf() -> anyhow::Result<Ebpf> {
+    let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/xdp-dp-prog"));
+    let mut loader = aya::EbpfLoader::new();
+    // Map name -> env var. Unset => keep the compile-time `with_max_entries` default.
+    for (map, var) in [
+        ("CONNTRACK", "XDP_DP_CONNTRACK_MAX"),
+        ("NAT_CT", "XDP_DP_CONNTRACK_MAX"), // same knob while NAT_CT still exists (pre-Task 3)
+        ("ROUTES", "XDP_DP_ROUTES_MAX"),
+        ("INTERFACES", "XDP_DP_INTERFACES_MAX"),
+        ("MAGLEV", "XDP_DP_MAGLEV_MAX"),
+        ("NAT", "XDP_DP_NAT_MAX"),
+        ("LB", "XDP_DP_LB_MAX"),
+        ("PORT_META", "XDP_DP_PORT_META_MAX"),
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            let n: u32 = v
+                .parse()
+                .with_context(|| format!("{var} must be a u32, got {v:?}"))?;
+            loader.set_max_entries(map, n);
+        }
+    }
+    loader
+        .load(bytes)
+        .context("load ebpf object")
+}
+```
+Note: after Task 3 removes `NAT_CT`, drop that one line. `set_max_entries` on a non-existent map
+name is ignored by aya, so the transient `NAT_CT` line is harmless either way; remove it for
+cleanliness when NAT_CT goes.
+
+- [ ] **Step 2: `--conntrack-max` flag on `serve`/`bringup` (optional convenience over the env var)**
+
+In `xdp-dp/src/main.rs`, add an optional `#[arg(long)]  conntrack_max: Option<u32>` to the `Serve`
+and `Bringup` subcommands; when set, export it so `load_ebpf` (called downstream) picks it up:
+```rust
+            if let Some(n) = conntrack_max {
+                // SAFETY: single-threaded CLI startup, before any datapath thread is spawned.
+                unsafe { std::env::set_var("XDP_DP_CONNTRACK_MAX", n.to_string()) };
+            }
+```
+Place this at the very top of the `Serve` / `Bringup` arms, before `load_ebpf`/`bring_up` runs.
+(Keep it minimal — the env var is the primary mechanism; the flag is sugar for the common knob.)
+
+- [ ] **Step 3: Build + verify override works**
+```bash
+cargo build -p xdp-dp
+# Sanity: load with a tiny conntrack and confirm the program still loads (root).
+sudo XDP_DP_CONNTRACK_MAX=4096 ./target/debug/xdp-dp pass --iface lo &
+sleep 1; sudo pkill -f 'xdp-dp pass' || true
+```
+Expected: loads cleanly (no error). Then run the e2e once with an override to confirm nothing breaks:
+```bash
+XDP_DP_CONNTRACK_MAX=262144 ./env/netns-e2e.sh run 2>&1 | tail -6   # Tests pass
+```
+
+- [ ] **Step 4: Commit**
+```bash
+cargo fmt --all
+git add xdp-dp
+git commit -m "feat(loader): configurable BPF map sizes via env vars + --conntrack-max flag"
+```
+
 ---
 
 ## Self-Review
