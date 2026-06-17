@@ -11,13 +11,25 @@ pub fn load_ebpf() -> anyhow::Result<Ebpf> {
     .context("load ebpf object")
 }
 
-/// Attach a named XDP program in an already-loaded `Ebpf` to an interface.
+/// Load (verify) and attach a named XDP program to one interface. Call this for the first
+/// interface; use `attach_xdp_loaded` for subsequent interfaces with the same program name.
 pub fn attach_xdp(ebpf: &mut Ebpf, prog_name: &str, iface: &str) -> anyhow::Result<()> {
     let prog: &mut Xdp = ebpf
         .program_mut(prog_name)
         .with_context(|| format!("{prog_name} program missing"))?
         .try_into()?;
     prog.load().with_context(|| format!("verify {prog_name}"))?;
+    prog.attach(iface, XdpFlags::default())
+        .with_context(|| format!("attach {prog_name} to {iface}"))?;
+    Ok(())
+}
+
+/// Attach an already-loaded XDP program to an additional interface (skips the `load()` call).
+pub fn attach_xdp_extra(ebpf: &mut Ebpf, prog_name: &str, iface: &str) -> anyhow::Result<()> {
+    let prog: &mut Xdp = ebpf
+        .program_mut(prog_name)
+        .with_context(|| format!("{prog_name} program missing"))?
+        .try_into()?;
     prog.attach(iface, XdpFlags::default())
         .with_context(|| format!("attach {prog_name} to {iface}"))?;
     Ok(())

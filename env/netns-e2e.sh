@@ -2,11 +2,15 @@
 # env/netns-e2e.sh — netns-based end-to-end test for the XDP IP-in-IPv6 overlay.
 #
 # Topology:
-#   guesta(10.0.0.5/gA) <-> hypa(gA-h / uA) <-> [uA-br] br-ul [uB-br] <-> hypb(uB / gB-h) <-> guestb(10.0.0.6/gB)
+#   guesta(10.0.0.5/gA)  \
+#   guesta2(10.0.0.7/gA2) }- hypa(gA-h,gA2-h / uA) <-> [uA-br] br-ul [uB-br] <-> hypb(uB / gB-h) <-> guestb(10.0.0.6/gB)
+#
+# Guests use a dpservice-style /32 + link route to gateway + default via gateway (10.0.0.1),
+# so they ARP only for the gateway — which the datapath answers in-kernel (no static neigh).
 #
 # Usage (run from repo root):
 #   ./env/netns-e2e.sh up       create namespaces + bridge, attach XDP datapath
-#   ./env/netns-e2e.sh test     ping guesta->guestb; show encap tcpdump evidence
+#   ./env/netns-e2e.sh test     ping guesta->guestb; ARP evidence; multi-interface; encap capture
 #   ./env/netns-e2e.sh down     kill daemons, tear down all namespaces/links/bridge
 #   ./env/netns-e2e.sh run      up + test + down  (with cleanup on error)
 #
@@ -48,7 +52,7 @@ cmd_up() {
     sudo ip link set br-ul type bridge mcast_snooping 0
 
     # ---- namespaces ----
-    for ns in hypa hypb guesta guestb; do
+    for ns in hypa hypb guesta guestb guesta2; do
         sudo ip netns add "$ns" 2>/dev/null || true
         sudo ip netns exec "$ns" ip link set lo up
     done
@@ -68,7 +72,20 @@ cmd_up() {
     fi
     sudo ip netns exec hypa ip link set gA-h up
     sudo ip netns exec guesta ip link set gA up
-    sudo ip netns exec guesta ip addr add 10.0.0.5/24 dev gA 2>/dev/null || true
+    # /32 address + link route to gateway + default via gateway (dpservice model)
+    sudo ip netns exec guesta ip addr add 10.0.0.5/32 dev gA 2>/dev/null || true
+    sudo ip netns exec guesta ip route add 10.0.0.1/32 dev gA 2>/dev/null || true
+    sudo ip netns exec guesta ip route add default via 10.0.0.1 2>/dev/null || true
+
+    # ---- hypa second guest link: gA2-h in hypa <-> gA2 in guesta2 ----
+    if ! sudo ip netns exec hypa ip link show gA2-h &>/dev/null; then
+        sudo ip link add gA2-h netns hypa type veth peer name gA2 netns guesta2
+    fi
+    sudo ip netns exec hypa ip link set gA2-h up
+    sudo ip netns exec guesta2 ip link set gA2 up
+    sudo ip netns exec guesta2 ip addr add 10.0.0.7/32 dev gA2 2>/dev/null || true
+    sudo ip netns exec guesta2 ip route add 10.0.0.1/32 dev gA2 2>/dev/null || true
+    sudo ip netns exec guesta2 ip route add default via 10.0.0.1 2>/dev/null || true
 
     # ---- hypb uplink: uB in hypb <-> uB-br on bridge ----
     if ! sudo ip netns exec hypb ip link show uB &>/dev/null; then
@@ -85,7 +102,9 @@ cmd_up() {
     fi
     sudo ip netns exec hypb ip link set gB-h up
     sudo ip netns exec guestb ip link set gB up
-    sudo ip netns exec guestb ip addr add 10.0.0.6/24 dev gB 2>/dev/null || true
+    sudo ip netns exec guestb ip addr add 10.0.0.6/32 dev gB 2>/dev/null || true
+    sudo ip netns exec guestb ip route add 10.0.0.1/32 dev gB 2>/dev/null || true
+    sudo ip netns exec guestb ip route add default via 10.0.0.1 2>/dev/null || true
 
     # ---- ip6tables: allow bridge forwarding on br-ul ----
     # Docker sets ip6tables FORWARD policy to DROP with bridge-nf-call-ip6tables=1.
@@ -106,24 +125,22 @@ cmd_up() {
         || die "underlay ping hypa->hypb failed — check bridge/ip6tables"
     echo "Underlay ping OK"
 
-    # ---- capture guest MACs ----
+    # ---- capture guest MACs (from inside guest netns — these are the actual guest MACs) ----
     GA_MAC=$(sudo ip netns exec guesta cat /sys/class/net/gA/address)
     GB_MAC=$(sudo ip netns exec guestb cat /sys/class/net/gB/address)
+    GA2_MAC=$(sudo ip netns exec guesta2 cat /sys/class/net/gA2/address)
     echo "UA_MAC=$UA_MAC  UB_MAC=$UB_MAC"
-    echo "GA_MAC=$GA_MAC  GB_MAC=$GB_MAC"
+    echo "GA_MAC=$GA_MAC  GB_MAC=$GB_MAC  GA2_MAC=$GA2_MAC"
 
-    # ---- static neigh entries on guests ----
-    # The XDP guest_tx program strips the inner Ethernet header, so the guest's
-    # ARP/NDP for the peer overlay IP never gets answered. Static entries bypass that.
-    # The lladdr values are dummies — guest_tx ignores the inner Ethernet dst.
-    sudo ip netns exec guesta ip neigh replace 10.0.0.6 lladdr 02:00:00:00:00:bb dev gA nud permanent
-    sudo ip netns exec guestb ip neigh replace 10.0.0.5 lladdr 02:00:00:00:00:cc dev gB nud permanent
+    # NOTE: No static guest neigh entries — the XDP datapath answers ARP for 10.0.0.1 in-kernel.
+    # Guests use /32 + link route + default via 10.0.0.1, so they only ARP for the gateway.
 
     # ---- redirect-target enablers ----
     # XDP bpf_redirect() into a veth only works if that veth's PEER has an XDP program.
-    # uA-br = peer of uA  (guest_tx on gA-h redirects -> uA -> uA-br)
+    # uA-br = peer of uA  (guest_tx on gA-h/gA2-h redirects -> uA -> uA-br)
     # uB-br = peer of uB
     # gA    = peer of gA-h (uplink_rx on uA redirects -> gA-h -> gA)
+    # gA2   = peer of gA2-h (uplink_rx on uA redirects -> gA2-h -> gA2)
     # gB    = peer of gB-h
     echo "=== Attaching xdp_pass on redirect-target peers ==="
     : > "$PIDFILE"
@@ -136,24 +153,32 @@ cmd_up() {
     echo $! >> "$PIDFILE"
     sudo ip netns exec guestb "$BIN" pass --iface gB &
     echo $! >> "$PIDFILE"
+    sudo ip netns exec guesta2 "$BIN" pass --iface gA2 &
+    echo $! >> "$PIDFILE"
 
     sleep 1
 
     # ---- datapath bringup on each hypervisor ----
-    # --peer-mac  = the OTHER hypervisor's uplink veth MAC (outer Eth dst on encap)
-    # --guest-mac = THIS hypervisor's guest interface MAC (inner Eth dst on decap)
     echo "=== Bringing up XDP datapath ==="
 
+    # hypa: two local guests (gA=10.0.0.5, gA2=10.0.0.7) + remote route to hypb guest (10.0.0.6)
     sudo ip netns exec hypa "$BIN" bringup \
-        --guest gA-h --uplink uA --vni 100 \
-        --local-underlay fd00::1 --peer-underlay fd00::2 \
-        --peer-mac "$UB_MAC" --guest-mac "$GA_MAC" &
+        --uplink uA \
+        --local-underlay fd00::1 \
+        --gateway 10.0.0.1 \
+        --guest "gA-h=10.0.0.5=${GA_MAC}" \
+        --guest "gA2-h=10.0.0.7=${GA2_MAC}" \
+        --remote "10.0.0.6=fd00::2=${UB_MAC}" &
     echo $! >> "$PIDFILE"
 
+    # hypb: one local guest (gB=10.0.0.6) + remote routes to both hypa guests
     sudo ip netns exec hypb "$BIN" bringup \
-        --guest gB-h --uplink uB --vni 100 \
-        --local-underlay fd00::2 --peer-underlay fd00::1 \
-        --peer-mac "$UA_MAC" --guest-mac "$GB_MAC" &
+        --uplink uB \
+        --local-underlay fd00::2 \
+        --gateway 10.0.0.1 \
+        --guest "gB-h=10.0.0.6=${GB_MAC}" \
+        --remote "10.0.0.5=fd00::1=${UA_MAC}" \
+        --remote "10.0.0.7=fd00::1=${UA_MAC}" &
     echo $! >> "$PIDFILE"
 
     sleep 2
@@ -162,6 +187,8 @@ cmd_up() {
     echo "=== XDP attachment verification ==="
     echo "hypa gA-h (guest_tx):"
     sudo ip netns exec hypa ip -d link show gA-h | grep -E 'xdp|prog' || echo "  WARNING: no xdp on gA-h"
+    echo "hypa gA2-h (guest_tx):"
+    sudo ip netns exec hypa ip -d link show gA2-h | grep -E 'xdp|prog' || echo "  WARNING: no xdp on gA2-h"
     echo "hypa uA (uplink_rx):"
     sudo ip netns exec hypa ip -d link show uA   | grep -E 'xdp|prog' || echo "  WARNING: no xdp on uA"
     echo "hypb gB-h (guest_tx):"
@@ -178,7 +205,21 @@ cmd_test() {
     sudo ip netns exec guesta ping -c 3 -W 2 10.0.0.6
     echo ""
 
-    echo "=== Test 2: IPv6/proto-4 encap evidence on bridge (uA-br) ==="
+    echo "=== Test 2: DATAPATH ARP proof — 10.0.0.1 must show GW_MAC 02:00:00:00:00:01 ==="
+    sudo ip netns exec guesta ip neigh show 10.0.0.1
+    NEIGH=$(sudo ip netns exec guesta ip neigh show 10.0.0.1)
+    if echo "$NEIGH" | grep -q "02:00:00:00:00:01"; then
+        echo "  ARP proof OK: datapath replied with GW_MAC"
+    else
+        echo "  WARNING: expected lladdr 02:00:00:00:00:01 but got: $NEIGH"
+    fi
+    echo ""
+
+    echo "=== Test 3: MULTI-INTERFACE — guesta2 (hypa's second guest) -> guestb ==="
+    sudo ip netns exec guesta2 ping -c 3 -W 2 10.0.0.6
+    echo ""
+
+    echo "=== Test 4: IPv6/proto-4 encap evidence on bridge (uA-br) ==="
     # XDP bpf_redirect() bypasses tcpdump on the redirecting interface (uA inside hypa),
     # so we capture on uA-br (the bridge-side peer) instead.
     if [[ -n "$TCPDUMP" ]]; then
@@ -192,7 +233,7 @@ cmd_test() {
     fi
     echo ""
 
-    echo "=== Test 3: return path guestb -> guesta ==="
+    echo "=== Test 5: return path guestb -> guesta ==="
     sudo ip netns exec guestb ping -c 3 -W 2 10.0.0.5
 
     echo ""
@@ -225,7 +266,7 @@ cmd_down() {
     sudo ip6tables -D FORWARD -i uB-br -j ACCEPT -m comment --comment "$IP6TABLES_MARK" 2>/dev/null || true
 
     # Delete namespaces (also removes veth pairs whose netns-end lives inside them)
-    for ns in hypa hypb guesta guestb; do
+    for ns in hypa hypb guesta guestb guesta2; do
         sudo ip netns del "$ns" 2>/dev/null || true
     done
 

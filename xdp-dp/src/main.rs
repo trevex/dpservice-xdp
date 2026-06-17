@@ -94,7 +94,9 @@ enum Cmd {
         /// Overlay gateway IPv4 the datapath answers ARP for (e.g. 10.0.0.1).
         #[arg(long)]
         gateway: String,
-        /// Local guest, repeatable: "<ifname>=<overlay_ipv4>" (guest_tx attaches to <ifname>).
+        /// Local guest, repeatable: "<ifname>=<overlay_ipv4>=<guest_mac>" where <guest_mac> is
+        /// the MAC of the guest interface inside the guest netns (inner eth dst on decap delivery).
+        /// guest_tx attaches to <ifname> (the hypervisor-side veth peer).
         #[arg(long = "guest")]
         guests: Vec<String>,
         /// Remote guest route, repeatable: "<overlay_ipv4>=<nexthop_ipv6>=<nexthop_mac>".
@@ -134,10 +136,17 @@ async fn main() -> anyhow::Result<()> {
 
             // Pass 1: attach ALL XDP programs while ebpf is still fully intact
             // (take_map consumes map entries, but programs are separate — still need &mut ebpf).
+            // uplink_rx: load + attach once.
             loader::attach_xdp(&mut ebpf, "uplink_rx", &uplink)?;
-            for g in &guests {
-                let (ifname, _ip) = g.split_once('=').context("--guest must be ifname=ipv4")?;
-                loader::attach_xdp(&mut ebpf, "guest_tx", ifname)?;
+            // guest_tx: load once (first guest), then attach-only for additional guests.
+            for (idx, g) in guests.iter().enumerate() {
+                let mut it = g.splitn(3, '=');
+                let ifname = it.next().context("--guest must be ifname=ipv4=mac")?;
+                if idx == 0 {
+                    loader::attach_xdp(&mut ebpf, "guest_tx", ifname)?;
+                } else {
+                    loader::attach_xdp_extra(&mut ebpf, "guest_tx", ifname)?;
+                }
             }
 
             // Pass 2: open map wrappers (each calls take_map, consuming the map slot).
@@ -153,17 +162,20 @@ async fn main() -> anyhow::Result<()> {
             let mut ports = maps::PortMetaMap::open(&mut ebpf)?;
             let mut ifaces = maps::Interfaces::open(&mut ebpf)?;
             for g in &guests {
-                let (ifname, ip) = g.split_once('=').context("--guest must be ifname=ipv4")?;
-                let ip = parse_ipv4(ip)?;
+                let mut it = g.splitn(3, '=');
+                let ifname = it.next().context("--guest must be ifname=ipv4=mac")?;
+                let ip_str = it.next().context("--guest must be ifname=ipv4=mac")?;
+                let mac_str = it.next().context("--guest must be ifname=ipv4=mac")?;
+                let ip = parse_ipv4(ip_str)?;
+                let guest_mac = parse_mac(mac_str)?;
                 let tap = ifindex(ifname)?;
-                let mac = mac_of(ifname)?;
                 ports.upsert(
                     tap,
                     xdp_dp_common::PortMeta {
                         vni: 0,
                         guest_ipv4: ip,
                         gateway_ipv4: gw,
-                        guest_mac: mac,
+                        guest_mac,
                         _pad: [0; 2],
                     },
                 )?;
@@ -173,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
                         tap_ifindex: tap,
                         is_local: 1,
                         underlay_ipv6: parse_ipv6(&local_underlay)?,
-                        guest_mac: mac,
+                        guest_mac,
                         _pad: [0; 2],
                     },
                 )?;
