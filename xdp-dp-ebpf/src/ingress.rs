@@ -72,6 +72,24 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     let tap_ifindex = iface.tap_ifindex;
     let guest_mac = iface.guest_mac;
 
+    // Ingress firewall: enforce the DESTINATION interface's INGRESS rules on NEW inbound flows
+    // (established flows — including seeded returns — already have a conntrack entry, so they are
+    // allowed without re-evaluation). Runs on the post-LB/NAT-DNAT inner 5-tuple.
+    if let Some(key) = crate::conntrack::ct_key(ctx.data(), ctx.data_end(), ETH_LEN + IPV6_LEN) {
+        if unsafe { crate::maps::CONNTRACK.get(&key) }.is_none()
+            && crate::firewall::fw_eval_dir(
+                ctx.data(),
+                ctx.data_end(),
+                ETH_LEN + IPV6_LEN,
+                tap_ifindex,
+                xdp_dp_common::FW_DIR_INGRESS,
+            ) == xdp_dp_common::FW_ACTION_DROP
+            && crate::firewall::fw_enforcing()
+        {
+            return Ok(xdp_action::XDP_DROP);
+        }
+    }
+
     // Track every flow: refresh an existing inbound DEFAULT entry, or create one on miss.
     // Only for non-LB/non-NAT flows; the inner IPv4 is at ETH_LEN + IPV6_LEN pre-adjust_head.
     if lb_backend.is_none() && nat_guest.is_none() {
