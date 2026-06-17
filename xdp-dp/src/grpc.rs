@@ -232,7 +232,12 @@ impl DpdKironcore for Service {
         &self,
         _req: Request<CreateLoadBalancerPrefixRequest>,
     ) -> Result<Response<CreateLoadBalancerPrefixResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        // PoC: LB prefixes are an announce-only concept; accept and return OK. The datapath does
+        // not need per-prefix state for the single-tenant local-backend PoC.
+        Ok(Response::new(CreateLoadBalancerPrefixResponse {
+            status: ok(),
+            underlay_route: self.underlay.to_vec(),
+        }))
     }
 
     async fn delete_load_balancer_prefix(
@@ -301,9 +306,29 @@ impl DpdKironcore for Service {
 
     async fn create_load_balancer(
         &self,
-        _req: Request<CreateLoadBalancerRequest>,
+        req: Request<CreateLoadBalancerRequest>,
     ) -> Result<Response<CreateLoadBalancerResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let lb_addr = r
+            .loadbalanced_ip
+            .ok_or_else(|| Status::invalid_argument("loadbalanced_ip is required"))?;
+        let ip = decode_ipv4(&lb_addr.address)?;
+        let ports: Vec<(u16, u8)> = r
+            .loadbalanced_ports
+            .iter()
+            .map(|p| (p.port as u16, p.protocol as u8))
+            .collect();
+        control
+            .create_lb(&r.loadbalancer_id, r.vni, ip, ports)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CreateLoadBalancerResponse {
+            status: ok(),
+            underlay_route: self.underlay.to_vec(),
+        }))
     }
 
     async fn get_load_balancer(
@@ -315,9 +340,17 @@ impl DpdKironcore for Service {
 
     async fn delete_load_balancer(
         &self,
-        _req: Request<DeleteLoadBalancerRequest>,
+        req: Request<DeleteLoadBalancerRequest>,
     ) -> Result<Response<DeleteLoadBalancerResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        control
+            .delete_lb(&r.loadbalancer_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(DeleteLoadBalancerResponse { status: ok() }))
     }
 
     async fn list_load_balancers(
@@ -329,9 +362,23 @@ impl DpdKironcore for Service {
 
     async fn create_load_balancer_target(
         &self,
-        _req: Request<CreateLoadBalancerTargetRequest>,
+        req: Request<CreateLoadBalancerTargetRequest>,
     ) -> Result<Response<CreateLoadBalancerTargetResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let tgt = r
+            .target_ip
+            .ok_or_else(|| Status::invalid_argument("target_ip is required"))?;
+        let backend = decode_ipv4(&tgt.address)?;
+        control
+            .add_lb_target(&r.loadbalancer_id, backend)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CreateLoadBalancerTargetResponse {
+            status: ok(),
+        }))
     }
 
     async fn list_load_balancer_targets(
