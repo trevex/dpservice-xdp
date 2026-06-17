@@ -49,12 +49,25 @@ pub struct RouteKey {
     pub ipv4: [u8; 4],
 }
 
-/// Value for the `routes` map: the underlay IPv6 nexthop (tunnel dst) + nexthop VNI.
+/// Value for the `routes` map: how to reach the overlay prefix's nexthop on the underlay.
 #[repr(C)]
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct RouteValue {
     pub nexthop_vni: u32,
     pub nexthop_ipv6: [u8; 16],
+    /// Underlay MAC of the nexthop hypervisor's uplink (outer eth dst on encap).
+    pub nexthop_mac: [u8; 6],
+    pub _pad: [u8; 2],
+}
+
+/// This hypervisor's uplink, written once by the control plane into `LOCAL[0]`.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct Local {
+    pub uplink_ifindex: u32,
+    pub uplink_mac: [u8; 6],
+    pub _pad: [u8; 2],
+    pub underlay_ipv6: [u8; 16],
 }
 
 /// Single-entry `CONFIG` map: per-hypervisor datapath parameters for the PoC's
@@ -92,6 +105,7 @@ mod user_impls {
     unsafe impl aya::Pod for RouteKey {}
     unsafe impl aya::Pod for RouteValue {}
     unsafe impl aya::Pod for Config {}
+    unsafe impl aya::Pod for Local {}
 }
 
 #[cfg(test)]
@@ -109,9 +123,12 @@ mod tests {
 
     #[test]
     fn route_types_have_stable_layout() {
-        // 4 (vni) + 4 (prefix_len) + 4 (ipv4) = 12; 4 (nexthop_vni) + 16 (ipv6) = 20.
+        // 4 (vni) + 4 (prefix_len) + 4 (ipv4) = 12.
+        // 4 (nexthop_vni) + 16 (ipv6) + 6 (mac) + 2 (pad) = 28.
         assert_eq!(core::mem::size_of::<RouteKey>(), 12);
-        assert_eq!(core::mem::size_of::<RouteValue>(), 20);
+        assert_eq!(core::mem::size_of::<RouteValue>(), 28);
+        // 4 (uplink_ifindex) + 6 (uplink_mac) + 2 (pad) + 16 (underlay_ipv6) = 28.
+        assert_eq!(core::mem::size_of::<Local>(), 28);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 #![no_main]
 
 mod arp_nd;
+mod encap;
 mod maps;
 mod parse;
 
