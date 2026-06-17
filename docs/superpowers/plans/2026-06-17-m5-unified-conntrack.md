@@ -515,6 +515,17 @@ git commit -m "feat(ct): TCP state machine + last_seen refresh on conntrack hits
 
 **Files:** Modify `xdp-dp-ebpf/src/egress.rs`, `xdp-dp-ebpf/src/ingress.rs`, `xdp-dp-ebpf/src/conntrack.rs`
 
+- [ ] **Step 0 (CRITICAL): guard `ct_apply` so DEFAULT entries are a no-op**
+
+`ct_apply` currently *always* rewrites (src if `CT_REWRITE_SRC`, else dst). A DEFAULT entry has neither flag and `xlate_ip = 0.0.0.0`, so applying it would corrupt the dst to `0.0.0.0`. Add an early return at the top of `ct_apply` (in `conntrack.rs`):
+```rust
+    // DEFAULT (and any flag-less) entries carry no translation — never rewrite.
+    if e.flags & (xdp_dp_common::CT_REWRITE_SRC | xdp_dp_common::CT_REWRITE_DST) == 0 {
+        return;
+    }
+```
+Place it as the first statement of `ct_apply`, before the bounds check. (Add `CT_REWRITE_DST` to the `conntrack.rs` import if not already present.) Without this, the moment Step 2 starts inserting DEFAULT entries the egress apply block will null inbound destinations — so this step comes first.
+
 - [ ] **Step 1: `ct_ensure_default` helper in `conntrack.rs`**
 ```rust
 use xdp_dp_common::CT_F_DEFAULT;
@@ -554,16 +565,21 @@ In `egress.rs`, restructure the egress conntrack block so a miss (after VIP/NAT 
 
 - [ ] **Step 3: Insert DEFAULT on ingress miss**
 
-In `ingress.rs`, after `deliver_ip` is resolved and the packet delivered path is chosen but before `adjust_head`, ensure a DEFAULT entry for non-LB/non-NAT inbound flows:
+In `ingress.rs`, after `deliver_ip` is resolved but before `adjust_head`, **touch** an existing inbound DEFAULT entry (refresh `last_seen`/TCP state so inbound-only flows don't age out) or **ensure** one on miss, for non-LB/non-NAT inbound flows:
 ```rust
     if lb_backend.is_none() && nat_guest.is_none() {
         if let Some(key) = crate::conntrack::ct_key(ctx.data(), ctx.data_end(), ETH_LEN + IPV6_LEN) {
-            if unsafe { crate::maps::CONNTRACK.get(&key) }.is_none() {
-                crate::conntrack::ct_ensure_default(ctx, ETH_LEN + IPV6_LEN, &key);
+            match unsafe { crate::maps::CONNTRACK.get(&key) } {
+                Some(e) => {
+                    let mut e = *e;
+                    crate::conntrack::ct_touch(ctx, ETH_LEN + IPV6_LEN, &key, &mut e);
+                }
+                None => crate::conntrack::ct_ensure_default(ctx, ETH_LEN + IPV6_LEN, &key),
             }
         }
     }
 ```
+(`ct_apply` is intentionally NOT called here — DEFAULT entries carry no translation, and any `CT_REWRITE_DST` entry was already handled by the `nat_guest` block above.)
 
 - [ ] **Step 4: Build + verifier + e2e + commit**
 ```bash
