@@ -22,13 +22,13 @@ use crate::pb::{
     DeleteVipResponse, GetFirewallRuleRequest, GetFirewallRuleResponse, GetInterfaceRequest,
     GetInterfaceResponse, GetLoadBalancerRequest, GetLoadBalancerResponse, GetNatRequest,
     GetNatResponse, GetVersionRequest, GetVersionResponse, GetVipRequest, GetVipResponse,
-    InitializeRequest, InitializeResponse, ListFirewallRulesRequest, ListFirewallRulesResponse,
-    ListInterfacesRequest, ListInterfacesResponse, ListLoadBalancerPrefixesRequest,
-    ListLoadBalancerPrefixesResponse, ListLoadBalancerTargetsRequest,
-    ListLoadBalancerTargetsResponse, ListLoadBalancersRequest, ListLoadBalancersResponse,
-    ListLocalNatsRequest, ListLocalNatsResponse, ListNeighborNatsRequest, ListNeighborNatsResponse,
-    ListPrefixesRequest, ListPrefixesResponse, ListRoutesRequest, ListRoutesResponse,
-    ResetVniRequest, ResetVniResponse, Status as DpStatus,
+    InitializeRequest, InitializeResponse, IpAddress, IpVersion, ListFirewallRulesRequest,
+    ListFirewallRulesResponse, ListInterfacesRequest, ListInterfacesResponse,
+    ListLoadBalancerPrefixesRequest, ListLoadBalancerPrefixesResponse,
+    ListLoadBalancerTargetsRequest, ListLoadBalancerTargetsResponse, ListLoadBalancersRequest,
+    ListLoadBalancersResponse, ListLocalNatsRequest, ListLocalNatsResponse,
+    ListNeighborNatsRequest, ListNeighborNatsResponse, ListPrefixesRequest, ListPrefixesResponse,
+    ListRoutesRequest, ListRoutesResponse, ResetVniRequest, ResetVniResponse, Status as DpStatus,
 };
 use crate::state::State;
 
@@ -120,12 +120,13 @@ impl DpdKironcore for Service {
         // Derive gateway: same /24 prefix but last octet = 1
         let gateway_ipv4 = [ipv4[0], ipv4[1], ipv4[2], 1];
 
+        let interface_id = r.interface_id;
         let device = r.device_name;
         let vni = r.vni;
         let underlay = self.underlay;
 
         control
-            .create_interface(&device, vni, ipv4, gateway_ipv4, underlay)
+            .create_interface(&interface_id, &device, vni, ipv4, gateway_ipv4, underlay)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(CreateInterfaceResponse {
@@ -243,23 +244,59 @@ impl DpdKironcore for Service {
 
     async fn create_vip(
         &self,
-        _req: Request<CreateVipRequest>,
+        req: Request<CreateVipRequest>,
     ) -> Result<Response<CreateVipResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let vip_addr = r
+            .vip_ip
+            .ok_or_else(|| Status::invalid_argument("vip_ip is required"))?;
+        let vip = decode_ipv4(&vip_addr.address)?;
+        control
+            .create_vip(&r.interface_id, vip)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CreateVipResponse {
+            status: ok(),
+            underlay_route: self.underlay.to_vec(),
+        }))
     }
 
     async fn get_vip(
         &self,
-        _req: Request<GetVipRequest>,
+        req: Request<GetVipRequest>,
     ) -> Result<Response<GetVipResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let vip_ip = control.get_vip(&r.interface_id).map(|addr| IpAddress {
+            ipver: IpVersion::Ipv4 as i32,
+            address: addr.to_vec(),
+        });
+        Ok(Response::new(GetVipResponse {
+            status: ok(),
+            vip_ip,
+            underlay_route: self.underlay.to_vec(),
+        }))
     }
 
     async fn delete_vip(
         &self,
-        _req: Request<DeleteVipRequest>,
+        req: Request<DeleteVipRequest>,
     ) -> Result<Response<DeleteVipResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        control
+            .delete_vip(&r.interface_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(DeleteVipResponse { status: ok() }))
     }
 
     async fn create_load_balancer(
