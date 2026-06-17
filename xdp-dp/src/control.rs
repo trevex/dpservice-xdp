@@ -9,7 +9,7 @@ use xdp_dp_common::{
 };
 
 use crate::loader;
-use crate::maps::{Interfaces, Lb, LocalMap, Maglev, Nat, PortMetaMap, Routes, Vips};
+use crate::maps::{Conntrack, Interfaces, Lb, LocalMap, Maglev, Nat, PortMetaMap, Routes, Vips};
 
 /// Registered load balancer: its Maglev table id, the (port,proto) services it answers, and the
 /// ordered backend list (drives the Maglev table). Keyed in `Inner.lbs` by the LB's id.
@@ -24,6 +24,8 @@ struct LbEntry {
 /// Owns the loaded eBPF object + map handles; mutated by the gRPC handlers.
 pub struct Control {
     inner: Mutex<Inner>,
+    /// Conntrack map handle, taken once by the GC task via `take_conntrack`.
+    conntrack: Mutex<Option<Conntrack>>,
 }
 
 struct Inner {
@@ -68,6 +70,7 @@ impl Control {
         let lb = Lb::open(&mut ebpf)?;
         let maglev = Maglev::open(&mut ebpf)?;
         let nat = Nat::open(&mut ebpf)?;
+        let conntrack = Conntrack::open(&mut ebpf)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 ebpf,
@@ -83,7 +86,13 @@ impl Control {
                 next_table_id: 1,
                 by_id: HashMap::new(),
             }),
+            conntrack: Mutex::new(Some(conntrack)),
         })
+    }
+
+    /// Hand out the conntrack map handle once (for the GC task). Returns None if already taken.
+    pub fn take_conntrack(&self) -> Option<Conntrack> {
+        self.conntrack.lock().unwrap().take()
     }
 
     /// Program a LOCAL interface: attach guest_tx to its device, set PORT_META + INTERFACES.

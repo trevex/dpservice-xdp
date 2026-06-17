@@ -245,6 +245,11 @@ impl Conntrack {
     pub fn get(&self, key: &CtKey) -> Option<CtEntry> {
         self.map.get(key, 0).ok()
     }
+
+    /// Snapshot all (key, entry) pairs for a GC sweep.
+    pub fn entries(&self) -> Vec<(CtKey, CtEntry)> {
+        self.map.iter().filter_map(|r| r.ok()).collect()
+    }
 }
 
 /// Typed handle over the `NAT` BPF map ((vni, guest ipv4) -> nat config).

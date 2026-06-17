@@ -2,6 +2,7 @@ pub mod pb {
     tonic::include_proto!("dpdkironcore.v1");
 }
 
+mod conntrack_gc;
 mod control;
 mod grpc;
 mod loader;
@@ -168,6 +169,9 @@ async fn main() -> anyhow::Result<()> {
                 parse_mac(&gateway_mac)?,
                 underlay,
             )?;
+            if let Some(ct) = ctrl.take_conntrack() {
+                tokio::spawn(conntrack_gc::run(ct, std::time::Duration::from_secs(10)));
+            }
             let svc = grpc::Service {
                 state: std::sync::Arc::new(state::State::default()),
                 control: Some(std::sync::Arc::new(ctrl)),
@@ -369,6 +373,9 @@ async fn main() -> anyhow::Result<()> {
                     },
                 )?;
             }
+
+            let ct = maps::Conntrack::open(&mut ebpf)?;
+            tokio::spawn(conntrack_gc::run(ct, std::time::Duration::from_secs(10)));
 
             println!(
                 "bringup: uplink={uplink} guests={} routes={} vips={} lbs={} nats={}; ctrl-c to stop",
