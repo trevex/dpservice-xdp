@@ -1,7 +1,7 @@
 use anyhow::Context;
 use aya::maps::{Array, HashMap, MapData};
 use aya::Ebpf;
-use xdp_dp_common::{Config, IfaceKey, IfaceValue};
+use xdp_dp_common::{Config, IfaceKey, IfaceValue, PortMeta, RouteKey, RouteValue};
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
 // Exercised by the roundtrip test now; wired into the gRPC control plane in Task 12.
@@ -51,6 +51,55 @@ impl ConfigMap {
     /// Read entry 0.
     pub fn get(&self) -> anyhow::Result<Config> {
         self.map.get(&0, 0).context("read CONFIG[0]")
+    }
+}
+
+/// Typed handle over the `PORT_META` BPF map (ifindex -> per-port metadata).
+#[allow(dead_code)]
+pub struct PortMetaMap {
+    map: HashMap<MapData, u32, PortMeta>,
+}
+
+#[allow(dead_code)]
+impl PortMetaMap {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(
+            ebpf.take_map("PORT_META")
+                .context("PORT_META map missing")?,
+        )?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, ifindex: u32, meta: PortMeta) -> anyhow::Result<()> {
+        self.map
+            .insert(ifindex, meta, 0)
+            .context("insert port_meta")
+    }
+
+    pub fn get(&self, ifindex: u32) -> Option<PortMeta> {
+        self.map.get(&ifindex, 0).ok()
+    }
+}
+
+/// Typed handle over the `ROUTES` BPF map.
+#[allow(dead_code)]
+pub struct Routes {
+    map: HashMap<MapData, RouteKey, RouteValue>,
+}
+
+#[allow(dead_code)]
+impl Routes {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(ebpf.take_map("ROUTES").context("ROUTES map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, key: RouteKey, val: RouteValue) -> anyhow::Result<()> {
+        self.map.insert(key, val, 0).context("insert route")
+    }
+
+    pub fn get(&self, key: &RouteKey) -> Option<RouteValue> {
+        self.map.get(key, 0).ok()
     }
 }
 
