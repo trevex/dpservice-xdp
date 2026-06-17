@@ -5,11 +5,12 @@ use aya_ebpf::{
 };
 use xdp_dp_common::{Local, RouteValue};
 
-use crate::parse::{write16, write6, ETH_LEN, ETH_P_IPV6, IPPROTO_IPIP, IPV6_LEN};
+use crate::parse::{write16, write6, ETH_LEN, ETH_P_IPV6, IPV6_LEN};
 
 /// Encapsulate the current inner IPv4 frame into Eth+IPv6 toward `route.nexthop_ipv6` and
 /// redirect out the local uplink. `inner_len` = (frame len - inner ETH_LEN), captured BEFORE
-/// adjust_head.
+/// adjust_head. `inner_proto` = IPv6 next-header byte (e.g. IPPROTO_IPIP for IPv4, IPPROTO_IPV6
+/// for IPv6).
 #[inline(always)]
 pub fn encap_and_redirect(
     ctx: &XdpContext,
@@ -17,6 +18,7 @@ pub fn encap_and_redirect(
     src_underlay: &[u8; 16],
     route: &RouteValue,
     inner_len: u16,
+    inner_proto: u8,
 ) -> Result<u32, ()> {
     if unsafe { bpf_xdp_adjust_head(ctx.ctx, -(IPV6_LEN as i32)) } != 0 {
         return Err(());
@@ -39,7 +41,7 @@ pub fn encap_and_redirect(
         *ip.add(2) = 0;
         *ip.add(3) = 0;
         core::ptr::write_unaligned(ip.add(4) as *mut u16, inner_len.to_be());
-        *ip.add(6) = IPPROTO_IPIP;
+        *ip.add(6) = inner_proto;
         *ip.add(7) = 64;
         write16(ip.add(8), src_underlay);
         write16(ip.add(24), &route.nexthop_ipv6);

@@ -196,6 +196,7 @@ impl Control {
                 guest_mac: mac,
                 _pad: [0; 2],
                 underlay_ipv6,
+                gateway_ipv6: [0u8; 16],
             },
         )?;
         g.ifaces.upsert(

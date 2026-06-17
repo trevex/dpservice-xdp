@@ -69,6 +69,7 @@ pub struct PortMeta {
     pub guest_mac: [u8; 6],
     pub _pad: [u8; 2],
     pub underlay_ipv6: [u8; 16],
+    pub gateway_ipv6: [u8; 16],
 }
 
 impl IfaceKey {
@@ -93,6 +94,15 @@ pub struct RouteKey {
 pub struct RouteLpmData {
     pub vni: [u8; 4],
     pub ipv4: [u8; 4],
+}
+
+/// LPM-trie key data for `ROUTES6`: VNI (big-endian) + IPv6 (network order, variable prefix).
+/// prefix_len = 32 + v6_prefix_len; lookups use prefix_len = 160.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct RouteLpmData6 {
+    pub vni: [u8; 4],
+    pub ipv6: [u8; 16],
 }
 
 /// Value for the `routes` map: the underlay IPv6 nexthop (tunnel dst). MAC-free — the outer
@@ -380,6 +390,7 @@ mod user_impls {
     unsafe impl aya::Pod for PortMeta {}
     unsafe impl aya::Pod for RouteKey {}
     unsafe impl aya::Pod for RouteLpmData {}
+    unsafe impl aya::Pod for RouteLpmData6 {}
     unsafe impl aya::Pod for RouteValue {}
     unsafe impl aya::Pod for Config {}
     unsafe impl aya::Pod for Local {}
@@ -422,11 +433,15 @@ mod tests {
         assert_eq!(core::mem::size_of::<Local>(), 32);
         // LPM key data: 4 (vni be) + 4 (ipv4) = 8.
         assert_eq!(core::mem::size_of::<RouteLpmData>(), 8);
+        // LPM key data v6: 4 (vni be) + 16 (ipv6) = 20.
+        assert_eq!(core::mem::size_of::<RouteLpmData6>(), 20);
     }
 
     #[test]
     fn port_meta_and_iface_layout() {
-        assert_eq!(core::mem::size_of::<PortMeta>(), 36);
+        // 4 (vni) + 4 (guest_ipv4) + 4 (gateway_ipv4) + 6 (guest_mac) + 2 (_pad)
+        // + 16 (underlay_ipv6) + 16 (gateway_ipv6) = 52.
+        assert_eq!(core::mem::size_of::<PortMeta>(), 52);
         assert_eq!(core::mem::size_of::<IfaceValue>(), 32);
         assert_eq!(core::mem::align_of::<PortMeta>(), 4);
     }

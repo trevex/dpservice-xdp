@@ -5,7 +5,7 @@ use aya_ebpf::{
 use xdp_dp_common::{
     Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
     LbValue, Local, MaglevKey, MeterState, NatKey, NatValue, NeighborNatEntry, PortMeta,
-    RouteLpmData, RouteValue, UnderlayValue, VipKey,
+    RouteLpmData, RouteLpmData6, RouteValue, UnderlayValue, VipKey,
 };
 
 #[map]
@@ -14,6 +14,8 @@ pub static INTERFACES: HashMap<IfaceKey, IfaceValue> = HashMap::with_max_entries
 // BPF_F_NO_PREALLOC, REQUIRED for LPM tries (the load fails without it).
 #[map]
 pub static ROUTES: LpmTrie<RouteLpmData, RouteValue> = LpmTrie::with_max_entries(65536, 1);
+#[map]
+pub static ROUTES6: LpmTrie<RouteLpmData6, RouteValue> = LpmTrie::with_max_entries(65536, 1);
 #[map]
 pub static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 #[map]
