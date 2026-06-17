@@ -3,7 +3,7 @@ use aya_ebpf::{
     helpers::{bpf_redirect, bpf_xdp_adjust_head},
     programs::XdpContext,
 };
-use xdp_dp_common::{IfaceKey, VipKey};
+use xdp_dp_common::{IfaceKey, VipKey, CT_REWRITE_DST};
 
 use crate::arp_nd::GW_MAC;
 use crate::maps::INTERFACES;
@@ -41,7 +41,19 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     // DNAT in place (pre-adjust_head the inner IPv4 is at ETH_LEN + IPV6_LEN), and deliver there.
     let lb_backend = crate::lb::lb_select_dnat(ctx, ETH_LEN + IPV6_LEN, 0);
     let nat_guest = if lb_backend.is_none() {
-        crate::nat::nat_dnat_ingress(ctx, ETH_LEN + IPV6_LEN)
+        let d = ctx.data();
+        let de = ctx.data_end();
+        match crate::conntrack::ct_key(d, de, ETH_LEN + IPV6_LEN) {
+            Some(key) => match unsafe { crate::maps::CONNTRACK.get(&key) } {
+                Some(e) if e.flags & CT_REWRITE_DST != 0 => {
+                    let e = *e;
+                    crate::conntrack::ct_apply(ctx, ETH_LEN + IPV6_LEN, &e);
+                    Some(e.xlate_ip)
+                }
+                _ => None,
+            },
+            None => None,
+        }
     } else {
         None
     };

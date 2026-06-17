@@ -4,7 +4,7 @@ use aya_ebpf::{
 };
 use xdp_dp_common::{
     Config, CtEntry, CtKey, IfaceKey, IfaceValue, InspectEntry, LbKey, LbValue, Local, MaglevKey,
-    NatCtVal, NatKey, NatValue, PortMeta, RouteKey, RouteValue, VipKey,
+    NatKey, NatValue, PortMeta, RouteKey, RouteValue, VipKey,
 };
 
 #[map]
@@ -33,5 +33,3 @@ pub static MAGLEV: HashMap<MaglevKey, [u8; 4]> = HashMap::with_max_entries(65536
 pub static CONNTRACK: LruHashMap<CtKey, CtEntry> = LruHashMap::with_max_entries(1_048_576, 0);
 #[map]
 pub static NAT: HashMap<NatKey, NatValue> = HashMap::with_max_entries(1024, 0);
-#[map]
-pub static NAT_CT: LruHashMap<CtKey, NatCtVal> = LruHashMap::with_max_entries(65536, 0);

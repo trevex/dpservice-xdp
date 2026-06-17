@@ -155,13 +155,6 @@ pub struct CtKey {
     pub _pad: [u8; 3],
 }
 
-/// Conntrack value: the original LB IPv4 to restore on the reverse path.
-#[repr(C)]
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
-pub struct CtVal {
-    pub lb_ipv4: [u8; 4],
-}
-
 /// NAT-GW config key: (vni, local guest IPv4).
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
@@ -179,19 +172,9 @@ pub struct NatValue {
     pub port_max: u16,
 }
 
-/// NAT conntrack value: an address + L4 port. Reverse entries hold the guest (ipv4, l4) to
-/// restore on ingress; forward entries hold the (nat_ipv4, nat_port) allocated for the flow.
-#[repr(C)]
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
-pub struct NatCtVal {
-    pub ipv4: [u8; 4],
-    pub port: u16,
-    pub _pad: [u8; 2],
-}
-
 /// Unified conntrack entry value. Keyed by the 5-tuple (`CtKey`) of the packet that will be SEEN;
 /// the datapath's `ct_apply` rewrites that packet's src or dst address (+L4 port) to
-/// `xlate_ip`/`xlate_port`. Replaces the feature-private `CtVal`/`NatCtVal` (removed later in M5).
+/// `xlate_ip`/`xlate_port`. Replaces the feature-private `CtVal`/`NatCtVal` (removed in M5 Task 3).
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct CtEntry {
@@ -262,10 +245,8 @@ mod user_impls {
     unsafe impl aya::Pod for LbValue {}
     unsafe impl aya::Pod for MaglevKey {}
     unsafe impl aya::Pod for CtKey {}
-    unsafe impl aya::Pod for CtVal {}
     unsafe impl aya::Pod for NatKey {}
     unsafe impl aya::Pod for NatValue {}
-    unsafe impl aya::Pod for NatCtVal {}
     unsafe impl aya::Pod for CtEntry {}
 }
 
@@ -317,14 +298,12 @@ mod tests {
         assert_eq!(core::mem::size_of::<LbValue>(), 8);
         assert_eq!(core::mem::size_of::<MaglevKey>(), 8);
         assert_eq!(core::mem::size_of::<CtKey>(), 16);
-        assert_eq!(core::mem::size_of::<CtVal>(), 4);
     }
 
     #[test]
     fn nat_layouts() {
         assert_eq!(core::mem::size_of::<NatKey>(), 8);
         assert_eq!(core::mem::size_of::<NatValue>(), 8);
-        assert_eq!(core::mem::size_of::<NatCtVal>(), 8);
     }
 
     #[test]

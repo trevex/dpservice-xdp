@@ -2,8 +2,8 @@ use anyhow::Context;
 use aya::maps::{Array, HashMap, MapData};
 use aya::Ebpf;
 use xdp_dp_common::{
-    Config, CtKey, CtVal, IfaceKey, IfaceValue, InspectEntry, LbKey, LbValue, Local, MaglevKey,
-    NatCtVal, NatKey, NatValue, PortMeta, RouteKey, RouteValue, VipKey,
+    Config, CtEntry, CtKey, IfaceKey, IfaceValue, InspectEntry, LbKey, LbValue, Local, MaglevKey,
+    NatKey, NatValue, PortMeta, RouteKey, RouteValue, VipKey,
 };
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
@@ -221,7 +221,7 @@ impl Maglev {
 /// Typed handle over the `CONNTRACK` BPF map (LRU hash map).
 #[allow(dead_code)]
 pub struct Conntrack {
-    map: HashMap<MapData, CtKey, CtVal>,
+    map: HashMap<MapData, CtKey, CtEntry>,
 }
 
 #[allow(dead_code)]
@@ -234,7 +234,7 @@ impl Conntrack {
         Ok(Self { map })
     }
 
-    pub fn upsert(&mut self, key: CtKey, val: CtVal) -> anyhow::Result<()> {
+    pub fn upsert(&mut self, key: CtKey, val: CtEntry) -> anyhow::Result<()> {
         self.map.insert(key, val, 0).context("insert conntrack")
     }
 
@@ -242,7 +242,7 @@ impl Conntrack {
         self.map.remove(key).context("remove conntrack")
     }
 
-    pub fn get(&self, key: &CtKey) -> Option<CtVal> {
+    pub fn get(&self, key: &CtKey) -> Option<CtEntry> {
         self.map.get(key, 0).ok()
     }
 }
@@ -270,20 +270,6 @@ impl Nat {
 
     pub fn get(&self, key: &NatKey) -> Option<NatValue> {
         self.map.get(key, 0).ok()
-    }
-}
-
-/// Typed handle over the `NAT_CT` BPF LRU map (5-tuple -> NAT translation).
-#[allow(dead_code)]
-pub struct NatCt {
-    map: HashMap<MapData, CtKey, NatCtVal>,
-}
-
-#[allow(dead_code)]
-impl NatCt {
-    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
-        let map = HashMap::try_from(ebpf.take_map("NAT_CT").context("NAT_CT map missing")?)?;
-        Ok(Self { map })
     }
 }
 
