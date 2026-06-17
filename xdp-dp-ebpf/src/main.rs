@@ -6,6 +6,7 @@ mod conntrack;
 mod csum;
 mod egress;
 mod encap;
+mod firewall;
 mod ingress;
 mod inspect;
 mod lb;
