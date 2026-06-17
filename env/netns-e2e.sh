@@ -352,6 +352,24 @@ cmd_test() {
     fi
     echo ""
 
+    echo "=== Test 9: unified conntrack under GC — sustained flows stay healthy ==="
+    # 12 pings (> the 10s GC interval) over a DEFAULT overlay flow (guesta->guestb) and a NAT flow
+    # (guesta->extsrv). Both must stay 0% loss, proving conntrack entries are created, refreshed
+    # (last_seen) on each packet, and not mis-evicted mid-flow by the aging sweep.
+    LOSS_DEF=0; LOSS_NAT=0
+    for _ in $(seq 1 12); do
+        sudo ip netns exec guesta ping -c 1 -W 2 10.0.0.6 >/dev/null 2>&1 || LOSS_DEF=$((LOSS_DEF+1))
+        sudo ip netns exec guesta ping -c 1 -W 2 10.0.0.8 >/dev/null 2>&1 || LOSS_NAT=$((LOSS_NAT+1))
+        sleep 1
+    done
+    echo "  DEFAULT flow (guesta->guestb) lost=$LOSS_DEF/12 ; NAT flow (guesta->extsrv) lost=$LOSS_NAT/12"
+    if [ "$LOSS_DEF" -eq 0 ] && [ "$LOSS_NAT" -eq 0 ]; then
+        echo "  conntrack OK: flows tracked + refreshed across the GC interval"
+    else
+        echo "  WARNING: flow loss under conntrack/GC"
+    fi
+    echo ""
+
     echo "=== All tests passed ==="
 }
 

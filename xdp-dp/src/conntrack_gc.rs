@@ -43,3 +43,35 @@ pub async fn run(mut ct: Conntrack, interval: Duration) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xdp_dp_common::{CtEntry, TCP_ESTABLISHED, TCP_NONE};
+
+    fn entry(tcp_state: u8, last_seen: u64) -> CtEntry {
+        CtEntry {
+            last_seen,
+            tcp_state,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn established_tcp_gets_long_timeout() {
+        assert_eq!(
+            timeout_ns(&entry(TCP_ESTABLISHED, 0)),
+            TCP_ESTABLISHED_TIMEOUT_NS
+        );
+        assert_eq!(timeout_ns(&entry(TCP_NONE, 0)), DEFAULT_TIMEOUT_NS);
+    }
+
+    #[test]
+    fn idle_beyond_timeout_is_stale() {
+        let now = 60 * 1_000_000_000u64; // 60s
+        let fresh = entry(TCP_NONE, now - 5 * 1_000_000_000); // 5s idle -> keep
+        let old = entry(TCP_NONE, now - 40 * 1_000_000_000); // 40s idle -> evict (>30s)
+        assert!(now.saturating_sub(fresh.last_seen) <= timeout_ns(&fresh));
+        assert!(now.saturating_sub(old.last_seen) > timeout_ns(&old));
+    }
+}
