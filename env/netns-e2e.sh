@@ -76,6 +76,8 @@ cmd_up() {
     sudo ip netns exec guesta ip addr add 10.0.0.5/32 dev gA 2>/dev/null || true
     sudo ip netns exec guesta ip route add 10.0.0.1/32 dev gA 2>/dev/null || true
     sudo ip netns exec guesta ip route add default via 10.0.0.1 2>/dev/null || true
+    # LB backend: own the LB IP 10.0.0.200 as a secondary (anycast — backends reply from it).
+    sudo ip netns exec guesta ip addr add 10.0.0.200/32 dev gA 2>/dev/null || true
 
     # ---- hypa second guest link: gA2-h in hypa <-> gA2 in guesta2 ----
     if ! sudo ip netns exec hypa ip link show gA2-h &>/dev/null; then
@@ -86,6 +88,7 @@ cmd_up() {
     sudo ip netns exec guesta2 ip addr add 10.0.0.7/32 dev gA2 2>/dev/null || true
     sudo ip netns exec guesta2 ip route add 10.0.0.1/32 dev gA2 2>/dev/null || true
     sudo ip netns exec guesta2 ip route add default via 10.0.0.1 2>/dev/null || true
+    sudo ip netns exec guesta2 ip addr add 10.0.0.200/32 dev gA2 2>/dev/null || true  # LB backend (anycast)
 
     # ---- hypb uplink: uB in hypb <-> uB-br on bridge ----
     if ! sudo ip netns exec hypb ip link show uB &>/dev/null; then
@@ -115,6 +118,7 @@ cmd_up() {
     sudo ip netns exec extsrv ip addr add 10.0.0.8/32 dev gE 2>/dev/null || true
     sudo ip netns exec extsrv ip route add 10.0.0.1/32 dev gE 2>/dev/null || true
     sudo ip netns exec extsrv ip route add default via 10.0.0.1 2>/dev/null || true
+    sudo ip netns exec extsrv ip addr add 10.0.0.200/32 dev gE 2>/dev/null || true  # remote LB backend (anycast)
 
     # ---- second tenant (vni=100), OVERLAPPING IP 10.0.0.5 ----
     # guestc on hypa (gC-h<->gC) and guestd on hypb (gD-h<->gD), both 10.0.0.5 in vni=100.
@@ -212,9 +216,10 @@ cmd_up() {
         --guest "gC-h=10.0.0.5=${GC_MAC}=fd00:a::205=100" \
         --remote "10.0.0.6=fd00:b::6=0" \
         --vip "10.0.0.7=10.0.0.100" \
-        --lb "10.0.0.200:0:1" \
-        --lb-target "10.0.0.200:0:1=10.0.0.5" \
-        --lb-target "10.0.0.200:0:1=10.0.0.7" \
+        --lb "10.0.0.200:0:1:fd00:a::200" \
+        --lb-target "10.0.0.200:0:1:fd00:a::200=fd00:a::5" \
+        --lb-target "10.0.0.200:0:1:fd00:a::200=fd00:a::7" \
+        --lb-target "10.0.0.200:0:1:fd00:a::200=fd00:b::8" \
         --remote "10.0.0.8=fd00:b::8=0" \
         --remote "10.0.0.0/24=fd00:b::8=0" \
         --external "10.0.0.8" \
@@ -235,7 +240,7 @@ cmd_up() {
         --remote "10.0.0.5=fd00:a::5=0" \
         --remote "10.0.0.7=fd00:a::7=0" \
         --remote "10.0.0.100=fd00:a::7=0" \
-        --remote "10.0.0.200=fd00:a::5=0" \
+        --remote "10.0.0.200=fd00:a::200=0" \
         --remote "10.0.0.50=fd00:a::5=0" \
         --remote "10.0.0.5=fd00:a::205=100" \
         --firewall-enforce true \
@@ -332,45 +337,47 @@ cmd_test() {
     fi
     echo ""
 
-    echo "=== Test 7: LB Maglev — guestb -> 10.0.0.200 spread over guesta(10.0.0.5)+guesta2(10.0.0.7) ==="
-    # Each `ping -c 1` is a fresh process with a distinct ICMP id, so the 5-tuple hash places
-    # flows across BOTH backends (distribution). The DNAT'd echo requests arrive at the backend
-    # guests with the backend's own IP as dest; capture them on gA / gA2. The backends' replies
-    # are reverse-SNAT'd by conntrack back to the LB IP, so guestb must see replies from
-    # 10.0.0.200 (proves the conntrack return path + checksum correctness).
+    echo "=== Test 7: LB (dpservice underlay-forwarding) — guestb -> 10.0.0.200 across guesta+guesta2 (local) + extsrv (REMOTE) ==="
+    # Backends own 10.0.0.200 (anycast). Maglev selects a backend NODE by its underlay; the LB does
+    # NO inner DNAT, so backends reply naturally from 10.0.0.200 (no reverse-SNAT). extsrv lives on
+    # the PEER hypervisor — Maglev-selecting it exercises the re-forward (re-encap) path. Each
+    # `ping -c 1` is a distinct ICMP id, so the 5-tuple hash spreads flows across the 3 backends.
     if [[ -n "$TCPDUMP" ]]; then
-        sudo ip netns exec guesta  "$TCPDUMP" -ni gA  'icmp' -c 50 >/tmp/lb-a.txt  2>&1 &
+        sudo ip netns exec guesta  "$TCPDUMP" -ni gA  'icmp and dst 10.0.0.200' -c 60 >/tmp/lb-a.txt  2>&1 &
         TDA=$!
-        sudo ip netns exec guesta2 "$TCPDUMP" -ni gA2 'icmp' -c 50 >/tmp/lb-a2.txt 2>&1 &
+        sudo ip netns exec guesta2 "$TCPDUMP" -ni gA2 'icmp and dst 10.0.0.200' -c 60 >/tmp/lb-a2.txt 2>&1 &
         TDA2=$!
-        sudo ip netns exec guestb  "$TCPDUMP" -ni gB  'icmp' -c 50 >/tmp/lb-b.txt  2>&1 &
+        sudo ip netns exec extsrv  "$TCPDUMP" -ni gE  'icmp and dst 10.0.0.200' -c 60 >/tmp/lb-e.txt  2>&1 &
+        TDE=$!
+        sudo ip netns exec guestb  "$TCPDUMP" -ni gB  'icmp' -c 60 >/tmp/lb-b.txt  2>&1 &
         TDB=$!
         sleep 0.3
     fi
     LOSS=0
-    for _ in $(seq 1 20); do
+    for _ in $(seq 1 24); do
         sudo ip netns exec guestb ping -c 1 -W 2 10.0.0.200 >/dev/null 2>&1 || LOSS=$((LOSS + 1))
     done
-    echo "  20 flows to 10.0.0.200: $((20 - LOSS)) replied, $LOSS lost"
+    echo "  24 flows to 10.0.0.200: $((24 - LOSS)) replied, $LOSS lost"
     sleep 1
     if [[ -n "$TCPDUMP" ]]; then
-        sudo kill "$TDA" "$TDA2" "$TDB" 2>/dev/null || true
-        wait "$TDA" "$TDA2" "$TDB" 2>/dev/null || true
+        sudo kill "$TDA" "$TDA2" "$TDE" "$TDB" 2>/dev/null || true
+        wait "$TDA" "$TDA2" "$TDE" "$TDB" 2>/dev/null || true
         A=$(grep -c 'echo request' /tmp/lb-a.txt  || true)
         B=$(grep -c 'echo request' /tmp/lb-a2.txt || true)
-        echo "  backend guesta(10.0.0.5) hits=$A   guesta2(10.0.0.7) hits=$B"
-        if [[ "${A:-0}" -gt 0 && "${B:-0}" -gt 0 ]]; then
-            echo "  LB distribution OK (both backends used)"
+        E=$(grep -c 'echo request' /tmp/lb-e.txt  || true)
+        echo "  hits  guesta=$A  guesta2=$B  extsrv(remote)=$E"
+        if [[ "${A:-0}" -gt 0 && "${B:-0}" -gt 0 && "${E:-0}" -gt 0 ]]; then
+            echo "  LB distribution OK across all 3 backends (incl. the REMOTE one via re-forward)"
         else
-            echo "  WARNING: LB did not distribute across both backends"
+            echo "  WARNING: not all backends used (remote re-forward may be broken)"
         fi
-        echo "  --- conntrack reverse-SNAT proof: replies to guestb must be sourced from 10.0.0.200 ---"
+        echo "  --- anycast proof: replies to guestb must be sourced from the LB IP 10.0.0.200 ---"
         if grep -qE '10\.0\.0\.200 > 10\.0\.0\.6: ICMP echo reply' /tmp/lb-b.txt; then
-            echo "  LB return SNAT proof OK: replies sourced from the LB IP"
+            echo "  anycast OK: replies sourced from 10.0.0.200 (backends own the LB IP, no reverse-SNAT)"
         else
             echo "  WARNING: no LB-sourced replies seen at guestb"
         fi
-        rm -f /tmp/lb-a.txt /tmp/lb-a2.txt /tmp/lb-b.txt
+        rm -f /tmp/lb-a.txt /tmp/lb-a2.txt /tmp/lb-e.txt /tmp/lb-b.txt
     fi
     echo ""
 
