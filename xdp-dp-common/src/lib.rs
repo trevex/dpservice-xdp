@@ -203,6 +203,94 @@ pub const TCP_ESTABLISHED: u8 = 3;
 pub const TCP_FINWAIT: u8 = 4;
 pub const TCP_RST_FIN: u8 = 5;
 
+/// Max firewall rules scanned per interface per direction in the datapath (bounded loop).
+pub const FW_MAX_RULES: u32 = 16;
+
+/// Firewall rule slot key: (interface ifindex, slot index 0..FW_MAX_RULES).
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct FwRuleKey {
+    pub ifindex: u32,
+    pub idx: u32,
+}
+
+/// A single firewall rule (fixed-size POD). Ports are inclusive ranges (0..=65535 = any);
+/// icmp_type/icmp_code 0xffff = any; proto 0 = any; action 1=accept/0=drop; direction
+/// 1=egress/0=ingress; enabled 1 = slot in use.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct FwRule {
+    pub src_ip: [u8; 4],
+    pub src_mask: [u8; 4],
+    pub dst_ip: [u8; 4],
+    pub dst_mask: [u8; 4],
+    pub src_port_min: u16,
+    pub src_port_max: u16,
+    pub dst_port_min: u16,
+    pub dst_port_max: u16,
+    pub icmp_type: u16,
+    pub icmp_code: u16,
+    pub proto: u8,
+    pub action: u8,
+    pub direction: u8,
+    pub enabled: u8,
+}
+
+/// Per-interface rule counts (so empty-direction => ACCEPT can be decided cheaply).
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct FwMeta {
+    pub ingress_count: u32,
+    pub egress_count: u32,
+}
+
+pub const FW_DIR_INGRESS: u8 = 0;
+pub const FW_DIR_EGRESS: u8 = 1;
+pub const FW_ACTION_DROP: u8 = 0;
+pub const FW_ACTION_ACCEPT: u8 = 1;
+
+/// Pure firewall match (no_std; used by the datapath and host-tested). Returns true if `r` matches
+/// the packet selectors. `icmp_type`/`icmp_code` are ignored unless `proto == 1`.
+#[inline]
+pub fn fw_rule_matches(
+    r: &FwRule,
+    src: &[u8; 4],
+    dst: &[u8; 4],
+    proto: u8,
+    sport: u16,
+    dport: u16,
+    icmp_type: u16,
+    icmp_code: u16,
+) -> bool {
+    if r.enabled == 0 {
+        return false;
+    }
+    if r.proto != 0 && r.proto != proto {
+        return false;
+    }
+    for i in 0..4 {
+        if src[i] & r.src_mask[i] != r.src_ip[i] & r.src_mask[i] {
+            return false;
+        }
+        if dst[i] & r.dst_mask[i] != r.dst_ip[i] & r.dst_mask[i] {
+            return false;
+        }
+    }
+    match proto {
+        6 | 17 => {
+            sport >= r.src_port_min
+                && sport <= r.src_port_max
+                && dport >= r.dst_port_min
+                && dport <= r.dst_port_max
+        }
+        1 => {
+            (r.icmp_type == 0xffff || icmp_type == r.icmp_type)
+                && (r.icmp_code == 0xffff || icmp_code == r.icmp_code)
+        }
+        _ => true,
+    }
+}
+
 /// Single-entry `CONFIG` map: per-hypervisor datapath parameters for the PoC's
 /// CONFIG-driven single-peer overlay (one guest + one peer hypervisor). The XDP programs
 /// read entry 0; the control plane populates it. MACs/ifindexes are filled at e2e time.
@@ -248,6 +336,9 @@ mod user_impls {
     unsafe impl aya::Pod for NatKey {}
     unsafe impl aya::Pod for NatValue {}
     unsafe impl aya::Pod for CtEntry {}
+    unsafe impl aya::Pod for FwRuleKey {}
+    unsafe impl aya::Pod for FwRule {}
+    unsafe impl aya::Pod for FwMeta {}
 }
 
 #[cfg(test)]
@@ -311,6 +402,128 @@ mod tests {
         // 8 (last_seen) + 4 (xlate_ip) + 2 (xlate_port) + 1 (flags) + 1 (tcp_state)
         // + 1 (fwall_action) + 7 (_pad) = 24, u64-aligned.
         assert_eq!(core::mem::size_of::<CtEntry>(), 24);
+    }
+
+    #[test]
+    fn fw_types_layout() {
+        // 4 (ifindex) + 4 (idx) = 8.
+        assert_eq!(core::mem::size_of::<FwRuleKey>(), 8);
+        // 4*4 (ip/mask pairs) + 4*2 (port ranges) + 2+2 (icmp) + 4 (proto/action/dir/enabled) = 32.
+        assert_eq!(core::mem::size_of::<FwRule>(), 32);
+        // 4 (ingress_count) + 4 (egress_count) = 8.
+        assert_eq!(core::mem::size_of::<FwMeta>(), 8);
+    }
+
+    #[test]
+    fn fw_match_proto_and_ports() {
+        let r = FwRule {
+            src_ip: [0, 0, 0, 0],
+            src_mask: [0, 0, 0, 0],
+            dst_ip: [10, 0, 0, 5],
+            dst_mask: [255, 255, 255, 255],
+            src_port_min: 0,
+            src_port_max: 65535,
+            dst_port_min: 80,
+            dst_port_max: 80,
+            icmp_type: 0xffff,
+            icmp_code: 0xffff,
+            proto: 6,
+            action: FW_ACTION_ACCEPT,
+            direction: FW_DIR_INGRESS,
+            enabled: 1,
+        };
+        assert!(fw_rule_matches(
+            &r,
+            &[1, 2, 3, 4],
+            &[10, 0, 0, 5],
+            6,
+            12345,
+            80,
+            0,
+            0
+        ));
+        assert!(!fw_rule_matches(
+            &r,
+            &[1, 2, 3, 4],
+            &[10, 0, 0, 5],
+            6,
+            12345,
+            81,
+            0,
+            0
+        ));
+        assert!(!fw_rule_matches(
+            &r,
+            &[1, 2, 3, 4],
+            &[10, 0, 0, 5],
+            17,
+            12345,
+            80,
+            0,
+            0
+        ));
+        assert!(!fw_rule_matches(
+            &r,
+            &[1, 2, 3, 4],
+            &[10, 0, 0, 6],
+            6,
+            12345,
+            80,
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    fn fw_match_icmp_and_any() {
+        let r = FwRule {
+            src_ip: [0; 4],
+            src_mask: [0; 4],
+            dst_ip: [0; 4],
+            dst_mask: [0; 4],
+            src_port_min: 0,
+            src_port_max: 65535,
+            dst_port_min: 0,
+            dst_port_max: 65535,
+            icmp_type: 8,
+            icmp_code: 0xffff,
+            proto: 1,
+            action: FW_ACTION_ACCEPT,
+            direction: FW_DIR_INGRESS,
+            enabled: 1,
+        };
+        assert!(fw_rule_matches(
+            &r,
+            &[1, 1, 1, 1],
+            &[2, 2, 2, 2],
+            1,
+            0,
+            0,
+            8,
+            0
+        ));
+        assert!(!fw_rule_matches(
+            &r,
+            &[1, 1, 1, 1],
+            &[2, 2, 2, 2],
+            1,
+            0,
+            0,
+            0,
+            0
+        ));
+        let mut d = r;
+        d.enabled = 0;
+        assert!(!fw_rule_matches(
+            &d,
+            &[1, 1, 1, 1],
+            &[2, 2, 2, 2],
+            1,
+            0,
+            0,
+            8,
+            0
+        ));
     }
 }
 
