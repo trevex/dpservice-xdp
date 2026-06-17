@@ -8,14 +8,30 @@ pub struct IfaceKey {
     pub ipv4: [u8; 4],
 }
 
-/// Value for the `interfaces` map: where to deliver/encap for this overlay IP.
+/// Value for the `interfaces` map: how to reach/deliver to an overlay IP.
 #[repr(C)]
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct IfaceValue {
-    /// Host-side tap ifindex for local delivery (0 if remote-only).
+    /// Host-side tap ifindex for local delivery (0 if remote).
     pub tap_ifindex: u32,
-    /// Underlay IPv6 endpoint of the owning hypervisor (the tunnel dst).
+    /// 1 = interface is local to this hypervisor, 0 = remote.
+    pub is_local: u32,
+    /// Underlay IPv6 endpoint of the owning hypervisor (tunnel dst for remote).
     pub underlay_ipv6: [u8; 16],
+    /// Guest MAC (inner eth dst for local delivery).
+    pub guest_mac: [u8; 6],
+    pub _pad: [u8; 2],
+}
+
+/// Per-port metadata, keyed by the guest tap's host-side ifindex.
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct PortMeta {
+    pub vni: u32,
+    pub guest_ipv4: [u8; 4],
+    pub gateway_ipv4: [u8; 4],
+    pub guest_mac: [u8; 6],
+    pub _pad: [u8; 2],
 }
 
 impl IfaceKey {
@@ -72,6 +88,7 @@ mod user_impls {
     use super::*;
     unsafe impl aya::Pod for IfaceKey {}
     unsafe impl aya::Pod for IfaceValue {}
+    unsafe impl aya::Pod for PortMeta {}
     unsafe impl aya::Pod for RouteKey {}
     unsafe impl aya::Pod for RouteValue {}
     unsafe impl aya::Pod for Config {}
@@ -95,6 +112,13 @@ mod tests {
         // 4 (vni) + 4 (prefix_len) + 4 (ipv4) = 12; 4 (nexthop_vni) + 16 (ipv6) = 20.
         assert_eq!(core::mem::size_of::<RouteKey>(), 12);
         assert_eq!(core::mem::size_of::<RouteValue>(), 20);
+    }
+
+    #[test]
+    fn port_meta_and_iface_layout() {
+        assert_eq!(core::mem::size_of::<PortMeta>(), 20);
+        assert_eq!(core::mem::size_of::<IfaceValue>(), 32);
+        assert_eq!(core::mem::align_of::<PortMeta>(), 4);
     }
 
     #[test]

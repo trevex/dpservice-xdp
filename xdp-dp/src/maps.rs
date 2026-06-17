@@ -67,7 +67,10 @@ mod tests {
         let k = IfaceKey::new(100, [10, 0, 0, 5]);
         let v = IfaceValue {
             tap_ifindex: 7,
+            is_local: 1,
             underlay_ipv6: [0xfd; 16],
+            guest_mac: [2, 0, 0, 0, 0, 5],
+            _pad: [0; 2],
         };
         ifaces.upsert(k, v).expect("upsert");
         assert_eq!(ifaces.get(&k), Some(v));
