@@ -1,9 +1,10 @@
 use aya_ebpf::{
     macros::map,
-    maps::{Array, HashMap},
+    maps::{Array, HashMap, LruHashMap},
 };
 use xdp_dp_common::{
-    Config, IfaceKey, IfaceValue, InspectEntry, Local, PortMeta, RouteKey, RouteValue, VipKey,
+    Config, CtKey, CtVal, IfaceKey, IfaceValue, InspectEntry, LbKey, LbValue, Local, MaglevKey,
+    PortMeta, RouteKey, RouteValue, VipKey,
 };
 
 #[map]
@@ -22,3 +23,9 @@ pub static INSPECT: Array<InspectEntry> = Array::with_max_entries(1, 0);
 /// ingress DNAT.
 #[map]
 pub static VIPS: HashMap<VipKey, [u8; 4]> = HashMap::with_max_entries(1024, 0);
+#[map]
+pub static LB: HashMap<LbKey, LbValue> = HashMap::with_max_entries(1024, 0);
+#[map]
+pub static MAGLEV: HashMap<MaglevKey, [u8; 4]> = HashMap::with_max_entries(65536, 0);
+#[map]
+pub static CONNTRACK: LruHashMap<CtKey, CtVal> = LruHashMap::with_max_entries(65536, 0);

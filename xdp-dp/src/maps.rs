@@ -2,7 +2,8 @@ use anyhow::Context;
 use aya::maps::{Array, HashMap, MapData};
 use aya::Ebpf;
 use xdp_dp_common::{
-    Config, IfaceKey, IfaceValue, InspectEntry, Local, PortMeta, RouteKey, RouteValue, VipKey,
+    Config, CtKey, CtVal, IfaceKey, IfaceValue, InspectEntry, LbKey, LbValue, Local, MaglevKey,
+    PortMeta, RouteKey, RouteValue, VipKey,
 };
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
@@ -161,6 +162,87 @@ impl Vips {
     }
 
     pub fn get(&self, key: &VipKey) -> Option<[u8; 4]> {
+        self.map.get(key, 0).ok()
+    }
+}
+
+/// Typed handle over the `LB` BPF map.
+#[allow(dead_code)]
+pub struct Lb {
+    map: HashMap<MapData, LbKey, LbValue>,
+}
+
+#[allow(dead_code)]
+impl Lb {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(ebpf.take_map("LB").context("LB map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, key: LbKey, val: LbValue) -> anyhow::Result<()> {
+        self.map.insert(key, val, 0).context("insert lb")
+    }
+
+    pub fn remove(&mut self, key: &LbKey) -> anyhow::Result<()> {
+        self.map.remove(key).context("remove lb")
+    }
+
+    pub fn get(&self, key: &LbKey) -> Option<LbValue> {
+        self.map.get(key, 0).ok()
+    }
+}
+
+/// Typed handle over the `MAGLEV` BPF map.
+#[allow(dead_code)]
+pub struct Maglev {
+    map: HashMap<MapData, MaglevKey, [u8; 4]>,
+}
+
+#[allow(dead_code)]
+impl Maglev {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(ebpf.take_map("MAGLEV").context("MAGLEV map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, key: MaglevKey, val: [u8; 4]) -> anyhow::Result<()> {
+        self.map.insert(key, val, 0).context("insert maglev")
+    }
+
+    pub fn remove(&mut self, key: &MaglevKey) -> anyhow::Result<()> {
+        self.map.remove(key).context("remove maglev")
+    }
+
+    pub fn get(&self, key: &MaglevKey) -> Option<[u8; 4]> {
+        self.map.get(key, 0).ok()
+    }
+}
+
+/// Typed handle over the `CONNTRACK` BPF map (LRU hash map).
+#[allow(dead_code)]
+pub struct Conntrack {
+    map: HashMap<MapData, CtKey, CtVal>,
+}
+
+#[allow(dead_code)]
+impl Conntrack {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(
+            ebpf.take_map("CONNTRACK")
+                .context("CONNTRACK map missing")?,
+        )?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, key: CtKey, val: CtVal) -> anyhow::Result<()> {
+        self.map.insert(key, val, 0).context("insert conntrack")
+    }
+
+    pub fn remove(&mut self, key: &CtKey) -> anyhow::Result<()> {
+        self.map.remove(key).context("remove conntrack")
+    }
+
+    pub fn get(&self, key: &CtKey) -> Option<CtVal> {
         self.map.get(key, 0).ok()
     }
 }
