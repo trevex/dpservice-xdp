@@ -140,3 +140,64 @@ pub fn nat_snat_egress(ctx: &XdpContext, ip_off: usize, vni: u32, is_external: b
     }
     true
 }
+
+/// Ingress reverse DNAT. If the packet's (src, dst, ports) matches a reverse NAT conntrack entry
+/// (i.e. it is the return of a NAT'd flow to nat_ip:nat_port), restore dst IP -> guest_ip and the
+/// L4 dst port / ICMP id -> guest port (+checksums), and return Some(guest_ip) for delivery.
+#[inline(always)]
+pub fn nat_dnat_ingress(ctx: &XdpContext, ip_off: usize) -> Option<[u8; 4]> {
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + ip_off + 20 > data_end {
+        return None;
+    }
+    let p = data as *mut u8;
+    let src = unsafe { core::ptr::read_unaligned(p.add(ip_off + 12) as *const [u8; 4]) };
+    let dst = unsafe { core::ptr::read_unaligned(p.add(ip_off + 16) as *const [u8; 4]) };
+    let (proto, sport, dport) = l4_ports(data, data_end, ip_off)?;
+    let key = CtKey {
+        src_ip: src,
+        dst_ip: dst,
+        src_port: sport,
+        dst_port: dport,
+        proto,
+        _pad: [0; 3],
+    };
+    let val = match unsafe { NAT_CT.get(&key) } {
+        Some(v) => *v,
+        None => return None,
+    };
+    let guest_ip = val.ipv4;
+    let guest_port = val.port;
+    let ihl = (unsafe { *p.add(ip_off) } & 0x0f) as usize * 4;
+    unsafe {
+        core::ptr::write_unaligned(p.add(ip_off + 16) as *mut [u8; 4], guest_ip);
+        let ipc = u16::from_be(core::ptr::read_unaligned(p.add(ip_off + 10) as *const u16));
+        core::ptr::write_unaligned(
+            p.add(ip_off + 10) as *mut u16,
+            csum_replace4(ipc, &dst, &guest_ip).to_be(),
+        );
+        let l4 = ip_off + ihl;
+        if proto == IPPROTO_TCP && data + l4 + 18 <= data_end {
+            let c0 = u16::from_be(core::ptr::read_unaligned(p.add(l4 + 16) as *const u16));
+            let c1 = csum_replace4(c0, &dst, &guest_ip);
+            let c2 = csum_replace2(c1, dport, guest_port);
+            core::ptr::write_unaligned(p.add(l4 + 16) as *mut u16, c2.to_be());
+            core::ptr::write_unaligned(p.add(l4 + 2) as *mut u16, guest_port.to_be());
+        } else if proto == IPPROTO_UDP && data + l4 + 8 <= data_end {
+            let c0 = u16::from_be(core::ptr::read_unaligned(p.add(l4 + 6) as *const u16));
+            if c0 != 0 {
+                let c1 = csum_replace4(c0, &dst, &guest_ip);
+                let c2 = csum_replace2(c1, dport, guest_port);
+                core::ptr::write_unaligned(p.add(l4 + 6) as *mut u16, c2.to_be());
+            }
+            core::ptr::write_unaligned(p.add(l4 + 2) as *mut u16, guest_port.to_be());
+        } else if proto == IPPROTO_ICMP && data + l4 + 8 <= data_end {
+            let c0 = u16::from_be(core::ptr::read_unaligned(p.add(l4 + 2) as *const u16));
+            let c1 = csum_replace2(c0, dport, guest_port);
+            core::ptr::write_unaligned(p.add(l4 + 2) as *mut u16, c1.to_be());
+            core::ptr::write_unaligned(p.add(l4 + 4) as *mut u16, guest_port.to_be());
+        }
+    }
+    Some(guest_ip)
+}
