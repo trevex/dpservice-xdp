@@ -52,7 +52,7 @@ cmd_up() {
     sudo ip link set br-ul type bridge mcast_snooping 0
 
     # ---- namespaces ----
-    for ns in hypa hypb guesta guestb guesta2 extsrv guestc guestd; do
+    for ns in hypa hypb hypc guesta guestb guesta2 extsrv guestc guestd extclient; do
         sudo ip netns add "$ns" 2>/dev/null || true
         sudo ip netns exec "$ns" ip link set lo up
     done
@@ -139,18 +139,43 @@ cmd_up() {
     sudo ip netns exec guestd ip route add 10.0.0.1/32 dev gD 2>/dev/null || true
     sudo ip netns exec guestd ip route add default via 10.0.0.1 2>/dev/null || true
 
+    # ---- hypc uplink (3rd node, for neighbor-NAT): uC in hypc <-> uC-br on bridge ----
+    if ! sudo ip netns exec hypc ip link show uC &>/dev/null; then
+        sudo ip link add uC netns hypc type veth peer name uC-br
+    fi
+    sudo ip link set uC-br master br-ul 2>/dev/null || true
+    sudo ip link set uC-br up
+    sudo ip netns exec hypc ip link set uC up
+    sudo ip netns exec hypc ip -6 addr add fd00::3/64 dev uC nodad 2>/dev/null || true
+
+    # ---- hypc external client: gX-h in hypc <-> gX in extclient (10.0.0.9) ----
+    if ! sudo ip netns exec hypc ip link show gX-h &>/dev/null; then
+        sudo ip link add gX-h netns hypc type veth peer name gX netns extclient
+    fi
+    sudo ip netns exec hypc ip link set gX-h up
+    sudo ip netns exec extclient ip link set gX up
+    sudo ip netns exec extclient ip addr add 10.0.0.9/32 dev gX 2>/dev/null || true
+    sudo ip netns exec extclient ip route add 10.0.0.1/32 dev gX 2>/dev/null || true
+    sudo ip netns exec extclient ip route add default via 10.0.0.1 2>/dev/null || true
+
     # ---- ip6tables: allow bridge forwarding on br-ul ----
     # Docker sets ip6tables FORWARD policy to DROP with bridge-nf-call-ip6tables=1.
     # We add scoped ACCEPT rules for br-ul instead of touching any global sysctl.
     sudo ip6tables -I FORWARD 1 -i br-ul -o br-ul -j ACCEPT -m comment --comment "$IP6TABLES_MARK" 2>/dev/null || true
     sudo ip6tables -I FORWARD 2 -i uA-br -j ACCEPT -m comment --comment "$IP6TABLES_MARK" 2>/dev/null || true
     sudo ip6tables -I FORWARD 3 -i uB-br -j ACCEPT -m comment --comment "$IP6TABLES_MARK" 2>/dev/null || true
+    sudo ip6tables -I FORWARD 4 -i uC-br -j ACCEPT -m comment --comment "$IP6TABLES_MARK" 2>/dev/null || true
 
     # ---- static underlay neighs (bypass NDP which may be unreliable in bridges) ----
     UA_MAC=$(sudo ip netns exec hypa cat /sys/class/net/uA/address)
     UB_MAC=$(sudo ip netns exec hypb cat /sys/class/net/uB/address)
+    UC_MAC=$(sudo ip netns exec hypc cat /sys/class/net/uC/address)
     sudo ip netns exec hypa ip -6 neigh replace fd00::2 lladdr "$UB_MAC" dev uA nud permanent
     sudo ip netns exec hypb ip -6 neigh replace fd00::1 lladdr "$UA_MAC" dev uB nud permanent
+    sudo ip netns exec hypa ip -6 neigh replace fd00::3 lladdr "$UC_MAC" dev uA nud permanent
+    sudo ip netns exec hypc ip -6 neigh replace fd00::1 lladdr "$UA_MAC" dev uC nud permanent
+    sudo ip netns exec hypb ip -6 neigh replace fd00::3 lladdr "$UC_MAC" dev uB nud permanent
+    sudo ip netns exec hypc ip -6 neigh replace fd00::2 lladdr "$UB_MAC" dev uC nud permanent
 
     # ---- sanity check: underlay IPv6 ping (no XDP yet) ----
     echo "=== Underlay sanity check ==="
@@ -165,9 +190,11 @@ cmd_up() {
     GE_MAC=$(sudo ip netns exec extsrv cat /sys/class/net/gE/address)
     GC_MAC=$(sudo ip netns exec guestc cat /sys/class/net/gC/address)
     GD_MAC=$(sudo ip netns exec guestd cat /sys/class/net/gD/address)
-    echo "UA_MAC=$UA_MAC  UB_MAC=$UB_MAC"
+    GX_MAC=$(sudo ip netns exec extclient cat /sys/class/net/gX/address)
+    echo "UA_MAC=$UA_MAC  UB_MAC=$UB_MAC  UC_MAC=$UC_MAC"
     echo "GA_MAC=$GA_MAC  GB_MAC=$GB_MAC  GA2_MAC=$GA2_MAC  GE_MAC=$GE_MAC"
     echo "GC_MAC=$GC_MAC  GD_MAC=$GD_MAC  (vni=100 tenant, overlapping 10.0.0.5)"
+    echo "GX_MAC=$GX_MAC  (extclient 10.0.0.9 on hypc, for neighbor-NAT)"
 
     # NOTE: No static guest neigh entries — the XDP datapath answers ARP for 10.0.0.1 in-kernel.
     # Guests use /32 + link route + default via 10.0.0.1, so they only ARP for the gateway.
@@ -198,6 +225,10 @@ cmd_up() {
     echo $! >> "$PIDFILE"
     sudo ip netns exec guestd "$BIN" pass --iface gD &
     echo $! >> "$PIDFILE"
+    sudo "$BIN" pass --iface uC-br &
+    echo $! >> "$PIDFILE"
+    sudo ip netns exec extclient "$BIN" pass --iface gX &
+    echo $! >> "$PIDFILE"
 
     sleep 1
 
@@ -210,7 +241,7 @@ cmd_up() {
         --uplink uA \
         --local-underlay fd00::1 \
         --gateway 10.0.0.1 \
-        --gateway-mac "$UB_MAC" \
+        --gateway-mac "ff:ff:ff:ff:ff:ff" \
         --guest "gA-h=10.0.0.5=${GA_MAC}=fd00:a::5=0" \
         --guest "gA2-h=10.0.0.7=${GA2_MAC}=fd00:a::7=0" \
         --guest "gC-h=10.0.0.5=${GC_MAC}=fd00:a::205=100" \
@@ -224,6 +255,8 @@ cmd_up() {
         --remote "10.0.0.0/24=fd00:b::8=0" \
         --external "10.0.0.8" \
         --nat "10.0.0.5=10.0.0.50:20000:30000" \
+        --remote "10.0.0.9=fd00:c::9=0" \
+        --external "10.0.0.9" \
         --remote "10.0.0.6=fd00:b::206=100" &
     echo $! >> "$PIDFILE"
 
@@ -233,7 +266,7 @@ cmd_up() {
         --uplink uB \
         --local-underlay fd00::2 \
         --gateway 10.0.0.1 \
-        --gateway-mac "$UA_MAC" \
+        --gateway-mac "ff:ff:ff:ff:ff:ff" \
         --guest "gB-h=10.0.0.6=${GB_MAC}=fd00:b::6=0" \
         --guest "gE-h=10.0.0.8=${GE_MAC}=fd00:b::8=0" \
         --guest "gD-h=10.0.0.6=${GD_MAC}=fd00:b::206=100" \
@@ -245,7 +278,21 @@ cmd_up() {
         --remote "10.0.0.5=fd00:a::205=100" \
         --firewall-enforce true \
         --fw-rule "gB-h:in:accept:icmp:10.0.0.5/32:0.0.0.0/0:*" \
-        --fw-rule "gB-h:in:drop:icmp:10.0.0.7/32:0.0.0.0/0:*" &
+        --fw-rule "gB-h:in:drop:icmp:10.0.0.7/32:0.0.0.0/0:*" \
+        --underlay-marker "fd00:b::50:0" \
+        --neigh-nat "10.0.0.50:20000:30000@fd00:a::5@0" &
+    echo $! >> "$PIDFILE"
+
+    # hypc: the external client's node. extclient(10.0.0.9) replies to the NAT IP 10.0.0.50, which
+    # it routes to the hypb GATEWAY marker fd00:b::50 (NOT the owner hypa) — exercising neighbor-NAT.
+    sudo ip netns exec hypc "$BIN" bringup \
+        --uplink uC \
+        --local-underlay fd00::3 \
+        --gateway 10.0.0.1 \
+        --gateway-mac "ff:ff:ff:ff:ff:ff" \
+        --guest "gX-h=10.0.0.9=${GX_MAC}=fd00:c::9=0" \
+        --remote "10.0.0.50=fd00:b::50=0" \
+        --remote "10.0.0.5=fd00:a::5=0" &
     echo $! >> "$PIDFILE"
 
     sleep 2
@@ -479,6 +526,33 @@ cmd_test() {
     fi
     echo ""
 
+    echo "=== Test 12: Neighbor NAT — return via a non-owner gateway (hypb) re-forwarded to owner (hypa) ==="
+    # guesta (hypa, nat_ip 10.0.0.50) -> extclient (hypc, 10.0.0.9). The reply enters at hypb (the
+    # NAT GATEWAY, which does NOT own the flow) and is re-forwarded to hypa via the neighbor-NAT
+    # table; hypa reverses it with its local NAT conntrack. 0% loss proves the cross-node return.
+    if [[ -n "$TCPDUMP" ]]; then
+        sudo ip netns exec extclient "$TCPDUMP" -ni gX 'icmp' -c 6 >/tmp/nn.txt 2>&1 &
+        TDN=$!
+        sleep 0.3
+    fi
+    if sudo ip netns exec guesta ping -c 3 -W 2 10.0.0.9 >/dev/null 2>&1; then
+        echo "  NeighborNat OK: guesta -> extclient works (return crossed hypb gateway -> hypa)"
+    else
+        echo "  WARNING: NeighborNat return path failed (guesta could not reach extclient)"
+    fi
+    if [[ -n "$TCPDUMP" ]]; then
+        sudo kill "$TDN" 2>/dev/null || true
+        wait "$TDN" 2>/dev/null || true
+        if grep -qE '10\.0\.0\.50 > 10\.0\.0\.9: ICMP echo request' /tmp/nn.txt; then
+            echo "  SNAT proof OK: extclient sees the NAT IP 10.0.0.50 as source"
+        else
+            echo "  WARNING: extclient did not see the NAT IP as source"
+            cat /tmp/nn.txt
+        fi
+        rm -f /tmp/nn.txt
+    fi
+    echo ""
+
     echo "=== All tests passed ==="
 }
 
@@ -508,12 +582,12 @@ cmd_down() {
     sudo ip6tables -D FORWARD -i uB-br -j ACCEPT -m comment --comment "$IP6TABLES_MARK" 2>/dev/null || true
 
     # Delete namespaces (also removes veth pairs whose netns-end lives inside them)
-    for ns in hypa hypb guesta guestb guesta2 extsrv guestc guestd; do
+    for ns in hypa hypb hypc guesta guestb guesta2 extsrv guestc guestd extclient; do
         sudo ip netns del "$ns" 2>/dev/null || true
     done
 
     # Remove the bridge and any dangling host-netns veths
-    for iface in uA-br uB-br br-ul; do
+    for iface in uA-br uB-br uC-br br-ul; do
         sudo ip link del "$iface" 2>/dev/null || true
     done
 
