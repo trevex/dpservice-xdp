@@ -72,6 +72,20 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     let tap_ifindex = iface.tap_ifindex;
     let guest_mac = iface.guest_mac;
 
+    // Track every flow: refresh an existing inbound DEFAULT entry, or create one on miss.
+    // Only for non-LB/non-NAT flows; the inner IPv4 is at ETH_LEN + IPV6_LEN pre-adjust_head.
+    if lb_backend.is_none() && nat_guest.is_none() {
+        if let Some(key) = crate::conntrack::ct_key(ctx.data(), ctx.data_end(), ETH_LEN + IPV6_LEN)
+        {
+            match unsafe { crate::maps::CONNTRACK.get(&key) } {
+                Some(e) => {
+                    let mut e = *e;
+                    crate::conntrack::ct_touch(ctx, ETH_LEN + IPV6_LEN, &key, &mut e);
+                }
+                None => crate::conntrack::ct_ensure_default(ctx, ETH_LEN + IPV6_LEN, &key),
+            }
+        }
+    }
     // Strip outer Eth+IPv6, leaving room to write the inner Ethernet.
     if unsafe { bpf_xdp_adjust_head(ctx.ctx, IPV6_LEN as i32) } != 0 {
         return Err(());

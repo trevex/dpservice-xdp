@@ -55,6 +55,10 @@ pub fn ct_key(data: usize, data_end: usize, ip_off: usize) -> Option<CtKey> {
 /// the verifier can check every access against known bounds without variable-offset pkt pointers.
 #[inline(always)]
 pub fn ct_apply(ctx: &XdpContext, ip_off: usize, e: &CtEntry) {
+    // DEFAULT (flag-less) entries carry no translation — never rewrite, or we'd null the address.
+    if e.flags & (xdp_dp_common::CT_REWRITE_SRC | xdp_dp_common::CT_REWRITE_DST) == 0 {
+        return;
+    }
     // Re-fetch bounds: after CONNTRACK.get() (a helper call) the verifier resets pkt-range
     // tracking, so we must re-establish it here.
     let data = ctx.data();
@@ -217,4 +221,23 @@ pub fn ct_touch(ctx: &XdpContext, ip_off: usize, key: &CtKey, e: &mut CtEntry) {
         e.tcp_state = tcp_advance(e.tcp_state, fl);
     }
     let _ = crate::maps::CONNTRACK.insert(key, e, 0);
+}
+
+/// Insert a no-translation DEFAULT conntrack entry for a flow on conntrack-miss, so every flow is
+/// tracked (firewall + aging see it). Records last_seen + initial TCP state.
+#[inline(always)]
+pub fn ct_ensure_default(ctx: &XdpContext, ip_off: usize, key: &CtKey) {
+    let tcp = crate::parse::tcp_flags(ctx.data(), ctx.data_end(), ip_off)
+        .map(|fl| tcp_advance(0, fl))
+        .unwrap_or(0);
+    let e = CtEntry {
+        last_seen: now(),
+        xlate_ip: [0; 4],
+        xlate_port: 0,
+        flags: xdp_dp_common::CT_F_DEFAULT,
+        tcp_state: tcp,
+        fwall_action: 0,
+        _pad: [0; 7],
+    };
+    let _ = crate::maps::CONNTRACK.insert(key, &e, 0);
 }

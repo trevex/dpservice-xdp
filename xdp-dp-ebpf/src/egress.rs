@@ -50,6 +50,12 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     // NAT config. Rewrites the packet in place; the route (dst unchanged) still encaps correctly.
     let is_ext = route.is_external != 0;
     crate::nat::nat_snat_egress(ctx, ETH_LEN, meta.vni, is_ext);
+    // Track every flow: if no conntrack entry exists for this (post-NAT) 5-tuple, insert DEFAULT.
+    if let Some(key) = crate::conntrack::ct_key(ctx.data(), ctx.data_end(), ETH_LEN) {
+        if unsafe { crate::maps::CONNTRACK.get(&key) }.is_none() {
+            crate::conntrack::ct_ensure_default(ctx, ETH_LEN, &key);
+        }
+    }
     let inner_len = (data_end - data - ETH_LEN) as u16;
     let local = LOCAL.get(0).ok_or(())?;
     encap_and_redirect(ctx, local, route, inner_len)
