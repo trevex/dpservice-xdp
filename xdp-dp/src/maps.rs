@@ -2,7 +2,7 @@ use anyhow::Context;
 use aya::maps::{Array, HashMap, MapData};
 use aya::Ebpf;
 use xdp_dp_common::{
-    Config, IfaceKey, IfaceValue, InspectEntry, Local, PortMeta, RouteKey, RouteValue,
+    Config, IfaceKey, IfaceValue, InspectEntry, Local, PortMeta, RouteKey, RouteValue, VipKey,
 };
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
@@ -135,6 +135,32 @@ impl Routes {
     }
 
     pub fn get(&self, key: &RouteKey) -> Option<RouteValue> {
+        self.map.get(key, 0).ok()
+    }
+}
+
+/// Typed handle over the `VIPS` BPF map.
+#[allow(dead_code)]
+pub struct Vips {
+    map: HashMap<MapData, VipKey, [u8; 4]>,
+}
+
+#[allow(dead_code)]
+impl Vips {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(ebpf.take_map("VIPS").context("VIPS map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, key: VipKey, val: [u8; 4]) -> anyhow::Result<()> {
+        self.map.insert(key, val, 0).context("insert vip")
+    }
+
+    pub fn remove(&mut self, key: &VipKey) -> anyhow::Result<()> {
+        self.map.remove(key).context("remove vip")
+    }
+
+    pub fn get(&self, key: &VipKey) -> Option<[u8; 4]> {
         self.map.get(key, 0).ok()
     }
 }

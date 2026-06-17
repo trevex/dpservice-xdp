@@ -3,7 +3,7 @@ use aya_ebpf::{
     maps::{Array, HashMap},
 };
 use xdp_dp_common::{
-    Config, IfaceKey, IfaceValue, InspectEntry, Local, PortMeta, RouteKey, RouteValue,
+    Config, IfaceKey, IfaceValue, InspectEntry, Local, PortMeta, RouteKey, RouteValue, VipKey,
 };
 
 #[map]
@@ -18,3 +18,7 @@ pub static PORT_META: HashMap<u32, PortMeta> = HashMap::with_max_entries(1024, 0
 pub static LOCAL: Array<Local> = Array::with_max_entries(1, 0);
 #[map]
 pub static INSPECT: Array<InspectEntry> = Array::with_max_entries(1, 0);
+/// 1:1 VIP map. Value is the mapped IPv4 counterpart: (vni,G)->V for egress SNAT, (vni,V)->G for
+/// ingress DNAT.
+#[map]
+pub static VIPS: HashMap<VipKey, [u8; 4]> = HashMap::with_max_entries(1024, 0);

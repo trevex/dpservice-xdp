@@ -79,6 +79,14 @@ pub struct InspectEntry {
     pub bytes: [u8; 32],
 }
 
+/// Key for the `vips` map: (VNI, IPv4). Value is the mapped IPv4 (the 1:1 counterpart).
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct VipKey {
+    pub vni: u32,
+    pub ipv4: [u8; 4],
+}
+
 /// Single-entry `CONFIG` map: per-hypervisor datapath parameters for the PoC's
 /// CONFIG-driven single-peer overlay (one guest + one peer hypervisor). The XDP programs
 /// read entry 0; the control plane populates it. MACs/ifindexes are filled at e2e time.
@@ -116,6 +124,7 @@ mod user_impls {
     unsafe impl aya::Pod for Config {}
     unsafe impl aya::Pod for Local {}
     unsafe impl aya::Pod for InspectEntry {}
+    unsafe impl aya::Pod for VipKey {}
 }
 
 #[cfg(test)]
@@ -153,5 +162,10 @@ mod tests {
         // 4*4 (u32s) + 16 + 16 (underlays) + 6+6+6+2 (macs+pad) = 16 + 32 + 20 = 68.
         assert_eq!(core::mem::size_of::<Config>(), 68);
         assert_eq!(core::mem::align_of::<Config>(), 4);
+    }
+
+    #[test]
+    fn vip_key_layout() {
+        assert_eq!(core::mem::size_of::<VipKey>(), 8);
     }
 }
