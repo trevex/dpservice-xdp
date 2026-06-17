@@ -127,6 +127,15 @@ enum Cmd {
         /// VIP mapping, repeatable: "<interface_ipv4>=<vip_ipv4>" (programs both VIPS directions).
         #[arg(long = "vip")]
         vips: Vec<String>,
+        /// Load balancer service, repeatable: "<ipv4>:<port>:<proto>" (proto numeric: 1=ICMP,
+        /// 6=TCP, 17=UDP). For ICMP use port 0. Allocates a Maglev table; add backends via
+        /// --lb-target.
+        #[arg(long = "lb")]
+        lbs: Vec<String>,
+        /// LB backend, repeatable: "<ipv4>:<port>:<proto>=<backend_ipv4>". References an --lb
+        /// service and appends a backend, rebuilding that service's Maglev table.
+        #[arg(long = "lb-target")]
+        lb_targets: Vec<String>,
     },
 }
 
@@ -173,6 +182,8 @@ async fn main() -> anyhow::Result<()> {
             guests,
             remotes,
             vips: vips_args,
+            lbs,
+            lb_targets,
         } => {
             let mut ebpf = loader::load_ebpf()?;
 
@@ -261,11 +272,76 @@ async fn main() -> anyhow::Result<()> {
                 // (0,V)->G ingress DNAT
             }
 
+            // Load balancers: each --lb allocates a Maglev table_id and an LB service entry;
+            // each --lb-target appends a backend to the named service. After collecting all
+            // backends we build + write the Maglev table for every service.
+            let mut lb_map = maps::Lb::open(&mut ebpf)?;
+            let mut maglev_map = maps::Maglev::open(&mut ebpf)?;
+            let parse_lb_spec = |spec: &str| -> anyhow::Result<([u8; 4], u16, u8)> {
+                let mut it = spec.split(':');
+                let ip = parse_ipv4(it.next().context("--lb: missing ipv4")?)?;
+                let port: u16 = it.next().context("--lb: missing port")?.parse()?;
+                let proto: u8 = it.next().context("--lb: missing proto")?.parse()?;
+                Ok((ip, port, proto))
+            };
+            let mut table_ids: std::collections::HashMap<([u8; 4], u16, u8), u32> =
+                std::collections::HashMap::new();
+            let mut backends: std::collections::HashMap<u32, Vec<[u8; 4]>> =
+                std::collections::HashMap::new();
+            let mut next_table_id = 1u32;
+            for lb in &lbs {
+                let (ip, port, proto) = parse_lb_spec(lb)?;
+                let tid = next_table_id;
+                next_table_id += 1;
+                table_ids.insert((ip, port, proto), tid);
+                backends.insert(tid, Vec::new());
+                lb_map.upsert(
+                    xdp_dp_common::LbKey {
+                        vni: 0,
+                        ipv4: ip,
+                        port,
+                        proto,
+                        _pad: 0,
+                    },
+                    xdp_dp_common::LbValue {
+                        table_id: tid,
+                        size: maglev::TABLE_SIZE,
+                    },
+                )?;
+            }
+            for t in &lb_targets {
+                let (spec, backend_str) = t
+                    .split_once('=')
+                    .context("--lb-target must be spec=backend")?;
+                let (ip, port, proto) = parse_lb_spec(spec)?;
+                let backend = parse_ipv4(backend_str)?;
+                let tid = *table_ids
+                    .get(&(ip, port, proto))
+                    .context("--lb-target references an unknown --lb service")?;
+                backends.get_mut(&tid).unwrap().push(backend);
+            }
+            for (tid, bes) in &backends {
+                if bes.is_empty() {
+                    continue;
+                }
+                let table = maglev::build(bes);
+                for (slot, &bi) in table.iter().enumerate() {
+                    maglev_map.upsert(
+                        xdp_dp_common::MaglevKey {
+                            table_id: *tid,
+                            slot: slot as u32,
+                        },
+                        bes[bi as usize],
+                    )?;
+                }
+            }
+
             println!(
-                "bringup: uplink={uplink} guests={} routes={} vips={}; ctrl-c to stop",
+                "bringup: uplink={uplink} guests={} routes={} vips={} lbs={}; ctrl-c to stop",
                 guests.len(),
                 remotes.len(),
-                vips_args.len()
+                vips_args.len(),
+                lbs.len()
             );
             tokio::signal::ctrl_c().await?;
         }

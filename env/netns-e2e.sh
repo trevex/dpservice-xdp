@@ -171,7 +171,10 @@ cmd_up() {
         --guest "gA-h=10.0.0.5=${GA_MAC}" \
         --guest "gA2-h=10.0.0.7=${GA2_MAC}" \
         --remote "10.0.0.6=fd00::2" \
-        --vip "10.0.0.7=10.0.0.100" &
+        --vip "10.0.0.7=10.0.0.100" \
+        --lb "10.0.0.200:0:1" \
+        --lb-target "10.0.0.200:0:1=10.0.0.5" \
+        --lb-target "10.0.0.200:0:1=10.0.0.7" &
     echo $! >> "$PIDFILE"
 
     # hypb: one local guest (gB=10.0.0.6) + remote routes to both hypa guests
@@ -184,7 +187,8 @@ cmd_up() {
         --guest "gB-h=10.0.0.6=${GB_MAC}" \
         --remote "10.0.0.5=fd00::1" \
         --remote "10.0.0.7=fd00::1" \
-        --remote "10.0.0.100=fd00::1" &
+        --remote "10.0.0.100=fd00::1" \
+        --remote "10.0.0.200=fd00::1" &
     echo $! >> "$PIDFILE"
 
     sleep 2
@@ -261,8 +265,50 @@ cmd_test() {
             || echo "  WARNING: no VIP-sourced reply seen"
         rm -f /tmp/vip-td.txt
     fi
-
     echo ""
+
+    echo "=== Test 7: LB Maglev — guestb -> 10.0.0.200 spread over guesta(10.0.0.5)+guesta2(10.0.0.7) ==="
+    # Each `ping -c 1` is a fresh process with a distinct ICMP id, so the 5-tuple hash places
+    # flows across BOTH backends (distribution). The DNAT'd echo requests arrive at the backend
+    # guests with the backend's own IP as dest; capture them on gA / gA2. The backends' replies
+    # are reverse-SNAT'd by conntrack back to the LB IP, so guestb must see replies from
+    # 10.0.0.200 (proves the conntrack return path + checksum correctness).
+    if [[ -n "$TCPDUMP" ]]; then
+        sudo ip netns exec guesta  "$TCPDUMP" -ni gA  'icmp' -c 50 >/tmp/lb-a.txt  2>&1 &
+        TDA=$!
+        sudo ip netns exec guesta2 "$TCPDUMP" -ni gA2 'icmp' -c 50 >/tmp/lb-a2.txt 2>&1 &
+        TDA2=$!
+        sudo ip netns exec guestb  "$TCPDUMP" -ni gB  'icmp' -c 50 >/tmp/lb-b.txt  2>&1 &
+        TDB=$!
+        sleep 0.3
+    fi
+    LOSS=0
+    for _ in $(seq 1 20); do
+        sudo ip netns exec guestb ping -c 1 -W 2 10.0.0.200 >/dev/null 2>&1 || LOSS=$((LOSS + 1))
+    done
+    echo "  20 flows to 10.0.0.200: $((20 - LOSS)) replied, $LOSS lost"
+    sleep 1
+    if [[ -n "$TCPDUMP" ]]; then
+        sudo kill "$TDA" "$TDA2" "$TDB" 2>/dev/null || true
+        wait "$TDA" "$TDA2" "$TDB" 2>/dev/null || true
+        A=$(grep -c 'echo request' /tmp/lb-a.txt  || true)
+        B=$(grep -c 'echo request' /tmp/lb-a2.txt || true)
+        echo "  backend guesta(10.0.0.5) hits=$A   guesta2(10.0.0.7) hits=$B"
+        if [[ "${A:-0}" -gt 0 && "${B:-0}" -gt 0 ]]; then
+            echo "  LB distribution OK (both backends used)"
+        else
+            echo "  WARNING: LB did not distribute across both backends"
+        fi
+        echo "  --- conntrack reverse-SNAT proof: replies to guestb must be sourced from 10.0.0.200 ---"
+        if grep -qE '10\.0\.0\.200 > 10\.0\.0\.6: ICMP echo reply' /tmp/lb-b.txt; then
+            echo "  LB return SNAT proof OK: replies sourced from the LB IP"
+        else
+            echo "  WARNING: no LB-sourced replies seen at guestb"
+        fi
+        rm -f /tmp/lb-a.txt /tmp/lb-a2.txt /tmp/lb-b.txt
+    fi
+    echo ""
+
     echo "=== All tests passed ==="
 }
 

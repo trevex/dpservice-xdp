@@ -18,11 +18,15 @@ pub fn lb_select_dnat(ctx: &XdpContext, ip_off: usize, vni: u32) -> Option<[u8; 
     let dst = unsafe { core::ptr::read_unaligned(p.add(ip_off + 16) as *const [u8; 4]) };
     let src = unsafe { core::ptr::read_unaligned(p.add(ip_off + 12) as *const [u8; 4]) };
     let (proto, sport, dport) = l4_ports(data, data_end, ip_off)?;
+    // For ICMP the L4 "port" is the echo id (varies per client process); LB services are keyed
+    // with port=0 for ICMP so one service matches all ids. TCP/UDP key on the real dport. The
+    // Maglev hash below still uses the real id, giving per-flow stickiness + cross-flow spread.
+    let lookup_port = if proto == 1 { 0 } else { dport };
     let lb = unsafe {
         LB.get(&LbKey {
             vni,
             ipv4: dst,
-            port: dport,
+            port: lookup_port,
             proto,
             _pad: 0,
         })
