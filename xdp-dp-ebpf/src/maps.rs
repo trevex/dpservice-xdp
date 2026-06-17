@@ -3,7 +3,7 @@ use aya_ebpf::{
     maps::{Array, HashMap, LruHashMap},
 };
 use xdp_dp_common::{
-    Config, CtKey, CtVal, IfaceKey, IfaceValue, InspectEntry, LbKey, LbValue, Local, MaglevKey,
+    Config, CtEntry, CtKey, IfaceKey, IfaceValue, InspectEntry, LbKey, LbValue, Local, MaglevKey,
     NatCtVal, NatKey, NatValue, PortMeta, RouteKey, RouteValue, VipKey,
 };
 
@@ -28,7 +28,9 @@ pub static LB: HashMap<LbKey, LbValue> = HashMap::with_max_entries(1024, 0);
 #[map]
 pub static MAGLEV: HashMap<MaglevKey, [u8; 4]> = HashMap::with_max_entries(65536, 0);
 #[map]
-pub static CONNTRACK: LruHashMap<CtKey, CtVal> = LruHashMap::with_max_entries(65536, 0);
+/// Unified conntrack. Sized to dpservice's DP_FLOW_TABLE_MAX order (LRU_HASH preallocates, ~80-100MB;
+/// memcg-accounted on kernels >= 5.11). Operators tune via the loader (a later task adds an env knob).
+pub static CONNTRACK: LruHashMap<CtKey, CtEntry> = LruHashMap::with_max_entries(1_048_576, 0);
 #[map]
 pub static NAT: HashMap<NatKey, NatValue> = HashMap::with_max_entries(1024, 0);
 #[map]

@@ -2,6 +2,7 @@
 #![no_main]
 
 mod arp_nd;
+mod conntrack;
 mod csum;
 mod egress;
 mod encap;
