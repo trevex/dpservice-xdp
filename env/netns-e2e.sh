@@ -52,7 +52,7 @@ cmd_up() {
     sudo ip link set br-ul type bridge mcast_snooping 0
 
     # ---- namespaces ----
-    for ns in hypa hypb guesta guestb guesta2; do
+    for ns in hypa hypb guesta guestb guesta2 extsrv; do
         sudo ip netns add "$ns" 2>/dev/null || true
         sudo ip netns exec "$ns" ip link set lo up
     done
@@ -106,6 +106,16 @@ cmd_up() {
     sudo ip netns exec guestb ip route add 10.0.0.1/32 dev gB 2>/dev/null || true
     sudo ip netns exec guestb ip route add default via 10.0.0.1 2>/dev/null || true
 
+    # ---- hypb external target: gE-h in hypb <-> gE in extsrv (the "public" peer for NAT) ----
+    if ! sudo ip netns exec hypb ip link show gE-h &>/dev/null; then
+        sudo ip link add gE-h netns hypb type veth peer name gE netns extsrv
+    fi
+    sudo ip netns exec hypb ip link set gE-h up
+    sudo ip netns exec extsrv ip link set gE up
+    sudo ip netns exec extsrv ip addr add 10.0.0.8/32 dev gE 2>/dev/null || true
+    sudo ip netns exec extsrv ip route add 10.0.0.1/32 dev gE 2>/dev/null || true
+    sudo ip netns exec extsrv ip route add default via 10.0.0.1 2>/dev/null || true
+
     # ---- ip6tables: allow bridge forwarding on br-ul ----
     # Docker sets ip6tables FORWARD policy to DROP with bridge-nf-call-ip6tables=1.
     # We add scoped ACCEPT rules for br-ul instead of touching any global sysctl.
@@ -129,8 +139,9 @@ cmd_up() {
     GA_MAC=$(sudo ip netns exec guesta cat /sys/class/net/gA/address)
     GB_MAC=$(sudo ip netns exec guestb cat /sys/class/net/gB/address)
     GA2_MAC=$(sudo ip netns exec guesta2 cat /sys/class/net/gA2/address)
+    GE_MAC=$(sudo ip netns exec extsrv cat /sys/class/net/gE/address)
     echo "UA_MAC=$UA_MAC  UB_MAC=$UB_MAC"
-    echo "GA_MAC=$GA_MAC  GB_MAC=$GB_MAC  GA2_MAC=$GA2_MAC"
+    echo "GA_MAC=$GA_MAC  GB_MAC=$GB_MAC  GA2_MAC=$GA2_MAC  GE_MAC=$GE_MAC"
 
     # NOTE: No static guest neigh entries — the XDP datapath answers ARP for 10.0.0.1 in-kernel.
     # Guests use /32 + link route + default via 10.0.0.1, so they only ARP for the gateway.
@@ -155,6 +166,8 @@ cmd_up() {
     echo $! >> "$PIDFILE"
     sudo ip netns exec guesta2 "$BIN" pass --iface gA2 &
     echo $! >> "$PIDFILE"
+    sudo ip netns exec extsrv "$BIN" pass --iface gE &
+    echo $! >> "$PIDFILE"
 
     sleep 1
 
@@ -174,7 +187,10 @@ cmd_up() {
         --vip "10.0.0.7=10.0.0.100" \
         --lb "10.0.0.200:0:1" \
         --lb-target "10.0.0.200:0:1=10.0.0.5" \
-        --lb-target "10.0.0.200:0:1=10.0.0.7" &
+        --lb-target "10.0.0.200:0:1=10.0.0.7" \
+        --remote "10.0.0.8=fd00::2" \
+        --external "10.0.0.8" \
+        --nat "10.0.0.5=10.0.0.50:20000:30000" &
     echo $! >> "$PIDFILE"
 
     # hypb: one local guest (gB=10.0.0.6) + remote routes to both hypa guests
@@ -185,10 +201,12 @@ cmd_up() {
         --gateway 10.0.0.1 \
         --gateway-mac "$UA_MAC" \
         --guest "gB-h=10.0.0.6=${GB_MAC}" \
+        --guest "gE-h=10.0.0.8=${GE_MAC}" \
         --remote "10.0.0.5=fd00::1" \
         --remote "10.0.0.7=fd00::1" \
         --remote "10.0.0.100=fd00::1" \
-        --remote "10.0.0.200=fd00::1" &
+        --remote "10.0.0.200=fd00::1" \
+        --remote "10.0.0.50=fd00::1" &
     echo $! >> "$PIDFILE"
 
     sleep 2
@@ -309,6 +327,31 @@ cmd_test() {
     fi
     echo ""
 
+    echo "=== Test 8: NAT-GW — guesta(10.0.0.5) -> extsrv(10.0.0.8), extsrv must see source 10.0.0.50 ==="
+    # guesta has nat_ip 10.0.0.50; the route to 10.0.0.8 is external, so egress is SNAT'd. extsrv
+    # must observe echo requests from 10.0.0.50 (not 10.0.0.5); guesta must get replies (0% loss),
+    # proving the conntrack reverse-DNAT restores 10.0.0.8 -> ... -> 10.0.0.5 and the rewritten
+    # ICMP id is restored.
+    if [[ -n "$TCPDUMP" ]]; then
+        sudo ip netns exec extsrv "$TCPDUMP" -ni gE 'icmp' -c 10 >/tmp/nat-e.txt 2>&1 &
+        TDE=$!
+        sleep 0.3
+    fi
+    sudo ip netns exec guesta ping -c 3 -W 2 10.0.0.8
+    if [[ -n "$TCPDUMP" ]]; then
+        sudo kill "$TDE" 2>/dev/null || true
+        wait "$TDE" 2>/dev/null || true
+        echo "--- SNAT proof: extsrv must see echo requests sourced from 10.0.0.50 ---"
+        if grep -qE '10\.0\.0\.50 > 10\.0\.0\.8: ICMP echo request' /tmp/nat-e.txt; then
+            echo "  NAT SNAT proof OK: extsrv sees the NAT IP as source"
+        else
+            echo "  WARNING: extsrv did not see 10.0.0.50 as source"
+            cat /tmp/nat-e.txt
+        fi
+        rm -f /tmp/nat-e.txt
+    fi
+    echo ""
+
     echo "=== All tests passed ==="
 }
 
@@ -338,7 +381,7 @@ cmd_down() {
     sudo ip6tables -D FORWARD -i uB-br -j ACCEPT -m comment --comment "$IP6TABLES_MARK" 2>/dev/null || true
 
     # Delete namespaces (also removes veth pairs whose netns-end lives inside them)
-    for ns in hypa hypb guesta guestb guesta2; do
+    for ns in hypa hypb guesta guestb guesta2 extsrv; do
         sudo ip netns del "$ns" 2>/dev/null || true
     done
 

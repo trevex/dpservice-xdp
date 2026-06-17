@@ -136,6 +136,12 @@ enum Cmd {
         /// service and appends a backend, rebuilding that service's Maglev table.
         #[arg(long = "lb-target")]
         lb_targets: Vec<String>,
+        /// NAT config, repeatable: "<guest_ipv4>=<nat_ipv4>:<port_min>:<port_max>".
+        #[arg(long = "nat")]
+        nats: Vec<String>,
+        /// Mark a remote route external (NAT-eligible egress), repeatable: "<overlay_ipv4>".
+        #[arg(long = "external")]
+        externals: Vec<String>,
     },
 }
 
@@ -184,6 +190,8 @@ async fn main() -> anyhow::Result<()> {
             vips: vips_args,
             lbs,
             lb_targets,
+            nats,
+            externals,
         } => {
             let mut ebpf = loader::load_ebpf()?;
 
@@ -244,6 +252,10 @@ async fn main() -> anyhow::Result<()> {
                 )?;
             }
 
+            let external_set: std::collections::HashSet<[u8; 4]> = externals
+                .iter()
+                .map(|s| parse_ipv4(s))
+                .collect::<anyhow::Result<_>>()?;
             let mut routes = maps::Routes::open(&mut ebpf)?;
             for r in &remotes {
                 let mut it = r.splitn(2, '=');
@@ -258,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
                     xdp_dp_common::RouteValue {
                         nexthop_vni: 0,
                         nexthop_ipv6: nh,
-                        is_external: 0,
+                        is_external: external_set.contains(&ip) as u8,
                         _pad: [0; 3],
                     },
                 )?;
@@ -338,12 +350,33 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // NAT-GW: each --nat programs (vni, guest_ip) -> (nat_ip, port_min, port_max). Egress
+            // SNAT fires when the dst route is flagged external (see --external).
+            let mut nat_map = maps::Nat::open(&mut ebpf)?;
+            for n in &nats {
+                let (gip_str, cfg) = n.split_once('=').context("--nat must be guestip=cfg")?;
+                let gip = parse_ipv4(gip_str)?;
+                let mut it = cfg.split(':');
+                let nat_ip = parse_ipv4(it.next().context("--nat: missing nat ipv4")?)?;
+                let port_min: u16 = it.next().context("--nat: missing port_min")?.parse()?;
+                let port_max: u16 = it.next().context("--nat: missing port_max")?.parse()?;
+                nat_map.upsert(
+                    xdp_dp_common::NatKey { vni: 0, ipv4: gip },
+                    xdp_dp_common::NatValue {
+                        nat_ipv4: nat_ip,
+                        port_min,
+                        port_max,
+                    },
+                )?;
+            }
+
             println!(
-                "bringup: uplink={uplink} guests={} routes={} vips={} lbs={}; ctrl-c to stop",
+                "bringup: uplink={uplink} guests={} routes={} vips={} lbs={} nats={}; ctrl-c to stop",
                 guests.len(),
                 remotes.len(),
                 vips_args.len(),
-                lbs.len()
+                lbs.len(),
+                nats.len()
             );
             tokio::signal::ctrl_c().await?;
         }
