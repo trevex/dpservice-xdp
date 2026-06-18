@@ -327,6 +327,7 @@ impl Control {
                 _pad: [0; 2],
                 underlay_ipv6,
                 gateway_ipv6,
+                guest_ipv6: ipv6,
             },
         )?;
         g.ifaces.upsert(

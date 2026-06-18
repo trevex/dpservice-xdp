@@ -13,6 +13,7 @@ mod lb;
 mod maps;
 mod meter;
 mod nat;
+mod nat64;
 mod parse;
 mod v6;
 mod vip;

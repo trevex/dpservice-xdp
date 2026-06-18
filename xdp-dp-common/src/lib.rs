@@ -70,6 +70,9 @@ pub struct PortMeta {
     pub _pad: [u8; 2],
     pub underlay_ipv6: [u8; 16],
     pub gateway_ipv6: [u8; 16],
+    /// Guest overlay IPv6 address (all-zero when the guest is IPv4-only). Used by NAT64 to
+    /// reconstruct the IPv6 destination of the reply packet.
+    pub guest_ipv6: [u8; 16],
 }
 
 impl IfaceKey {
@@ -241,6 +244,10 @@ pub const CT_F_SRC_NAT: u8 = 0x04;
 pub const CT_F_DST_LB: u8 = 0x08;
 pub const CT_F_DEFAULT: u8 = 0x10;
 pub const CT_F_FIREWALL: u8 = 0x20;
+/// Set on NAT64 flows (IPv6 guest → IPv4 external via the 64:ff9b::/96 prefix). Both the forward
+/// and reverse conntrack entries carry this flag so the ingress reply path knows to expand
+/// IPv4 back to IPv6 when delivering the translated reply to the guest.
+pub const CT_F_NAT64: u8 = 0x40;
 
 // CtEntry.tcp_state values (mirror dpservice dp_flow_tcp_state)
 pub const TCP_NONE: u8 = 0;
@@ -440,8 +447,8 @@ mod tests {
     #[test]
     fn port_meta_and_iface_layout() {
         // 4 (vni) + 4 (guest_ipv4) + 4 (gateway_ipv4) + 6 (guest_mac) + 2 (_pad)
-        // + 16 (underlay_ipv6) + 16 (gateway_ipv6) = 52.
-        assert_eq!(core::mem::size_of::<PortMeta>(), 52);
+        // + 16 (underlay_ipv6) + 16 (gateway_ipv6) + 16 (guest_ipv6) = 68.
+        assert_eq!(core::mem::size_of::<PortMeta>(), 68);
         assert_eq!(core::mem::size_of::<IfaceValue>(), 32);
         assert_eq!(core::mem::align_of::<PortMeta>(), 4);
     }

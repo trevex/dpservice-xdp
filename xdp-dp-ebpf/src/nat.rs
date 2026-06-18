@@ -8,7 +8,7 @@ use crate::parse::{hash5, l4_ports};
 const IPPROTO_ICMP: u8 = 1;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
-const PROBE_LIMIT: u16 = 64;
+pub const PROBE_LIMIT: u16 = 64;
 
 /// Incrementally fold a 16-bit field change (network-order `old`/`new`) into an L4/ICMP checksum
 /// by reusing `csum_replace4` with the upper 2 bytes zeroed in both arguments.

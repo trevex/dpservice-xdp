@@ -382,6 +382,7 @@ async fn main() -> anyhow::Result<()> {
                         _pad: [0; 2],
                         underlay_ipv6: underlay,
                         gateway_ipv6: [0u8; 16],
+                        guest_ipv6: [0u8; 16],
                     },
                 )?;
                 ifaces.upsert(
@@ -442,6 +443,7 @@ async fn main() -> anyhow::Result<()> {
                         _pad: [0; 2],
                         underlay_ipv6,
                         gateway_ipv6: gw6,
+                        guest_ipv6: overlay_ipv6,
                     },
                 )?;
                 // For v6-only interfaces (no --guest), add the UNDERLAY entry here.

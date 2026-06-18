@@ -90,6 +90,13 @@ fn try_icmpv6_echo_reply(
 /// Egress for an inner IPv6 frame: route the inner v6 dst via ROUTES6 and encap (inner-proto 41).
 #[inline(always)]
 pub fn v6_guest_tx(ctx: &XdpContext, meta: &PortMeta) -> Result<u32, ()> {
+    // NAT64: intercept packets destined to 64:ff9b::/96, translate IPv6→IPv4, SNAT, encap.
+    if let Some(act) =
+        crate::nat64::nat64_egress(ctx, meta.vni, meta.guest_ipv4, &meta.underlay_ipv6)?
+    {
+        return Ok(act);
+    }
+
     let data = ctx.data();
     let data_end = ctx.data_end();
     if data + ETH_LEN + IPV6_LEN > data_end {

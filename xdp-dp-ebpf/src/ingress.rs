@@ -3,7 +3,7 @@ use aya_ebpf::{
     helpers::{bpf_redirect, bpf_xdp_adjust_head},
     programs::XdpContext,
 };
-use xdp_dp_common::{VipKey, CT_REWRITE_DST};
+use xdp_dp_common::{VipKey, CT_F_NAT64, CT_REWRITE_DST};
 
 use crate::arp_nd::GW_MAC;
 use crate::maps::{LOCAL, NAT_IPS};
@@ -149,7 +149,10 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
         },
         None => u,
     };
-    let nat_guest = if lb_ul.is_none() {
+    // nat_guest: Some((guest_ipv4, orig_sport, is_nat64)) when a CT_REWRITE_DST entry matched.
+    // orig_sport is the original guest L4 sport/id (stored in CT xlate_port), used by NAT64 to
+    // restore the guest's ICMP identifier on the reply.
+    let nat_guest: Option<([u8; 4], u16, bool)> = if lb_ul.is_none() {
         let d = ctx.data();
         let de = ctx.data_end();
         match crate::conntrack::ct_key(d, de, ETH_LEN + IPV6_LEN, vni) {
@@ -171,9 +174,11 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
                 match unsafe { crate::maps::CONNTRACK.get(&key) } {
                     Some(e) if e.flags & CT_REWRITE_DST != 0 => {
                         let mut e = *e;
+                        let is_nat64 = e.flags & CT_F_NAT64 != 0;
+                        let orig_sport = e.xlate_port;
                         crate::conntrack::ct_apply(ctx, ETH_LEN + IPV6_LEN, &e);
                         crate::conntrack::ct_touch(ctx, ETH_LEN + IPV6_LEN, &key, &mut e);
-                        Some(e.xlate_ip)
+                        Some((e.xlate_ip, orig_sport, is_nat64))
                     }
                     _ => None,
                 }
@@ -185,6 +190,12 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     };
     let tap_ifindex = deliver_u.tap_ifindex;
     let guest_mac = deliver_u.guest_mac;
+
+    // NAT64 reply path: CT_REWRITE_DST + CT_F_NAT64 → expand IPv4 reply to IPv6 for the guest.
+    if let Some((nat_ipv4, orig_sport, true)) = nat_guest {
+        return crate::nat64::nat64_ingress(ctx, tap_ifindex, guest_mac, nat_ipv4, orig_sport)
+            .map(|r| r.unwrap_or(xdp_action::XDP_PASS));
+    }
 
     // Neighbor NAT: if this inbound packet is destined to a nat_ip owned by ANOTHER node (and we
     // are not the LB target / local NAT owner), re-forward it to the owner's underlay.
