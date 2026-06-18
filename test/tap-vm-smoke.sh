@@ -41,24 +41,10 @@ CONSOLE_SOCK="/tmp/sm-console.sock"
 BRINGUP_LOG="/tmp/sm-bringup.log"
 QEMU_LOG="/tmp/sm-qemu.log"
 
-# Locate tools — prefer PATH, then well-known Nix store paths.
-_find_tool() {
-    local name="$1"; shift
-    if command -v "$name" &>/dev/null; then
-        echo "$(command -v "$name")"
-        return
-    fi
-    for p in "$@"; do
-        if [[ -x "$p" ]]; then echo "$p"; return; fi
-    done
-    echo ""
-}
-ETHTOOL=$(_find_tool ethtool \
-    /nix/store/rhkjzkrz7b4j33dbrn49cf77ynr64a9c-ethtool-6.15/bin/ethtool \
-    /nix/store/pd20b5lz3ib30arpjs6b2xc45dablcfc-ethtool-6.14/bin/ethtool)
-TCPDUMP=$(_find_tool tcpdump \
-    /nix/store/sr8khdvxdgq3sy7yqqp8d00adhpkgbic-tcpdump-4.99.5/bin/tcpdump \
-    /nix/store/awwgy1l75y4n5azz43i5r4s4pv368pvl-tcpdump-4.99.5/bin/tcpdump)
+# All tools are provided by the flake devShell; run this script via `nix develop`. ethtool and
+# tcpdump are optional (offload-disable / capture proofs are skipped if absent).
+ETHTOOL="$(command -v ethtool || true)"
+TCPDUMP="$(command -v tcpdump || true)"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -108,7 +94,7 @@ cmd_up() {
         --local-underlay fd00::1 \
         --gateway 10.0.0.1 \
         --gateway-mac "$UPLINK_MAC" \
-        --guest "smg0=10.0.0.50=$GMAC" \
+        --guest "smg0=10.0.0.50=$GMAC=fd00:a::50=0" \
         >"$BRINGUP_LOG" 2>&1 &
     echo $! >> "$PIDFILE"
     sleep 2

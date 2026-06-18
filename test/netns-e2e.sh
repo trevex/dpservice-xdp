@@ -20,24 +20,17 @@
 #   - tcpdump in Nix store (detected automatically)
 set -euo pipefail
 
-BIN="$(pwd)/target/debug/xdp-dp"
+# Repo root from the script's own location (this script lives in test/).
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="$REPO/target/debug/xdp-dp"
 # User-writable: the script runs as the normal user (only individual commands use sudo),
 # so this must NOT be under root-owned /run.
 PIDFILE="${TMPDIR:-/tmp}/xdp-e2e-pids"
 IP6TABLES_MARK="xdp-e2e"  # comment tag to identify our rules
 
-# Locate tcpdump: first in PATH, then well-known Nix store paths.
-TCPDUMP=""
-if command -v tcpdump &>/dev/null; then
-    TCPDUMP="$(command -v tcpdump)"
-else
-    for p in /nix/store/*/bin/tcpdump; do
-        if [[ -x "$p" ]]; then
-            TCPDUMP="$p"
-            break
-        fi
-    done
-fi
+# All tooling is provided by the flake devShell; run this script via `nix develop` (the Makefile
+# does). tcpdump is optional (capture-based proofs are skipped if it is absent).
+TCPDUMP="$(command -v tcpdump || true)"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 

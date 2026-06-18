@@ -43,9 +43,12 @@ class GrpcClient:
 		self.uuid = None
 		self.expectedError = 0
 		self.expectFailure = False
-		self.cmd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "dpservice-cli")
-		if not os.access(self.cmd, os.X_OK):
-			raise RuntimeError("dpservice-cli is missing (run test/conformance/fetch-cli.sh to build it)")
+		# The genuine dpservice-cli is built by the flake (buildGoModule) and on PATH inside
+		# `nix develop`; run.sh passes its absolute path through sudo via DPSERVICE_CLI.
+		import shutil
+		self.cmd = os.environ.get("DPSERVICE_CLI") or shutil.which("dpservice-cli")
+		if not self.cmd or not os.access(self.cmd, os.X_OK):
+			raise RuntimeError("dpservice-cli not found (run inside `nix develop`; it is built by the flake)")
 
 	def getClientVersion(self):
 		return subprocess.check_output([self.cmd, '-v']).decode('utf-8').strip()

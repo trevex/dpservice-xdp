@@ -10,14 +10,39 @@
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # The genuine dpservice source, used to build the real dpservice-cli (the gRPC client our
+    # conformance harness drives) from source — no out-of-band binary fetch. Pinned to the tag
+    # our proto/dpdk.proto matches.
+    dpservice = {
+      url = "github:ironcore-dev/dpservice?ref=v0.3.22";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, go-overlay, git-hooks, ... }:
+  outputs = { self, nixpkgs, flake-utils, go-overlay, git-hooks, dpservice, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ go-overlay.overlays.default ];
         pkgs = import nixpkgs { inherit system overlays; };
         go = pkgs.go-bin.latest;
+
+        # The real dpservice-cli (cli/dpservice-cli in the dpservice repo), built from the pinned
+        # `dpservice` flake input via buildGoModule. Placed on PATH in the devShell so the
+        # conformance harness drives our gRPC server with the genuine client.
+        dpservice-cli = pkgs.buildGoModule {
+          pname = "dpservice-cli";
+          version = "0.3.22";
+          src = dpservice;
+          modRoot = "cli/dpservice-cli";
+          vendorHash = "sha256-mtJ4pS+KI9Gk3QEG9Zu1y/dCfzPDw5Tn/MW0d7g3C2o=";
+          doCheck = false;
+          subPackages = [ "." ];
+        };
+
+        # Python with the packages the test harnesses need (scapy for packet crafting, pytest for
+        # the conformance suite). Reused across the devShell and any script run via `nix develop`.
+        pythonEnv = pkgs.python3.withPackages (ps: with ps; [ scapy pytest ]);
+
         # Rust is managed entirely by rustup (community-standard for aya/aya-build), pinned
         # via rust-toolchain.toml to nightly-2026-01-15 (LLVM 21) to match nixpkgs bpf-linker.
         # The pre-commit rustfmt/clippy hooks therefore run through rustup too (system hooks
@@ -47,6 +72,8 @@
         };
       in
       {
+        packages.dpservice-cli = dpservice-cli;
+
         devShells.default = pkgs.mkShell {
           inherit (pre-commit-check) shellHook;
 
@@ -59,7 +86,9 @@
             pkgs.wasm-tools
             pkgs.mdbook
             pkgs.mdbook-mermaid
-            # eBPF + gRPC + VM harness tooling
+            # eBPF + gRPC + VM/conformance harness tooling. Everything the test scripts need is
+            # provided here, so the scripts use bare tool names (no host-specific paths) and are
+            # expected to run inside `nix develop` (the Makefile wraps them).
             pkgs.bpf-linker
             pkgs.protobuf
             pkgs.grpcurl
@@ -68,13 +97,13 @@
             pkgs.OVMF
             pkgs.iproute2
             pkgs.bridge-utils
+            pkgs.ethtool
+            pkgs.tcpdump
             pkgs.kubectl
             pkgs.socat
-            (pkgs.python3.withPackages (ps: with ps; [ scapy pytest ]))  # tap-vm-smoke + conformance harness
-          ];
-
-          packages = [
-            pkgs.just
+            pkgs.gnumake
+            pythonEnv
+            dpservice-cli
           ];
 
           RUST_BACKTRACE = 1;

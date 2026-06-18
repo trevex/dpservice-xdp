@@ -11,7 +11,7 @@
 #         ./env/ha-smoke.sh up|down
 set -euo pipefail
 
-BIN="$(pwd)/target/debug/xdp-dp"
+BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/xdp-dp"
 PIDFILE="${TMPDIR:-/tmp}/xdp-ha-pids"
 MARK="xdp-ha"
 # bpffs must live OUTSIDE /sys: `ip netns exec` remounts a fresh /sys, shadowing a bpffs at

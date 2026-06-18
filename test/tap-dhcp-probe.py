@@ -15,9 +15,8 @@
 #   "NO OFFER in native/driver mode"        -> native tap cannot grow either; the responder needs
 #       a no-grow redesign (or SKB) for production. A real finding to act on.
 #
-# Run (needs root for /dev/net/tun + XDP attach, and the flake python for scapy):
-#   PYBIN="$(nix develop "$(git rev-parse --show-toplevel)" -c bash -c 'command -v python3')"
-#   sudo "$PYBIN" env/tap-dhcp-probe.py
+# Run (inside the flake devShell, which provides python3+scapy): `make tap-dhcp-probe`, or
+#   nix develop -c ./test/tap-dhcp-probe.sh
 
 import fcntl
 import os

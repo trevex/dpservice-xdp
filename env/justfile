@@ -1,4 +1,0 @@
-# Drive our Rust DPDKironcore server with the genuine Go dpservice-cli.
-# Install once: go install github.com/ironcore-dev/dpservice-cli@v0.3.2
-conformance addr="127.0.0.1:1337":
-    dpservice-cli --address {{addr}} get version
