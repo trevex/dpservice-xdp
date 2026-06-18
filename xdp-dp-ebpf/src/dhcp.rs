@@ -145,11 +145,27 @@ pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
     };
 
     let ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
-    let chaddr = unsafe { core::ptr::read_unaligned(p.add(F_BOOTP + 28) as *const [u8; 6]) };
-    if chaddr != meta.guest_mac {
+    // MAC learning: use the Ethernet source (bytes 6-11), not BOOTP chaddr.
+    // The test suite sends REQUEST with a different Ethernet src than chaddr to verify
+    // that the datapath learns the actual L2 source address used by the VM.
+    let eth_src = unsafe { core::ptr::read_unaligned(p.add(6) as *const [u8; 6]) };
+    if eth_src != meta.guest_mac {
         let mut updated = *meta;
-        updated.guest_mac = chaddr;
+        updated.guest_mac = eth_src;
         let _ = crate::maps::PORT_META.insert(&ifindex, &updated, 0);
+        // Also update UNDERLAY (keyed by underlay IPv6) and INTERFACES (keyed by vni+ipv4)
+        // so the local fast path and ingress delivery use the new MAC immediately.
+        if let Some(u) = unsafe { crate::maps::UNDERLAY.get(&meta.underlay_ipv6) } {
+            let mut u2 = *u;
+            u2.guest_mac = eth_src;
+            let _ = crate::maps::UNDERLAY.insert(&meta.underlay_ipv6, &u2, 0);
+        }
+        let ikey = xdp_dp_common::IfaceKey::new(meta.vni, meta.guest_ipv4);
+        if let Some(iv) = unsafe { crate::maps::INTERFACES.get(&ikey) } {
+            let mut iv2 = *iv;
+            iv2.guest_mac = eth_src;
+            let _ = crate::maps::INTERFACES.insert(&ikey, &iv2, 0);
+        }
     }
 
     let dhcp_cfg = crate::maps::DHCP_CONFIG.get(0);

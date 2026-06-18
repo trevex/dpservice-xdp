@@ -127,6 +127,10 @@ struct Inner {
     routes_shadow: Vec<(u32, [u8; 4], u32, u32, [u8; 16])>,
     /// IPv6 routes shadow (vni, prefix_ipv6, prefix_len, nexthop_vni, nexthop_underlay).
     routes6_shadow: Vec<(u32, [u8; 16], u32, u32, [u8; 16])>,
+    /// Shadow cache of learned guest MACs: underlay_ipv6 -> guest_mac.
+    /// Persists across interface delete+recreate so that the datapath can continue
+    /// delivering to the last-known MAC even when the interface is reprogrammed.
+    learned_macs: HashMap<[u8; 16], [u8; 6]>,
 }
 
 impl Control {
@@ -202,6 +206,7 @@ impl Control {
                 links: HashMap::new(),
                 routes_shadow: Vec::new(),
                 routes6_shadow: Vec::new(),
+                learned_macs: HashMap::new(),
             }),
             conntrack,
         })
@@ -374,13 +379,18 @@ impl Control {
         total_mbps: u64,
         public_mbps: u64,
     ) -> anyhow::Result<()> {
+        // MAC learning persistence: use the shadow cache of learned MACs, which is populated
+        // by detach_interface before it removes the UNDERLAY entry. This ensures that a
+        // delete+recreate cycle preserves the datapath-learned MAC even though the BPF UNDERLAY
+        // map entry is gone by the time program_iface_maps is called.
+        let effective_mac = g.learned_macs.get(&underlay_ipv6).copied().unwrap_or(mac);
         g.ports.upsert(
             tap,
             PortMeta {
                 vni,
                 guest_ipv4: ipv4,
                 gateway_ipv4,
-                guest_mac: mac,
+                guest_mac: effective_mac,
                 _pad: [0; 2],
                 underlay_ipv6,
                 gateway_ipv6,
@@ -393,7 +403,7 @@ impl Control {
                 tap_ifindex: tap,
                 is_local: 1,
                 underlay_ipv6,
-                guest_mac: mac,
+                guest_mac: effective_mac,
                 _pad: [0; 2],
             },
         )?;
@@ -402,7 +412,7 @@ impl Control {
             xdp_dp_common::UnderlayValue {
                 vni,
                 tap_ifindex: tap,
-                guest_mac: mac,
+                guest_mac: effective_mac,
                 _pad: [0; 2],
             },
         )?;
@@ -459,6 +469,12 @@ impl Control {
         g.links.remove(interface_id);
         let _ = g.ports.remove(tap);
         let _ = g.ifaces.remove(IfaceKey::new(rec.vni, rec.ipv4));
+        // Before removing the UNDERLAY entry, snapshot the currently-learned guest MAC
+        // (the datapath may have updated it via DHCP/ARP MAC learning). This snapshot
+        // survives the delete so that addinterface can restore the learned MAC.
+        if let Some(u) = g.underlay.get(&rec.underlay) {
+            g.learned_macs.insert(rec.underlay, u.guest_mac);
+        }
         let _ = g.underlay.remove(&rec.underlay);
         let _ = g.meter.remove(&tap);
         let _ = g.dhcp_meta.remove(tap);

@@ -89,10 +89,19 @@ pub fn attach_xdp_link(
         .program_mut(prog_name)
         .with_context(|| format!("{prog_name} program missing"))?
         .try_into()?;
-    let id = prog
-        .attach(iface, XdpFlags::default())
-        .or_else(|_| prog.attach(iface, XdpFlags::SKB_MODE))
-        .with_context(|| format!("attach {prog_name} to {iface}"))?;
+    // Attach mode: default to native (driver) mode and fall back to SKB (generic) so production
+    // guest taps get the fast path. The DHCP responder grows the frame via bpf_xdp_adjust_tail,
+    // which veth's native XDP cannot do — so the conformance harness sets XDP_DP_SKB_MODE=1 to
+    // force generic mode (where adjust_tail growth works). Real tap/NIC drivers support native
+    // adjust_tail, so production stays on the fast path.
+    let id = if std::env::var_os("XDP_DP_SKB_MODE").is_some() {
+        prog.attach(iface, XdpFlags::SKB_MODE)
+            .with_context(|| format!("attach {prog_name} to {iface} (SKB_MODE)"))?
+    } else {
+        prog.attach(iface, XdpFlags::default())
+            .or_else(|_| prog.attach(iface, XdpFlags::SKB_MODE))
+            .with_context(|| format!("attach {prog_name} to {iface}"))?
+    };
     prog.take_link(id).context("take xdp link")
 }
 

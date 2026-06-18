@@ -45,8 +45,11 @@ class DpService:
 		# xdp-dp serve replaces dpservice-bin; all DPDK vdev/pf/vf-pattern assembly is dropped.
 		# build_path is the repo root (passed via --build-path).
 		# sudo is required to attach XDP programs to network interfaces.
+		# XDP_DP_SKB_MODE=1: force generic XDP so the DHCP responder's bpf_xdp_adjust_tail growth
+		# works on the veth substrate (native veth XDP cannot grow frames). Passed inside the sudo
+		# arg list because sudo resets the environment. Production taps use native mode (default).
 		self.cmd = (
-			f"sudo {self.build_path}/target/debug/xdp-dp serve"
+			f"sudo XDP_DP_SKB_MODE=1 {self.build_path}/target/debug/xdp-dp serve"
 			f" --addr=127.0.0.1:{grpc_port}"
 			f" --uplink=xdtap0"
 			f" --local-underlay={local_ul_ipv6}"
