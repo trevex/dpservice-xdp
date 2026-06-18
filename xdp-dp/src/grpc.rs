@@ -28,8 +28,8 @@ use crate::pb::{
     ListLoadBalancerTargetsRequest, ListLoadBalancerTargetsResponse, ListLoadBalancersRequest,
     ListLoadBalancersResponse, ListLocalNatsRequest, ListLocalNatsResponse,
     ListNeighborNatsRequest, ListNeighborNatsResponse, ListPrefixesRequest, ListPrefixesResponse,
-    ListRoutesRequest, ListRoutesResponse, Prefix, ProtocolFilter, ResetVniRequest,
-    ResetVniResponse, Status as DpStatus, TrafficDirection,
+    ListRoutesRequest, ListRoutesResponse, MeteringParams, Prefix, ProtocolFilter, ResetVniRequest,
+    ResetVniResponse, Status as DpStatus, TrafficDirection, VirtualFunction,
 };
 use crate::state::State;
 
@@ -53,21 +53,53 @@ fn ok() -> Option<DpStatus> {
 }
 
 // ---------------------------------------------------------------------------
-// Address-decoding helpers
+// Address encoding/decoding helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a `Vec<u8>` into a `[u8; 4]`, returning `Status::invalid_argument` on wrong length.
-fn decode_ipv4(bytes: &[u8]) -> Result<[u8; 4], Status> {
-    bytes.try_into().map_err(|_| {
-        Status::invalid_argument(format!("expected 4-byte IPv4, got {} bytes", bytes.len()))
-    })
+/// Encode a 16-byte IPv6 address as a UTF-8 string for proto `bytes` fields that the Go client
+/// expects to be string-encoded (underlay_route, and address fields in responses). The dpservice
+/// Go client calls `netip.ParseAddr(string(bytes))`, so we must send the printable form.
+fn encode_ipv6_str(addr: [u8; 16]) -> Vec<u8> {
+    std::net::Ipv6Addr::from(addr).to_string().into_bytes()
 }
 
-/// Convert a `Vec<u8>` into a `[u8; 16]`, returning `Status::invalid_argument` on wrong length.
+/// Encode a 4-byte IPv4 address as a UTF-8 string for proto `bytes` fields.
+fn encode_ipv4_str(addr: [u8; 4]) -> Vec<u8> {
+    std::net::Ipv4Addr::from(addr).to_string().into_bytes()
+}
+
+/// Decode an IPv4 address from bytes. Accepts either 4 raw octets (binary) or a UTF-8 string
+/// representation (e.g. "10.100.1.1") as sent by the Go dpservice-cli client.
+fn decode_ipv4(bytes: &[u8]) -> Result<[u8; 4], Status> {
+    if bytes.len() == 4 {
+        return bytes
+            .try_into()
+            .map_err(|_| Status::invalid_argument("IPv4 decode error"));
+    }
+    // String-encoded: parse as dotted-decimal
+    let s = std::str::from_utf8(bytes)
+        .map_err(|_| Status::invalid_argument("IPv4 address is not valid UTF-8"))?;
+    let addr: std::net::Ipv4Addr = s
+        .parse()
+        .map_err(|_| Status::invalid_argument(format!("invalid IPv4 address string: {s}")))?;
+    Ok(addr.octets())
+}
+
+/// Decode an IPv6 address from bytes. Accepts either 16 raw octets (binary) or a UTF-8 string
+/// representation (e.g. "fe80::1") as sent by the Go dpservice-cli client.
 fn decode_ipv6(bytes: &[u8]) -> Result<[u8; 16], Status> {
-    bytes.try_into().map_err(|_| {
-        Status::invalid_argument(format!("expected 16-byte IPv6, got {} bytes", bytes.len()))
-    })
+    if bytes.len() == 16 {
+        return bytes
+            .try_into()
+            .map_err(|_| Status::invalid_argument("IPv6 decode error"));
+    }
+    // String-encoded: parse as colon-hex
+    let s = std::str::from_utf8(bytes)
+        .map_err(|_| Status::invalid_argument("IPv6 address is not valid UTF-8"))?;
+    let addr: std::net::Ipv6Addr = s
+        .parse()
+        .map_err(|_| Status::invalid_argument(format!("invalid IPv6 address string: {s}")))?;
+    Ok(addr.octets())
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +265,7 @@ fn encode_fw_rule(rule_id: Vec<u8>, r: xdp_dp_common::FwRule) -> FirewallRule {
         Some(Prefix {
             ip: Some(IpAddress {
                 ipver: IpVersion::Ipv4 as i32,
-                address: r.src_ip.to_vec(),
+                address: encode_ipv4_str(r.src_ip),
             }),
             length: u32::from_be_bytes(r.src_mask).count_ones(),
             underlay_route: Vec::new(),
@@ -245,7 +277,7 @@ fn encode_fw_rule(rule_id: Vec<u8>, r: xdp_dp_common::FwRule) -> FirewallRule {
         Some(Prefix {
             ip: Some(IpAddress {
                 ipver: IpVersion::Ipv4 as i32,
-                address: r.dst_ip.to_vec(),
+                address: encode_ipv4_str(r.dst_ip),
             }),
             length: u32::from_be_bytes(r.dst_mask).count_ones(),
             underlay_route: Vec::new(),
@@ -304,7 +336,8 @@ fn encode_fw_rule(rule_id: Vec<u8>, r: xdp_dp_common::FwRule) -> FirewallRule {
 // ---------------------------------------------------------------------------
 
 /// Construct a `pb::Interface` from shadow-state fields.
-/// `primary_ipv4` and `primary_ipv6` are raw big-endian byte vectors (as defined by the proto).
+/// Address bytes are string-encoded because the Go dpservice-go client converts them with
+/// `string(bytes)` and passes to `netip.ParseAddr`.
 fn make_interface(
     id: &[u8],
     vni: u32,
@@ -315,9 +348,11 @@ fn make_interface(
     pb::Interface {
         id: id.to_vec(),
         vni,
-        primary_ipv4: ipv4.to_vec(),
-        primary_ipv6: ipv6.to_vec(),
-        underlay_route: underlay.to_vec(),
+        primary_ipv4: encode_ipv4_str(ipv4),
+        primary_ipv6: encode_ipv6_str(ipv6),
+        underlay_route: encode_ipv6_str(underlay),
+        // Include empty metering_params — the Go client dereferences it without nil-check.
+        metering_params: Some(MeteringParams::default()),
         ..Default::default()
     }
 }
@@ -336,11 +371,21 @@ impl DpdKironcore for Service {
         &self,
         _req: Request<CheckInitializedRequest>,
     ) -> Result<Response<CheckInitializedResponse>, Status> {
-        let uuid = self.state.check_initialized().unwrap_or_default();
-        Ok(Response::new(CheckInitializedResponse {
-            status: ok(),
-            uuid,
-        }))
+        match self.state.check_initialized() {
+            Some(uuid) => Ok(Response::new(CheckInitializedResponse {
+                status: ok(),
+                uuid,
+            })),
+            // Not yet initialized: return a non-OK status so the Go CLI knows to call Initialize.
+            // dpservice uses a specific error code for "not initialized"; we use code=1 ("client").
+            None => Ok(Response::new(CheckInitializedResponse {
+                status: Some(DpStatus {
+                    code: 1,
+                    message: "not initialized".into(),
+                }),
+                uuid: String::new(),
+            })),
+        }
     }
 
     async fn get_version(
@@ -422,8 +467,9 @@ impl DpdKironcore for Service {
 
         Ok(Response::new(CreateInterfaceResponse {
             status: ok(),
-            underlay_route: underlay.to_vec(),
-            vf: None,
+            underlay_route: encode_ipv6_str(underlay),
+            // Include an empty VF struct — the Go client dereferences it without nil-check.
+            vf: Some(VirtualFunction::default()),
         }))
     }
 
@@ -445,7 +491,7 @@ impl DpdKironcore for Service {
             .route
             .ok_or_else(|| Status::invalid_argument("route is required"))?;
 
-        // Decode prefix IPv4
+        // Decode prefix — may be IPv4 or IPv6
         let prefix = route
             .prefix
             .ok_or_else(|| Status::invalid_argument("route.prefix is required"))?;
@@ -453,7 +499,6 @@ impl DpdKironcore for Service {
         let prefix_ip = prefix
             .ip
             .ok_or_else(|| Status::invalid_argument("route.prefix.ip is required"))?;
-        let ipv4 = decode_ipv4(&prefix_ip.address)?;
 
         // Decode nexthop IPv6
         let nexthop_addr = route
@@ -461,9 +506,18 @@ impl DpdKironcore for Service {
             .ok_or_else(|| Status::invalid_argument("route.nexthop_address is required"))?;
         let nexthop_ipv6 = decode_ipv6(&nexthop_addr.address)?;
 
-        control
-            .create_route(vni, ipv4, prefix_len, nexthop_ipv6, false)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        // Dispatch on address family: IPv6 prefixes go to create_route6, IPv4 to create_route.
+        if prefix_ip.ipver == IpVersion::Ipv6 as i32 {
+            let ipv6 = decode_ipv6(&prefix_ip.address)?;
+            control
+                .create_route6(vni, ipv6, prefix_len, nexthop_ipv6, false)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        } else {
+            let ipv4 = decode_ipv4(&prefix_ip.address)?;
+            control
+                .create_route(vni, ipv4, prefix_len, nexthop_ipv6, false)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
 
         Ok(Response::new(CreateRouteResponse { status: ok() }))
     }
@@ -537,7 +591,7 @@ impl DpdKironcore for Service {
             .map(|(ip, len)| Prefix {
                 ip: Some(IpAddress {
                     ipver: IpVersion::Ipv4 as i32,
-                    address: ip.to_vec(),
+                    address: encode_ipv4_str(ip),
                 }),
                 length: len,
                 underlay_route: Vec::new(),
@@ -570,7 +624,7 @@ impl DpdKironcore for Service {
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(CreatePrefixResponse {
             status: ok(),
-            underlay_route: self.underlay.to_vec(),
+            underlay_route: encode_ipv6_str(self.underlay),
         }))
     }
 
@@ -611,7 +665,7 @@ impl DpdKironcore for Service {
             .map(|(ip, len)| Prefix {
                 ip: Some(IpAddress {
                     ipver: IpVersion::Ipv4 as i32,
-                    address: ip.to_vec(),
+                    address: encode_ipv4_str(ip),
                 }),
                 length: len,
                 underlay_route: Vec::new(),
@@ -645,7 +699,7 @@ impl DpdKironcore for Service {
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(CreateLoadBalancerPrefixResponse {
             status: ok(),
-            underlay_route: self.underlay.to_vec(),
+            underlay_route: encode_ipv6_str(self.underlay),
         }))
     }
 
@@ -691,7 +745,7 @@ impl DpdKironcore for Service {
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(CreateVipResponse {
             status: ok(),
-            underlay_route: self.underlay.to_vec(),
+            underlay_route: encode_ipv6_str(self.underlay),
         }))
     }
 
@@ -706,12 +760,12 @@ impl DpdKironcore for Service {
         let r = req.into_inner();
         let vip_ip = control.get_vip(&r.interface_id).map(|addr| IpAddress {
             ipver: IpVersion::Ipv4 as i32,
-            address: addr.to_vec(),
+            address: encode_ipv4_str(addr),
         });
         Ok(Response::new(GetVipResponse {
             status: ok(),
             vip_ip,
-            underlay_route: self.underlay.to_vec(),
+            underlay_route: encode_ipv6_str(self.underlay),
         }))
     }
 
@@ -758,7 +812,7 @@ impl DpdKironcore for Service {
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(CreateLoadBalancerResponse {
             status: ok(),
-            underlay_route: lb_underlay.to_vec(),
+            underlay_route: encode_ipv6_str(lb_underlay),
         }))
     }
 
@@ -784,11 +838,11 @@ impl DpdKironcore for Service {
                     status: ok(),
                     loadbalanced_ip: Some(IpAddress {
                         ipver: IpVersion::Ipv4 as i32,
-                        address: ip.to_vec(),
+                        address: encode_ipv4_str(ip),
                     }),
                     vni,
                     loadbalanced_ports,
-                    underlay_route: lb_underlay.to_vec(),
+                    underlay_route: encode_ipv6_str(lb_underlay),
                 }))
             }
             None => Err(Status::not_found("load balancer not found")),
@@ -826,7 +880,7 @@ impl DpdKironcore for Service {
                 vni,
                 ip: Some(IpAddress {
                     ipver: IpVersion::Ipv4 as i32,
-                    address: ip.to_vec(),
+                    address: encode_ipv4_str(ip),
                 }),
                 ports: ports
                     .into_iter()
@@ -835,7 +889,7 @@ impl DpdKironcore for Service {
                         protocol: proto as i32,
                     })
                     .collect(),
-                underlay_route: lb_underlay.to_vec(),
+                underlay_route: encode_ipv6_str(lb_underlay),
             })
             .collect();
         Ok(Response::new(ListLoadBalancersResponse {
@@ -882,7 +936,7 @@ impl DpdKironcore for Service {
             .into_iter()
             .map(|backend| IpAddress {
                 ipver: IpVersion::Ipv6 as i32,
-                address: backend.to_vec(),
+                address: encode_ipv6_str(backend),
             })
             .collect();
         Ok(Response::new(ListLoadBalancerTargetsResponse {
@@ -925,7 +979,7 @@ impl DpdKironcore for Service {
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(CreateNatResponse {
             status: ok(),
-            underlay_route: self.underlay.to_vec(),
+            underlay_route: encode_ipv6_str(self.underlay),
         }))
     }
 
@@ -944,11 +998,11 @@ impl DpdKironcore for Service {
             status: ok(),
             nat_ip: Some(IpAddress {
                 ipver: IpVersion::Ipv4 as i32,
-                address: nat_ip.to_vec(),
+                address: encode_ipv4_str(nat_ip),
             }),
             min_port: min_port as u32,
             max_port: max_port as u32,
-            underlay_route: self.underlay.to_vec(),
+            underlay_route: encode_ipv6_str(self.underlay),
         }))
     }
 
@@ -982,15 +1036,15 @@ impl DpdKironcore for Service {
                 |(_iface_id, guest_ipv4, nat_ip, port_min, port_max)| pb::NatEntry {
                     nat_ip: Some(IpAddress {
                         ipver: IpVersion::Ipv4 as i32,
-                        address: guest_ipv4.to_vec(),
+                        address: encode_ipv4_str(guest_ipv4),
                     }),
                     min_port: port_min as u32,
                     max_port: port_max as u32,
-                    underlay_route: self.underlay.to_vec(),
+                    underlay_route: encode_ipv6_str(self.underlay),
                     vni: 0,
                     actual_nat_ip: Some(IpAddress {
                         ipver: IpVersion::Ipv4 as i32,
-                        address: nat_ip.to_vec(),
+                        address: encode_ipv4_str(nat_ip),
                     }),
                 },
             )
@@ -1068,11 +1122,11 @@ impl DpdKironcore for Service {
             .map(|e| pb::NatEntry {
                 nat_ip: Some(IpAddress {
                     ipver: IpVersion::Ipv4 as i32,
-                    address: e.nat_ip.to_vec(),
+                    address: encode_ipv4_str(e.nat_ip),
                 }),
                 min_port: e.port_min as u32,
                 max_port: e.port_max as u32,
-                underlay_route: e.underlay.to_vec(),
+                underlay_route: encode_ipv6_str(e.underlay),
                 vni: e.vni,
                 actual_nat_ip: None,
             })
@@ -1100,13 +1154,13 @@ impl DpdKironcore for Service {
                     length: l,
                     ip: Some(IpAddress {
                         ipver: IpVersion::Ipv4 as i32,
-                        address: p.to_vec(),
+                        address: encode_ipv4_str(p),
                     }),
                     underlay_route: Vec::new(),
                 }),
                 nexthop_address: Some(IpAddress {
                     ipver: IpVersion::Ipv6 as i32,
-                    address: n.to_vec(),
+                    address: encode_ipv6_str(n),
                 }),
                 nexthop_vni: vni,
                 weight: 0,

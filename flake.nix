@@ -70,7 +70,7 @@
             pkgs.bridge-utils
             pkgs.kubectl
             pkgs.socat
-            pkgs.python3  # serial-console driver for env/tap-vm-smoke.sh
+            (pkgs.python3.withPackages (ps: with ps; [ scapy pytest ]))  # tap-vm-smoke + conformance harness
           ];
 
           packages = [
