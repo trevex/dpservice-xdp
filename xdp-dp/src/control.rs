@@ -238,6 +238,7 @@ impl Control {
                     tap,
                     vni,
                     ipv4,
+                    ipv6,
                     gateway_ipv4,
                     gateway_ipv6,
                     mac,
@@ -267,6 +268,7 @@ impl Control {
             tap,
             vni,
             ipv4,
+            ipv6,
             gateway_ipv4,
             gateway_ipv6,
             mac,
@@ -276,13 +278,14 @@ impl Control {
         )
     }
 
-    /// Program PORT_META / INTERFACES / UNDERLAY / METER for one interface.
+    /// Program PORT_META / INTERFACES / UNDERLAY / METER / local self-route for one interface.
     #[allow(clippy::too_many_arguments)]
     fn program_iface_maps(
         g: &mut Inner,
         tap: u32,
         vni: u32,
         ipv4: [u8; 4],
+        ipv6: [u8; 16],
         gateway_ipv4: [u8; 4],
         gateway_ipv6: [u8; 16],
         mac: [u8; 6],
@@ -321,6 +324,34 @@ impl Control {
                 _pad: [0; 2],
             },
         )?;
+        // Local self-route: a same-host guest reaches this interface by its overlay IP. Program a
+        // /32 (and /128 when dual-stack) route to this interface's OWN underlay so guest_tx's LPM
+        // resolves a local destination to a local underlay, and the local fast path delivers it
+        // without a wire round-trip. These are NOT added to routes_shadow (not user-visible routes).
+        g.routes.upsert(
+            vni,
+            ipv4,
+            32,
+            RouteValue {
+                nexthop_vni: vni,
+                nexthop_ipv6: underlay_ipv6,
+                is_external: 0,
+                _pad: [0; 3],
+            },
+        )?;
+        if ipv6 != [0u8; 16] {
+            g.routes6.upsert(
+                vni,
+                ipv6,
+                128,
+                RouteValue {
+                    nexthop_vni: vni,
+                    nexthop_ipv6: underlay_ipv6,
+                    is_external: 0,
+                    _pad: [0; 3],
+                },
+            )?;
+        }
         if total_mbps != 0 || public_mbps != 0 {
             g.meter
                 .upsert(tap, Self::meter_state(total_mbps, public_mbps))?;
@@ -345,6 +376,11 @@ impl Control {
         let _ = g.ifaces.remove(IfaceKey::new(rec.vni, rec.ipv4));
         let _ = g.underlay.remove(&rec.underlay);
         let _ = g.meter.remove(&tap);
+        // Remove the local self-route(s) programmed in program_iface_maps.
+        let _ = g.routes.remove(rec.vni, rec.ipv4, 32);
+        if rec.ipv6 != [0u8; 16] {
+            let _ = g.routes6.remove(rec.vni, rec.ipv6, 128);
+        }
         if let Some(rules) = g.fw.remove(&tap) {
             drop(rules);
         }

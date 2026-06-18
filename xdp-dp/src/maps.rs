@@ -201,6 +201,17 @@ impl Routes6 {
         );
         self.map.insert(&key, val, 0).context("insert route6")
     }
+
+    pub fn remove(&mut self, vni: u32, ipv6: [u8; 16], prefix_len: u32) -> anyhow::Result<()> {
+        let key = Key::new(
+            32 + prefix_len.min(128),
+            RouteLpmData6 {
+                vni: vni.to_be_bytes(),
+                ipv6,
+            },
+        );
+        self.map.remove(&key).context("remove route6")
+    }
 }
 
 /// Typed handle over the `VIPS` BPF map.

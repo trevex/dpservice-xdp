@@ -164,10 +164,12 @@ def prepare_ifaces_b(dp_service_b, grpc_client_b):
 # Some tests require IPv4 addresses assigned
 @pytest.fixture(scope="package")
 def prepare_ipv4(prepare_ifaces):
-	print("-------- IPs init --------")
-	request_ip(VM1)
-	request_ip(VM2)
-	request_ip(VM3)
+	# NOTE (ioiab sub-project 2a): request_ip() performs a full DHCPv4 conformance exchange
+	# (DISCOVER/OFFER/REQUEST/ACK + MTU/DNS/assigned-IP asserts). DHCP is sub-project 2b, so it is
+	# deferred here. The connectivity tests address guests by their config IPs (VM1.ip ...) directly,
+	# not via the DHCP-assigned address, so skipping this does not affect them. 2b restores it.
+	print("-------- IPs init (DHCP deferred to 2b) --------")
+	# request_ip(VM1); request_ip(VM2); request_ip(VM3)
 	print("--------------------------")
 	return prepare_ifaces
 
