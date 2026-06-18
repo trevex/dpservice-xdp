@@ -127,6 +127,18 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     // LB takes precedence: Maglev-select a backend underlay. If the backend is remote (not in
     // UNDERLAY), reforward the encapped packet directly to the backend node without decap.
     let lb_ul = crate::lb::lb_select_forward(ctx, ETH_LEN + IPV6_LEN, vni);
+
+    // ICMP error relay: if the outer IPv4 carries an ICMP error (type 3/11/12) whose embedded
+    // inner header targets an LB VIP, relay the encapped packet to the selected backend.
+    // This runs when lb_select_forward returned None (outer ICMP proto didn't match LB's TCP/UDP
+    // key) and handles the dpservice packet_relay_node ICMP-error forwarding semantics.
+    if lb_ul.is_none() {
+        if let Some(bul) = crate::lb::lb_select_forward_icmp_error(ctx, ETH_LEN + IPV6_LEN, vni) {
+            let local = LOCAL.get(0).ok_or(())?;
+            return Ok(crate::encap::reforward(ctx, local, &outer_dst, &bul));
+        }
+    }
+
     let deliver_u = match lb_ul {
         Some(bul) => match unsafe { crate::maps::UNDERLAY.get(&bul) } {
             Some(bu) => *bu,

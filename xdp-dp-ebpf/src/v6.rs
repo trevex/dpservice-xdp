@@ -7,6 +7,7 @@ use xdp_dp_common::{PortMeta, RouteLpmData6};
 
 use crate::arp_nd::GW_MAC;
 use crate::encap::encap_and_redirect;
+use crate::encap::reforward;
 use crate::maps::{LOCAL, ROUTES6, UNDERLAY};
 use crate::parse::{write6, ETH_LEN, ETH_P_IPV6, IPPROTO_IPV6, IPV6_LEN};
 
@@ -68,6 +69,19 @@ pub fn v6_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
         Some(u) => *u,
         None => return Ok(xdp_action::XDP_PASS),
     };
+    let vni = u.vni;
+    // IPv6 LB relay: if the inner IPv6 dst is an LB VIP, Maglev-select a backend and reforward
+    // the encapped packet without decap (matching dpservice's IPv6 LB relay semantics).
+    // The inner IPv6 header starts at ETH_LEN + IPV6_LEN (immediately after outer Eth+IPv6).
+    if let Some(bul) = crate::lb::lb_select_forward_v6(ctx, ETH_LEN + IPV6_LEN, vni) {
+        match unsafe { UNDERLAY.get(&bul) } {
+            Some(_) => {} // local backend: fall through to normal decap+deliver
+            None => {
+                let local = LOCAL.get(0).ok_or(())?;
+                return Ok(reforward(ctx, local, &outer_dst, &bul));
+            }
+        }
+    }
     if unsafe { bpf_xdp_adjust_head(ctx.ctx, IPV6_LEN as i32) } != 0 {
         return Err(());
     }
