@@ -78,6 +78,11 @@ cmd_up() {
     sudo ip netns exec guesta ip route add default via 10.0.0.1 2>/dev/null || true
     # LB backend: own the LB IP 10.0.0.200 as a secondary (anycast — backends reply from it).
     sudo ip netns exec guesta ip addr add 10.0.0.200/32 dev gA 2>/dev/null || true
+    # Dual-stack overlay v6: /128 + link route to the v6 gateway + v6 default (dpservice model,
+    # NO static neigh — the datapath answers ND for fd00:ff::1).
+    sudo ip netns exec guesta ip -6 addr add fd00:ff::5/128 dev gA nodad 2>/dev/null || true
+    sudo ip netns exec guesta ip -6 route add fd00:ff::1/128 dev gA 2>/dev/null || true
+    sudo ip netns exec guesta ip -6 route add default via fd00:ff::1 dev gA 2>/dev/null || true
 
     # ---- hypa second guest link: gA2-h in hypa <-> gA2 in guesta2 ----
     if ! sudo ip netns exec hypa ip link show gA2-h &>/dev/null; then
@@ -108,6 +113,10 @@ cmd_up() {
     sudo ip netns exec guestb ip addr add 10.0.0.6/32 dev gB 2>/dev/null || true
     sudo ip netns exec guestb ip route add 10.0.0.1/32 dev gB 2>/dev/null || true
     sudo ip netns exec guestb ip route add default via 10.0.0.1 2>/dev/null || true
+    # Dual-stack overlay v6 for guestb (peer of guesta's v6 overlay test).
+    sudo ip netns exec guestb ip -6 addr add fd00:ff::6/128 dev gB nodad 2>/dev/null || true
+    sudo ip netns exec guestb ip -6 route add fd00:ff::1/128 dev gB 2>/dev/null || true
+    sudo ip netns exec guestb ip -6 route add default via fd00:ff::1 dev gB 2>/dev/null || true
 
     # ---- hypb external target: gE-h in hypb <-> gE in extsrv (the "public" peer for NAT) ----
     if ! sudo ip netns exec hypb ip link show gE-h &>/dev/null; then
@@ -258,7 +267,10 @@ cmd_up() {
         --remote "10.0.0.9=fd00:c::9=0" \
         --external "10.0.0.9" \
         --meter "gA-h=1:0" \
-        --remote "10.0.0.6=fd00:b::206=100" &
+        --remote "10.0.0.6=fd00:b::206=100" \
+        --gateway6 "fd00:ff::1" \
+        --guest6 "gA-h=fd00:ff::5=fd00:a::5=0" \
+        --remote6 "fd00:ff::6=fd00:b::6=0" &
     echo $! >> "$PIDFILE"
 
     # hypb: one local guest (gB=10.0.0.6) + remote routes to both hypa guests
@@ -281,7 +293,10 @@ cmd_up() {
         --fw-rule "gB-h:in:accept:icmp:10.0.0.5/32:0.0.0.0/0:*" \
         --fw-rule "gB-h:in:drop:icmp:10.0.0.7/32:0.0.0.0/0:*" \
         --underlay-marker "fd00:b::50:0" \
-        --neigh-nat "10.0.0.50:20000:30000@fd00:a::5@0" &
+        --neigh-nat "10.0.0.50:20000:30000@fd00:a::5@0" \
+        --gateway6 "fd00:ff::1" \
+        --guest6 "gB-h=fd00:ff::6=fd00:b::6=0" \
+        --remote6 "fd00:ff::5=fd00:a::5=0" &
     echo $! >> "$PIDFILE"
 
     # hypc: the external client's node. extclient(10.0.0.9) replies to the NAT IP 10.0.0.50, which
@@ -570,6 +585,27 @@ cmd_test() {
         echo "  rate metering OK: flood throttled (${FLOOD}% loss), slow traffic passed"
     else
         echo "  WARNING: metering not behaving (flood loss=${FLOOD}%, slow_ok=${SLOW_OK})"
+    fi
+    echo ""
+
+    echo "=== Test 14: IPv6 ND — guesta resolves the v6 gateway via the datapath (NA = GW_MAC) ==="
+    # The datapath answers ICMPv6 Neighbor Solicitation for fd00:ff::1 with a Neighbor Advertisement
+    # carrying GW_MAC. A v6 ping triggers ND; guesta's neigh table must then show the gateway -> GW_MAC.
+    sudo ip netns exec guesta ping -6 -c 1 -W 2 fd00:ff::6 >/dev/null 2>&1 || true  # triggers ND
+    NB=$(sudo ip netns exec guesta ip -6 neigh show fd00:ff::1 2>/dev/null)
+    if echo "$NB" | grep -qi '02:00:00:00:00:01'; then
+        echo "  ND proof OK: datapath answered NS for the v6 gateway with GW_MAC"
+    else
+        echo "  WARNING: v6 gateway not resolved via datapath ND ($NB)"
+    fi
+    echo ""
+
+    echo "=== Test 15: IPv6 overlay — guesta(fd00:ff::5) -> guestb(fd00:ff::6) over the overlay ==="
+    # Dual-stack guest-to-guest native IPv6 over IPv6-in-IPv6 (outer next-header 41), routed by ROUTES6.
+    if sudo ip netns exec guesta ping -6 -c 3 -W 2 fd00:ff::6 >/dev/null 2>&1; then
+        echo "  IPv6 overlay OK: dual-stack guest-to-guest v6 ping works (IPv6-in-IPv6, proto 41)"
+    else
+        echo "  WARNING: IPv6 overlay ping failed"
     fi
     echo ""
 
