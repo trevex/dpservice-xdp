@@ -19,6 +19,12 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     if let Some(act) = crate::arp_nd::try_nd_reply(ctx, meta) {
         return Ok(act);
     }
+
+    // Answer DHCPv4 in-datapath.
+    if let Some(act) = crate::dhcp::try_dhcpv4_reply(ctx, meta) {
+        return Ok(act);
+    }
+
     // IPv6 inner frames take the v6 overlay path.
     {
         let d = ctx.data();

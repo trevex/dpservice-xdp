@@ -4,6 +4,7 @@
 mod arp_nd;
 mod conntrack;
 mod csum;
+mod dhcp;
 mod egress;
 mod encap;
 mod firewall;
