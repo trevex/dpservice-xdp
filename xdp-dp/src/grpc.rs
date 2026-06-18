@@ -299,6 +299,29 @@ fn encode_fw_rule(rule_id: Vec<u8>, r: xdp_dp_common::FwRule) -> FirewallRule {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Interface proto builder
+// ---------------------------------------------------------------------------
+
+/// Construct a `pb::Interface` from shadow-state fields.
+/// `primary_ipv4` and `primary_ipv6` are raw big-endian byte vectors (as defined by the proto).
+fn make_interface(
+    id: &[u8],
+    vni: u32,
+    ipv4: [u8; 4],
+    ipv6: [u8; 16],
+    underlay: [u8; 16],
+) -> pb::Interface {
+    pb::Interface {
+        id: id.to_vec(),
+        vni,
+        primary_ipv4: ipv4.to_vec(),
+        primary_ipv6: ipv6.to_vec(),
+        underlay_route: underlay.to_vec(),
+        ..Default::default()
+    }
+}
+
 #[tonic::async_trait]
 impl DpdKironcore for Service {
     async fn initialize(
@@ -445,20 +468,43 @@ impl DpdKironcore for Service {
         Ok(Response::new(CreateRouteResponse { status: ok() }))
     }
 
-    // --- stubs ---
+    // --- Interface observe ---
 
     async fn list_interfaces(
         &self,
         _req: Request<ListInterfacesRequest>,
     ) -> Result<Response<ListInterfacesResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let interfaces = control
+            .list_interfaces()
+            .into_iter()
+            .map(|(id, vni, ipv4, ipv6, underlay)| make_interface(&id, vni, ipv4, ipv6, underlay))
+            .collect();
+        Ok(Response::new(ListInterfacesResponse {
+            status: ok(),
+            interfaces,
+        }))
     }
 
     async fn get_interface(
         &self,
-        _req: Request<GetInterfaceRequest>,
+        req: Request<GetInterfaceRequest>,
     ) -> Result<Response<GetInterfaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let id = req.into_inner().interface_id;
+        match control.get_interface(&id) {
+            Some((vni, ipv4, ipv6, underlay)) => Ok(Response::new(GetInterfaceResponse {
+                status: ok(),
+                interface: Some(make_interface(&id, vni, ipv4, ipv6, underlay)),
+            })),
+            None => Err(Status::not_found("interface not found")),
+        }
     }
 
     async fn delete_interface(
