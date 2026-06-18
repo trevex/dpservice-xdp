@@ -298,6 +298,33 @@ pub struct FwMeta {
     pub egress_count: u32,
 }
 
+/// Max DNS servers per family carried in DHCP replies (dpservice's flags are repeatable; this caps
+/// the in-map array — 8 covers the conformance set + headroom).
+pub const DHCP_MAX_DNS: usize = 8;
+
+/// Server-wide DHCP config (DHCP_CONFIG[0]). Mirrors dpservice's --dhcp-mtu/--dhcp-dns/--dhcpv6-dns.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DhcpConfig {
+    pub mtu: u16,
+    pub dns4_len: u8, // number of valid entries in dns4
+    pub dns6_len: u8, // number of valid entries in dns6
+    pub dns4: [[u8; 4]; DHCP_MAX_DNS],
+    pub dns6: [[u8; 16]; DHCP_MAX_DNS],
+}
+
+/// Per-interface DHCP config (DHCP_META[ifindex]). hostname + PXE; the guest IP/MAC come from PORT_META.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DhcpMeta {
+    pub hostname: [u8; 64],
+    pub hostname_len: u8,
+    pub boot_filename: [u8; 64],
+    pub boot_filename_len: u8,
+    pub _pad: [u8; 2],
+    pub pxe_ip: [u8; 16], // pxe_config.next_server (v6 string -> 16 bytes); all-zero = no PXE
+}
+
 pub const FW_DIR_INGRESS: u8 = 0;
 pub const FW_DIR_EGRESS: u8 = 1;
 pub const FW_ACTION_DROP: u8 = 0;
@@ -415,6 +442,8 @@ mod user_impls {
     unsafe impl aya::Pod for FwMeta {}
     unsafe impl aya::Pod for NeighborNatEntry {}
     unsafe impl aya::Pod for MeterState {}
+    unsafe impl aya::Pod for DhcpConfig {}
+    unsafe impl aya::Pod for DhcpMeta {}
 }
 
 #[cfg(test)]
@@ -510,6 +539,15 @@ mod tests {
         // + 1 (enabled) + 3 (_pad) = 32.
         assert_eq!(core::mem::size_of::<NeighborNatEntry>(), 32);
         assert_eq!(core::mem::align_of::<NeighborNatEntry>(), 4);
+    }
+
+    #[test]
+    fn dhcp_layouts() {
+        assert_eq!(
+            core::mem::size_of::<DhcpConfig>(),
+            2 + 1 + 1 + 4 * DHCP_MAX_DNS + 16 * DHCP_MAX_DNS
+        );
+        assert_eq!(core::mem::size_of::<DhcpMeta>(), 64 + 1 + 64 + 1 + 2 + 16);
     }
 
     #[test]

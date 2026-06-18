@@ -3,9 +3,9 @@ use aya_ebpf::{
     maps::{lpm_trie::LpmTrie, Array, HashMap, LruHashMap},
 };
 use xdp_dp_common::{
-    Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
-    LbValue, Local, MaglevKey, MeterState, NatKey, NatValue, NeighborNatEntry, PortMeta,
-    RouteLpmData, RouteLpmData6, RouteValue, UnderlayValue, VipKey,
+    Config, CtEntry, CtKey, DhcpConfig, DhcpMeta, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue,
+    InspectEntry, LbKey, LbValue, Local, MaglevKey, MeterState, NatKey, NatValue, NeighborNatEntry,
+    PortMeta, RouteLpmData, RouteLpmData6, RouteValue, UnderlayValue, VipKey,
 };
 
 #[map]
@@ -58,3 +58,7 @@ pub static NEIGHBOR_NAT: HashMap<u32, NeighborNatEntry> = HashMap::with_max_entr
 pub static NEIGHBOR_NAT_COUNT: Array<u32> = Array::with_max_entries(1, 0);
 #[map]
 pub static METER: HashMap<u32, MeterState> = HashMap::with_max_entries(1024, 0);
+#[map]
+pub static DHCP_CONFIG: Array<DhcpConfig> = Array::with_max_entries(1, 0);
+#[map]
+pub static DHCP_META: HashMap<u32, DhcpMeta> = HashMap::with_max_entries(1024, 0);

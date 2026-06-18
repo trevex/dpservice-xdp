@@ -5,9 +5,9 @@ use aya::maps::{
 };
 use aya::Ebpf;
 use xdp_dp_common::{
-    Config, CtEntry, CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, InspectEntry, LbKey,
-    LbValue, Local, MaglevKey, MeterState, NatKey, NatValue, NeighborNatEntry, PortMeta,
-    RouteLpmData, RouteLpmData6, RouteValue, UnderlayValue, VipKey,
+    Config, CtEntry, CtKey, DhcpConfig, DhcpMeta, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue,
+    InspectEntry, LbKey, LbValue, Local, MaglevKey, MeterState, NatKey, NatValue, NeighborNatEntry,
+    PortMeta, RouteLpmData, RouteLpmData6, RouteValue, UnderlayValue, VipKey,
 };
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
@@ -556,6 +556,54 @@ impl NeighborNatCount {
         self.map
             .set(0, &count, 0)
             .context("write NEIGHBOR_NAT_COUNT[0]")
+    }
+}
+
+/// Typed handle over the single-entry `DHCP_CONFIG` Array map (server-wide DHCP parameters).
+#[allow(dead_code)]
+pub struct DhcpConfigMap {
+    map: Array<MapData, DhcpConfig>,
+}
+
+#[allow(dead_code)]
+impl DhcpConfigMap {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = Array::try_from(
+            ebpf.take_map("DHCP_CONFIG")
+                .context("DHCP_CONFIG map missing")?,
+        )?;
+        Ok(Self { map })
+    }
+
+    pub fn set(&mut self, cfg: &DhcpConfig) -> anyhow::Result<()> {
+        self.map.set(0, cfg, 0).context("write DHCP_CONFIG[0]")
+    }
+}
+
+/// Typed handle over the `DHCP_META` BPF map (ifindex -> per-interface DHCP metadata).
+#[allow(dead_code)]
+pub struct DhcpMetaMap {
+    map: HashMap<MapData, u32, DhcpMeta>,
+}
+
+#[allow(dead_code)]
+impl DhcpMetaMap {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(
+            ebpf.take_map("DHCP_META")
+                .context("DHCP_META map missing")?,
+        )?;
+        Ok(Self { map })
+    }
+
+    pub fn upsert(&mut self, ifindex: u32, meta: DhcpMeta) -> anyhow::Result<()> {
+        self.map
+            .insert(ifindex, meta, 0)
+            .context("insert dhcp_meta")
+    }
+
+    pub fn remove(&mut self, ifindex: u32) -> anyhow::Result<()> {
+        self.map.remove(&ifindex).context("remove dhcp_meta")
     }
 }
 
