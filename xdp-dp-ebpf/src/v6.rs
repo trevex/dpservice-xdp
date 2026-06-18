@@ -29,6 +29,18 @@ pub fn v6_guest_tx(ctx: &XdpContext, meta: &PortMeta) -> Result<u32, ()> {
             },
         ))
         .ok_or(())?;
+    // Local fast path: if the nexthop underlay is a LOCAL interface, deliver straight to that tap.
+    if let Some(u) = unsafe { UNDERLAY.get(&route.nexthop_ipv6) } {
+        if u.tap_ifindex != 0 && ctx.data() + ETH_LEN <= ctx.data_end() {
+            let q = ctx.data() as *mut u8;
+            unsafe {
+                write6(q, &u.guest_mac);
+                write6(q.add(6), &GW_MAC);
+                core::ptr::write_unaligned(q.add(12) as *mut u16, ETH_P_IPV6.to_be());
+            }
+            return Ok(unsafe { bpf_redirect(u.tap_ifindex, 0) } as u32);
+        }
+    }
     let inner_len = (data_end - data - ETH_LEN) as u16;
     let local = LOCAL.get(0).ok_or(())?;
     encap_and_redirect(

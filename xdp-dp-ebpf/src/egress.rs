@@ -2,8 +2,8 @@ use aya_ebpf::{bindings::xdp_action, programs::XdpContext};
 
 use crate::arp_nd::try_arp_reply;
 use crate::encap::encap_and_redirect;
-use crate::maps::{LOCAL, PORT_META, ROUTES};
-use crate::parse::{ETH_LEN, ETH_P_IP};
+use crate::maps::{LOCAL, PORT_META, ROUTES, UNDERLAY};
+use crate::parse::{write6, ETH_LEN, ETH_P_IP};
 
 pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     // Identify the port by its ingress ifindex.
@@ -79,20 +79,35 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
             },
         ))
         .ok_or(())?;
-    // Network NAT: SNAT guest -> nat_ip:port when the dst route is external and the guest has a
-    // NAT config. Rewrites the packet in place; the route (dst unchanged) still encaps correctly.
+    // Network NAT: SNAT guest -> nat_ip:port when the dst route is external.
     let is_ext = route.is_external != 0;
     crate::nat::nat_snat_egress(ctx, ETH_LEN, meta.vni, is_ext);
-    // Track every flow: if no conntrack entry exists for this (post-NAT) 5-tuple, insert DEFAULT.
+    // Track every flow.
     if let Some(key) = crate::conntrack::ct_key(ctx.data(), ctx.data_end(), ETH_LEN, meta.vni) {
         if unsafe { crate::maps::CONNTRACK.get(&key) }.is_none() {
             crate::conntrack::ct_ensure_default(ctx, ETH_LEN, &key);
         }
     }
-    // Rate metering: per-source-interface token bucket on the egress frame.
+    // Rate metering.
     let frame_len = (ctx.data_end() - ctx.data()) as u64;
-    if !crate::meter::meter_pass(ifindex, frame_len, route.is_external != 0) {
+    if !crate::meter::meter_pass(ifindex, frame_len, is_ext) {
         return Ok(xdp_action::XDP_DROP);
+    }
+    // Local fast path: if the route's nexthop underlay is one of our own LOCAL interfaces, deliver
+    // straight to that tap (no encap, no PF hairpin). LB anycast entries have tap_ifindex==0 and
+    // are skipped (they encap to the selected backend underlay as usual).
+    if let Some(u) = unsafe { UNDERLAY.get(&route.nexthop_ipv6) } {
+        if u.tap_ifindex != 0 {
+            let q = ctx.data() as *mut u8;
+            if ctx.data() + ETH_LEN <= ctx.data_end() {
+                unsafe {
+                    write6(q, &u.guest_mac); // dst = local guest MAC
+                    write6(q.add(6), &crate::arp_nd::GW_MAC); // src = gateway MAC
+                                                              // ethertype stays ETH_P_IP
+                }
+                return Ok(unsafe { aya_ebpf::helpers::bpf_redirect(u.tap_ifindex, 0) } as u32);
+            }
+        }
     }
     let inner_len = (data_end - data - ETH_LEN) as u16;
     let local = LOCAL.get(0).ok_or(())?;
