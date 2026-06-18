@@ -46,29 +46,29 @@ def pytest_addoption(parser):
 		"--ha", action="store_true", help="Run two dpservice instances"
 	)
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def build_path(request):
 	return request.config.getoption("--build-path")
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def port_redundancy(request):
 	return request.config.getoption("--port-redundancy")
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def fast_flow_timeout(request):
 	return request.config.getoption("--fast-flow-timeout")
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def ha_mode(request):
 	return request.config.getoption("--ha")
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def grpc_client(request, build_path):
 	if request.config.getoption("--dpgrpc"):
 		return DpGrpcClient(build_path)
 	return GrpcClient(build_path, grpc_port)
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def grpc_client_b(build_path):
 	return GrpcClient(build_path, grpc_port_b)
 
@@ -106,7 +106,7 @@ def _dp_service(request, build_path, port_redundancy, fast_flow_timeout, seconda
 	print("--------------------------")
 	return dp_service
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def sync_setup(request, ha_mode):
 	if not ha_mode:
 		return
@@ -130,7 +130,7 @@ def sync_setup(request, ha_mode):
 		run_command(f"sysctl net.ipv6.conf.{iface}.disable_ipv6=1")
 		run_command(f"ip link set {iface} up")
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def dp_service(request, build_path, port_redundancy, fast_flow_timeout, ha_mode, sync_setup):
 	return _dp_service(request, build_path, port_redundancy, fast_flow_timeout, secondary=False, ha=ha_mode)
 
@@ -143,7 +143,7 @@ def dp_service_b(request, build_path, port_redundancy, fast_flow_timeout, ha_mod
 
 
 # Most tests require interfaces to be up and routing established
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def prepare_ifaces(request, dp_service, grpc_client):
 	if request.config.getoption("--attach"):
 		dp_service.attach(grpc_client)
@@ -162,7 +162,7 @@ def prepare_ifaces_b(dp_service_b, grpc_client_b):
 
 
 # Some tests require IPv4 addresses assigned
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def prepare_ipv4(prepare_ifaces):
 	# NOTE (ioiab sub-project 2a): request_ip() performs a full DHCPv4 conformance exchange
 	# (DISCOVER/OFFER/REQUEST/ACK + MTU/DNS/assigned-IP asserts). DHCP is sub-project 2b, so it is
@@ -175,7 +175,7 @@ def prepare_ipv4(prepare_ifaces):
 
 
 # Telemetry tests require a running prometheus exporter
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def start_exporter(request, build_path):
 	print("-------- Exporter init --------")
 	exporter = Exporter(build_path)
