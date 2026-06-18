@@ -212,6 +212,15 @@ enum Cmd {
         /// Programs the ROUTES6 LPM trie so v6_guest_tx can forward overlay IPv6 packets.
         #[arg(long = "remote6")]
         remotes6: Vec<String>,
+        /// DHCP MTU option (server-wide). Defaults to 1500 if unset.
+        #[arg(long = "dhcp-mtu")]
+        dhcp_mtu: Option<u32>,
+        /// DHCPv4 DNS server, repeatable (server-wide).
+        #[arg(long = "dhcp-dns")]
+        dhcp_dns: Vec<String>,
+        /// DHCPv6 DNS server, repeatable (server-wide).
+        #[arg(long = "dhcpv6-dns")]
+        dhcpv6_dns: Vec<String>,
     },
 }
 
@@ -233,9 +242,9 @@ async fn main() -> anyhow::Result<()> {
             gateway_mac,
             conntrack_max,
             pin_dir: _pin_dir,
-            dhcp_mtu: _dhcp_mtu,
-            dhcp_dns: _dhcp_dns,
-            dhcpv6_dns: _dhcpv6_dns,
+            dhcp_mtu,
+            dhcp_dns,
+            dhcpv6_dns,
         } => {
             if let Some(n) = conntrack_max {
                 // SAFETY: single-threaded CLI startup, before any datapath thread is spawned.
@@ -254,6 +263,16 @@ async fn main() -> anyhow::Result<()> {
                 parse_mac(&gateway_mac)?,
                 underlay,
             )?;
+            let dns4: Vec<[u8; 4]> = dhcp_dns
+                .iter()
+                .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok().map(|a| a.octets()))
+                .collect();
+            let dns6: Vec<[u8; 16]> = dhcpv6_dns
+                .iter()
+                .filter_map(|s| s.parse::<std::net::Ipv6Addr>().ok().map(|a| a.octets()))
+                .collect();
+            ctrl.set_dhcp_config(dhcp_mtu.unwrap_or(1500) as u16, &dns4, &dns6)
+                .map_err(|e| anyhow::anyhow!(e))?;
             tokio::spawn(conntrack_gc::run(
                 ctrl.take_conntrack(),
                 std::time::Duration::from_secs(10),
@@ -295,6 +314,9 @@ async fn main() -> anyhow::Result<()> {
             gateway6,
             guests6,
             remotes6,
+            dhcp_mtu,
+            dhcp_dns,
+            dhcpv6_dns,
         } => {
             // HA adopt path: re-open the pinned CONNTRACK and resume GC; no load/attach.
             if adopt {
@@ -849,6 +871,36 @@ async fn main() -> anyhow::Result<()> {
                         public_last_ns: 0,
                     },
                 )?;
+            }
+
+            // DHCP_CONFIG: program server-wide DHCP options (MTU + DNS servers).
+            {
+                let mut dhcp_config_map = maps::DhcpConfigMap::open(&mut ebpf)?;
+                let dns4: Vec<[u8; 4]> = dhcp_dns
+                    .iter()
+                    .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok().map(|a| a.octets()))
+                    .collect();
+                let dns6: Vec<[u8; 16]> = dhcpv6_dns
+                    .iter()
+                    .filter_map(|s| s.parse::<std::net::Ipv6Addr>().ok().map(|a| a.octets()))
+                    .collect();
+                let mtu = dhcp_mtu.unwrap_or(1500) as u16;
+                let dns4_len = dns4.len().min(xdp_dp_common::DHCP_MAX_DNS) as u8;
+                let dns6_len = dns6.len().min(xdp_dp_common::DHCP_MAX_DNS) as u8;
+                let mut cfg = xdp_dp_common::DhcpConfig {
+                    mtu,
+                    dns4_len,
+                    dns6_len,
+                    dns4: [[0; 4]; xdp_dp_common::DHCP_MAX_DNS],
+                    dns6: [[0; 16]; xdp_dp_common::DHCP_MAX_DNS],
+                };
+                for (i, a) in dns4.iter().take(xdp_dp_common::DHCP_MAX_DNS).enumerate() {
+                    cfg.dns4[i] = *a;
+                }
+                for (i, a) in dns6.iter().take(xdp_dp_common::DHCP_MAX_DNS).enumerate() {
+                    cfg.dns6[i] = *a;
+                }
+                dhcp_config_map.set(&cfg)?;
             }
 
             // Pin CONNTRACK BEFORE take_map (Conntrack::open) — take_map removes the map from

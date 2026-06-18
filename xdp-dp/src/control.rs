@@ -13,8 +13,8 @@ use xdp_dp_common::{
 use crate::grpc::LbIpBytes;
 use crate::loader;
 use crate::maps::{
-    Conntrack, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev, Meter, Nat, NatIps,
-    NeighborNat, NeighborNatCount, PortMetaMap, Routes, Routes6, Vips,
+    Conntrack, DhcpConfigMap, DhcpMetaMap, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev,
+    Meter, Nat, NatIps, NeighborNat, NeighborNatCount, PortMetaMap, Routes, Routes6, Vips,
 };
 
 /// Full detail record for a registered local interface (shadow of eBPF map state).
@@ -102,6 +102,8 @@ struct Inner {
     neigh_nat: NeighborNat,
     neigh_nat_count: NeighborNatCount,
     nat_ips: NatIps,
+    dhcp_config: DhcpConfigMap,
+    dhcp_meta: DhcpMetaMap,
     /// In-memory neighbor NAT entries (drives the BPF map reprogram).
     neigh_nats: Vec<NeighborNatEntry>,
     /// loadbalancer_id -> its LB state.
@@ -164,6 +166,8 @@ impl Control {
         let neigh_nat = NeighborNat::open(&mut ebpf)?;
         let neigh_nat_count = NeighborNatCount::open(&mut ebpf)?;
         let nat_ips = NatIps::open(&mut ebpf)?;
+        let dhcp_config = DhcpConfigMap::open(&mut ebpf)?;
+        let dhcp_meta = DhcpMetaMap::open(&mut ebpf)?;
         let conntrack = Arc::new(Mutex::new(Conntrack::open(&mut ebpf)?));
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -184,6 +188,8 @@ impl Control {
                 neigh_nat,
                 neigh_nat_count,
                 nat_ips,
+                dhcp_config,
+                dhcp_meta,
                 neigh_nats: Vec::new(),
                 lbs: HashMap::new(),
                 next_table_id: 1,
@@ -204,6 +210,57 @@ impl Control {
     /// Return a shared handle to the conntrack map (for the GC task and flush operations).
     pub fn take_conntrack(&self) -> Arc<Mutex<Conntrack>> {
         Arc::clone(&self.conntrack)
+    }
+
+    pub fn set_dhcp_config(
+        &self,
+        mtu: u16,
+        dns4: &[[u8; 4]],
+        dns6: &[[u8; 16]],
+    ) -> anyhow::Result<()> {
+        let mut cfg = xdp_dp_common::DhcpConfig {
+            mtu,
+            dns4_len: dns4.len().min(xdp_dp_common::DHCP_MAX_DNS) as u8,
+            dns6_len: dns6.len().min(xdp_dp_common::DHCP_MAX_DNS) as u8,
+            dns4: [[0; 4]; xdp_dp_common::DHCP_MAX_DNS],
+            dns6: [[0; 16]; xdp_dp_common::DHCP_MAX_DNS],
+        };
+        for (i, a) in dns4.iter().take(xdp_dp_common::DHCP_MAX_DNS).enumerate() {
+            cfg.dns4[i] = *a;
+        }
+        for (i, a) in dns6.iter().take(xdp_dp_common::DHCP_MAX_DNS).enumerate() {
+            cfg.dns6[i] = *a;
+        }
+        self.inner.lock().unwrap().dhcp_config.set(&cfg)
+    }
+
+    pub fn set_dhcp_meta(
+        &self,
+        interface_id: &[u8],
+        hostname: &[u8],
+        pxe_ip: [u8; 16],
+        boot_filename: &[u8],
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let ifindex = *g
+            .by_ifindex
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        let mut m = xdp_dp_common::DhcpMeta {
+            hostname: [0; 64],
+            hostname_len: 0,
+            boot_filename: [0; 64],
+            boot_filename_len: 0,
+            _pad: [0; 2],
+            pxe_ip,
+        };
+        let hl = hostname.len().min(64);
+        m.hostname[..hl].copy_from_slice(&hostname[..hl]);
+        m.hostname_len = hl as u8;
+        let bl = boot_filename.len().min(64);
+        m.boot_filename[..bl].copy_from_slice(&boot_filename[..bl]);
+        m.boot_filename_len = bl as u8;
+        g.dhcp_meta.upsert(ifindex, m)
     }
 
     fn meter_state(total_mbps: u64, public_mbps: u64) -> xdp_dp_common::MeterState {
@@ -404,6 +461,7 @@ impl Control {
         let _ = g.ifaces.remove(IfaceKey::new(rec.vni, rec.ipv4));
         let _ = g.underlay.remove(&rec.underlay);
         let _ = g.meter.remove(&tap);
+        let _ = g.dhcp_meta.remove(tap);
         // Remove the local self-route(s) programmed in program_iface_maps.
         let _ = g.routes.remove(rec.vni, rec.ipv4, 32);
         if rec.ipv6 != [0u8; 16] {

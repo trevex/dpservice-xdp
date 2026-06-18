@@ -53,6 +53,9 @@ class DpService:
 			f" --gateway={gateway_ip}"
 			f" --gateway6={gateway_ipv6}"
 			f" --gateway-mac=ff:ff:ff:ff:ff:ff"
+			f" --dhcp-mtu={dhcp_mtu}"
+			f" --dhcp-dns={dhcp_dns1} --dhcp-dns={dhcp_dns2}"
+			f" --dhcpv6-dns={dhcpv6_dns1} --dhcpv6-dns={dhcpv6_dns2}"
 		)
 		if test_virtsvc:
 			self.cmd += (f' --udp-virtsvc="{virtsvc_udp_virtual_ip},{virtsvc_udp_virtual_port},{virtsvc_udp_svc_ipv6},{virtsvc_udp_svc_port}"'
