@@ -172,9 +172,20 @@ kernel-resident maps cover the failover motive in an all-`xdp-dp` deployment, an
 dpservice/xdp-dp HA pairs are not a requirement. **Milestone M13.**
 
 ### 4.9 Packet capture (`Capture*`)
-dpservice offloads capture via `rte_flow` mirror to a pcap sink. XDP analog: a capture flag in
-config + `bpf_perf_event_output`/ringbuf to stream matched packets to a userspace pcap writer.
-`CaptureStart`/`CaptureStop`/`CaptureStatus`. **Milestone M14.**
+dpservice offloads capture via `rte_flow` mirror to a remote pcap sink. The on-wire mirror format is
+`| Outer Ether(14) | Outer IPv6(40) | UDP(8) | Captured Ether frame |` (the 62-byte prefix the sink
+strips with `editcap -C 62`), sent to `CaptureConfig.sink_node_ip:udp_dst_port`.
+`CaptureStart`/`CaptureStop`/`CaptureStatus`. **Milestone M14 — DEFERRED (2026-06-18).**
+
+**Decided model (when resumed):** dpservice **sink-mirror** (wire-compatible) — honor
+`sink_node_ip` + `udp_src_port`/`udp_dst_port` + per-interface `filter`. Mechanism: pure XDP has **no
+packet-clone helper**, so the faithful approach is userspace-assisted — eBPF ring-buffers matched
+frames (per-ifindex capture flag set on the VF-rx `guest_tx` and PF-rx `uplink_rx` hooks, original
+forwarding untouched) to the `xdp-dp` process, which forwards each captured Ethernet frame as the UDP
+payload to `sink_node_ip:udp_dst_port` via a socket bound to the local underlay (src port =
+`udp_src_port`). The kernel prepends Eth+IPv6+UDP, reproducing dpservice's exact 62-byte wire format.
+Rejected alternative: ringbuf → local `.pcap` (leaves `sink_node_ip`/UDP fields unused, not
+wire-faithful).
 
 ### 4.10 IPv6 overlay tenants
 Foundation kept the overlay IPv4-over-IPv6. Full parity (and NAT64) needs IPv6 **tenant** support:
