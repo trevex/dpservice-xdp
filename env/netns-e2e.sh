@@ -335,13 +335,17 @@ cmd_test() {
     sudo ip netns exec guesta ping -c 3 -W 2 10.0.0.6
     echo ""
 
-    echo "=== Test 2: DATAPATH ARP proof — 10.0.0.1 must show GW_MAC 02:00:00:00:00:01 ==="
-    sudo ip netns exec guesta ip neigh show 10.0.0.1
+    echo "=== Test 2: DATAPATH ARP proof — 10.0.0.1 resolves to the datapath gateway MAC ==="
+    # dpservice-style virtual gateway: the datapath answers ARP for the gateway using the VF's OWN
+    # MAC (point-to-point L2). So guesta's neigh for 10.0.0.1 must show guesta's own gA MAC.
+    GA_OWN_MAC=$(sudo ip netns exec guesta cat /sys/class/net/gA/address)
+    sudo ip netns exec guesta ping -c1 -W1 10.0.0.6 >/dev/null 2>&1 || true  # trigger ARP
     NEIGH=$(sudo ip netns exec guesta ip neigh show 10.0.0.1)
-    if echo "$NEIGH" | grep -q "02:00:00:00:00:01"; then
-        echo "  ARP proof OK: datapath replied with GW_MAC"
+    echo "  $NEIGH"
+    if echo "$NEIGH" | grep -qi "$GA_OWN_MAC"; then
+        echo "  ARP proof OK: datapath replied with the VF's own MAC ($GA_OWN_MAC)"
     else
-        echo "  WARNING: expected lladdr 02:00:00:00:00:01 but got: $NEIGH"
+        echo "  WARNING: expected lladdr $GA_OWN_MAC but got: $NEIGH"
     fi
     echo ""
 
@@ -588,13 +592,14 @@ cmd_test() {
     fi
     echo ""
 
-    echo "=== Test 14: IPv6 ND — guesta resolves the v6 gateway via the datapath (NA = GW_MAC) ==="
-    # The datapath answers ICMPv6 Neighbor Solicitation for fd00:ff::1 with a Neighbor Advertisement
-    # carrying GW_MAC. A v6 ping triggers ND; guesta's neigh table must then show the gateway -> GW_MAC.
+    echo "=== Test 14: IPv6 ND — guesta resolves the v6 gateway via the datapath (NA = VF's own MAC) ==="
+    # The datapath answers ICMPv6 NS for fd00:ff::1 with a Neighbor Advertisement carrying the VF's
+    # own MAC (dpservice-style virtual gateway). A v6 ping triggers ND; the neigh must then resolve.
+    GA_OWN_MAC=$(sudo ip netns exec guesta cat /sys/class/net/gA/address)
     sudo ip netns exec guesta ping -6 -c 1 -W 2 fd00:ff::6 >/dev/null 2>&1 || true  # triggers ND
     NB=$(sudo ip netns exec guesta ip -6 neigh show fd00:ff::1 2>/dev/null)
-    if echo "$NB" | grep -qi '02:00:00:00:00:01'; then
-        echo "  ND proof OK: datapath answered NS for the v6 gateway with GW_MAC"
+    if echo "$NB" | grep -qi "$GA_OWN_MAC"; then
+        echo "  ND proof OK: datapath answered NS for the v6 gateway with the VF's own MAC ($GA_OWN_MAC)"
     else
         echo "  WARNING: v6 gateway not resolved via datapath ND ($NB)"
     fi

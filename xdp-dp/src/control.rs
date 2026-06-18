@@ -585,6 +585,8 @@ impl Control {
         g.by_id.values().any(|r| r.vni == vni)
             || g.routes_shadow.iter().any(|&(v, _, _, _, _)| v == vni)
             || g.routes6_shadow.iter().any(|&(v, _, _, _, _)| v == vni)
+            || g.lbs.values().any(|lb| lb.vni == vni)
+            || g.neigh_nats.iter().any(|n| n.vni == vni)
     }
 
     pub fn reset_vni(&self, vni: u32) -> anyhow::Result<()> {

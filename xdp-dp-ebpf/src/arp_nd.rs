@@ -41,13 +41,16 @@ pub fn try_arp_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
     // Capture requester fields before overwriting.
     let sender_mac = unsafe { core::ptr::read_unaligned(arp.add(8) as *const [u8; 6]) };
     let spa = unsafe { core::ptr::read_unaligned(arp.add(14) as *const [u8; 4]) };
+    // dpservice presents the virtual gateway to each VF using that VF's OWN MAC (point-to-point
+    // L2), so the guest caches the gateway at its own MAC. Answer ARP with the guest's MAC.
+    let gw_mac = meta.guest_mac;
     unsafe {
-        // Ethernet: dst = requester MAC, src = gateway MAC.
+        // Ethernet: dst = requester MAC, src = gateway MAC (= guest's own MAC).
         write6(p, &sender_mac);
-        write6(p.add(6), &GW_MAC);
-        // ARP: opcode = reply(2); sha = GW_MAC, spa = gateway IP; tha = requester MAC, tpa = requester IP.
+        write6(p.add(6), &gw_mac);
+        // ARP: opcode = reply(2); sha = gw_mac, spa = gateway IP; tha = requester MAC, tpa = requester IP.
         core::ptr::write_unaligned(arp.add(6) as *mut u16, 2u16.to_be());
-        write6(arp.add(8), &GW_MAC);
+        write6(arp.add(8), &gw_mac);
         core::ptr::write_unaligned(arp.add(14) as *mut [u8; 4], meta.gateway_ipv4);
         write6(arp.add(18), &sender_mac);
         core::ptr::write_unaligned(arp.add(24) as *mut [u8; 4], spa);
@@ -104,9 +107,11 @@ pub fn try_nd_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
     }
     let req_mac = unsafe { core::ptr::read_unaligned(p as *const [u8; 6]) };
     let req_src = unsafe { core::ptr::read_unaligned(ip.add(8) as *const [u8; 16]) };
+    // Like ARP, present the virtual v6 gateway to the VF using the guest's own MAC.
+    let gw_mac = meta.guest_mac;
     unsafe {
         write6(p, &req_mac);
-        write6(p.add(6), &GW_MAC);
+        write6(p.add(6), &gw_mac);
         write16(ip.add(8), &meta.gateway_ipv6);
         write16(ip.add(24), &req_src);
         *ip.add(7) = 255;
@@ -118,10 +123,10 @@ pub fn try_nd_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
         *icmp.add(5) = 0;
         *icmp.add(6) = 0;
         *icmp.add(7) = 0;
-        // target @ +8 stays = gateway. Option @ +24: type=2 (target LL addr), len=1, GW_MAC.
+        // target @ +8 stays = gateway. Option @ +24: type=2 (target LL addr), len=1, gw_mac.
         *icmp.add(24) = 2;
         *icmp.add(25) = 1;
-        write6(icmp.add(26), &GW_MAC);
+        write6(icmp.add(26), &gw_mac);
         let mut sum: u32 = 0;
         let mut k = 0;
         while k < 16 {
