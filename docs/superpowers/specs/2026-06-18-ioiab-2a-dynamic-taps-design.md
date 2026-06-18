@@ -106,11 +106,17 @@ Vendor dpservice `test/local` into `test/conformance/`. **Adapt scaffolding only
   `--local-underlay=fc00:1::1`, `--grpc-port`, `--gateway`/`--gateway6` from `config.py`) instead of
   `dpservice-bin`. Keep the existing `--attach` path (start `xdp-dp` out-of-band, run pytest against
   it). The harness must create the veth topology + enablers before launch and tear it down after.
-- **gRPC client shim** (`grpc_client.py`): reimplement the methods the non-DHCP tests call
-  (`addinterface`/`delinterface`, `addroute`/`delroute`, `addvip`/`delvip`, `addfwallrule`/
-  `delfwallrule`, `addlb`/`dellb`/`addlbtarget`, `addnat`/`addnat_neigh`, `addpfx`, `listroutes`,
-  …) with `grpcio` against `proto/dpdk.proto`, removing the C++/Go `dpservice-cli` dependency.
-  `config.py` underlay/overlay/MAC constants are reused as-is.
+- **gRPC client = the real `dpservice-cli`** (decided): the harness's `grpc_client.py` is reused
+  **unchanged** — it shells out to `dpservice-cli --address=localhost:<port> -o json <subcommand>`
+  and parses the JSON. `dpservice-cli` is a generic client for the same `DPDKironcore` contract
+  `xdp-dp` implements, so it drives us directly; this also validates our wire responses against the
+  *actual* client metalnet's ecosystem uses. A pinned released `dpservice-cli` binary is fetched as
+  a test dependency (dev shell / CI), at the version matching `proto/dpdk.proto`. `config.py`
+  constants are reused as-is. **Implication for `grpc.rs`:** every response `xdp-dp` returns must
+  populate its proto fields correctly (e.g. `list_interfaces` → real `Interface` messages with
+  `spec`, `delete_*` → proper `Status`), because `dpservice-cli` renders JSON from those fields and
+  the tests assert on them (`spec['underlay_route']`, `status['code']`, `source`). No `xdp-dp ctl`
+  CLI and no python `grpcio` shim are built.
 
 ## 5. Data flow
 
