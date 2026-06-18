@@ -746,7 +746,23 @@ cp -r <dpservice>/test/local/* test/conformance/
 echo "vendored from ironcore-dev/dpservice test/local @ v0.3.22" > test/conformance/VENDORED.md
 ```
 
-- [ ] **Step 2: Pin `dpservice-cli`.** Fetch the released `dpservice-cli` binary matching `proto/dpdk.proto` into `test/conformance/bin/dpservice-cli` (gitignored or LFS; a `fetch-cli.sh` that curls the GitHub release asset for the pinned tag). The vendored `grpc_client.py` already builds the path as `build_path + "/cli/dpservice-cli/dpservice-cli"`; pass `--build-path=test/conformance` and symlink so that path resolves, OR edit `grpc_client.py`'s `self.cmd` to `test/conformance/bin/dpservice-cli` (scaffolding edit, allowed).
+- [ ] **Step 2: Build the real `dpservice-cli` from source.** (Environment reality: the standalone `ironcore-dev/dpservice-cli` release binaries are stale at v0.3.2; the current CLI lives in the dpservice repo at `cli/dpservice-cli`. Go **is** available via Nix — `go` in the flake store path.) A `test/conformance/fetch-cli.sh`:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+DST="$(cd "$(dirname "$0")" && pwd)/bin"; mkdir -p "$DST"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+git clone --depth 1 --branch v0.3.22 https://github.com/ironcore-dev/dpservice "$TMP/dpservice"
+( cd "$TMP/dpservice/cli/dpservice-cli" && go build -o "$DST/dpservice-cli" . )
+"$DST/dpservice-cli" -v
+```
+Gitignore `test/conformance/bin/`. The vendored `grpc_client.py` builds the cli path as `build_path + "/cli/dpservice-cli/dpservice-cli"`; edit `grpc_client.py`'s `self.cmd` to `f"{here}/bin/dpservice-cli"` (scaffolding edit, allowed) so it resolves regardless of `--build-path`. If `go build` fails on a missing proto-gen step, run the repo's documented codegen (`make` target under `cli/dpservice-cli`) or fall back to `go install` of the module.
+
+- [ ] **Step 2b: Provision python+scapy+pytest via the flake.** The flake devShell currently has bare `pkgs.python3` (no scapy/pytest). In `flake.nix`, replace `pkgs.python3  # serial-console driver...` with:
+```nix
+            (pkgs.python3.withPackages (ps: with ps; [ scapy pytest ]))  # tap-vm-smoke + conformance harness
+```
+Verify: `nix develop -c python3 -c 'import scapy, pytest; print("ok")'` → `ok`. `run.sh` (Step 6) invokes pytest through `nix develop -c` so the harness always has its deps.
 
 - [ ] **Step 3: veth substitution + enablers** — `test/conformance/setup-net.sh`:
 
@@ -813,13 +829,13 @@ cd "$(dirname "$0")/../.."
 cargo build -p xdp-dp
 trap './test/conformance/setup-net.sh down' EXIT INT TERM
 ./test/conformance/setup-net.sh up
-# Run the non-DHCP suite. --attach makes conftest connect to the serve daemon we (or dp_service.py)
-# start; here we let dp_service.py launch xdp-dp via the patched cmd.
+# Run the non-DHCP suite via the flake devShell python (scapy+pytest). dp_service.py launches
+# xdp-dp serve via the patched cmd; conftest waits for the gRPC port.
 cd test/conformance
-python3 -m pytest -q \
+nix develop "$(git rev-parse --show-toplevel)" -c python3 -m pytest -q \
   test_vf_to_vf.py test_vf_to_pf.py test_pf_to_vf.py test_encap.py \
   test_arp.py test_ipv6_nd.py test_flows.py test_lb.py test_nat.py test_vni.py test_zzz_grpc.py \
-  --build-path="$(pwd)/../.." "$@"
+  --build-path="$(git rev-parse --show-toplevel)" "$@"
 ```
 
 - [ ] **Step 7: Smoke one test.**
