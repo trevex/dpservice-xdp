@@ -78,6 +78,8 @@ struct Inner {
     fw: HashMap<u32, Vec<(Vec<u8>, FwRule)>>,
     /// interface_id -> the owned guest_tx XDP link (dropping it detaches the program).
     links: HashMap<Vec<u8>, XdpLink>,
+    /// (vni, prefix_ipv4, prefix_len, nexthop_underlay) for list/delete_route.
+    routes_shadow: Vec<(u32, [u8; 4], u32, [u8; 16])>,
 }
 
 impl Control {
@@ -140,6 +142,7 @@ impl Control {
                 prefixes: HashMap::new(),
                 fw: HashMap::new(),
                 links: HashMap::new(),
+                routes_shadow: Vec::new(),
             }),
             conntrack: Mutex::new(Some(conntrack)),
         })
@@ -382,6 +385,46 @@ impl Control {
                 _pad: [0; 3],
             },
         )?;
+        g.routes_shadow.push((vni, ipv4, prefix_len, nexthop_ipv6));
+        Ok(())
+    }
+
+    pub fn delete_route(&self, vni: u32, ipv4: [u8; 4], prefix_len: u32) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let _ = g.routes.remove(vni, ipv4, prefix_len);
+        g.routes_shadow
+            .retain(|&(v, p, l, _)| !(v == vni && p == ipv4 && l == prefix_len));
+        Ok(())
+    }
+
+    pub fn list_routes(&self, vni: u32) -> Vec<([u8; 4], u32, [u8; 16])> {
+        let g = self.inner.lock().unwrap();
+        g.routes_shadow
+            .iter()
+            .filter(|&&(v, _, _, _)| v == vni)
+            .map(|&(_, p, l, n)| (p, l, n))
+            .collect()
+    }
+
+    pub fn vni_in_use(&self, vni: u32) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.by_id.values().any(|r| r.vni == vni)
+            || g.routes_shadow.iter().any(|&(v, _, _, _)| v == vni)
+    }
+
+    pub fn reset_vni(&self, vni: u32) -> anyhow::Result<()> {
+        // Remove all routes for the vni (interfaces are torn down via DeleteInterface).
+        let to_del: Vec<_> = {
+            let g = self.inner.lock().unwrap();
+            g.routes_shadow
+                .iter()
+                .filter(|&&(v, _, _, _)| v == vni)
+                .map(|&(_, p, l, _)| (p, l))
+                .collect()
+        };
+        for (p, l) in to_del {
+            self.delete_route(vni, p, l)?;
+        }
         Ok(())
     }
 

@@ -927,30 +927,92 @@ impl DpdKironcore for Service {
 
     async fn list_routes(
         &self,
-        _req: Request<ListRoutesRequest>,
+        req: Request<ListRoutesRequest>,
     ) -> Result<Response<ListRoutesResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let vni = req.into_inner().vni;
+        let routes = control
+            .list_routes(vni)
+            .into_iter()
+            .map(|(p, l, n)| pb::Route {
+                prefix: Some(Prefix {
+                    length: l,
+                    ip: Some(IpAddress {
+                        ipver: IpVersion::Ipv4 as i32,
+                        address: p.to_vec(),
+                    }),
+                    underlay_route: Vec::new(),
+                }),
+                nexthop_address: Some(IpAddress {
+                    ipver: IpVersion::Ipv6 as i32,
+                    address: n.to_vec(),
+                }),
+                nexthop_vni: vni,
+                weight: 0,
+            })
+            .collect();
+        Ok(Response::new(ListRoutesResponse {
+            status: ok(),
+            routes,
+        }))
     }
 
     async fn delete_route(
         &self,
-        _req: Request<DeleteRouteRequest>,
+        req: Request<DeleteRouteRequest>,
     ) -> Result<Response<DeleteRouteResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let vni = r.vni;
+        let route = r
+            .route
+            .ok_or_else(|| Status::invalid_argument("route is required"))?;
+        let prefix = route
+            .prefix
+            .ok_or_else(|| Status::invalid_argument("route.prefix is required"))?;
+        let ip = prefix
+            .ip
+            .ok_or_else(|| Status::invalid_argument("route.prefix.ip is required"))?;
+        let ipv4 = decode_ipv4(&ip.address)?;
+        control
+            .delete_route(vni, ipv4, prefix.length)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(DeleteRouteResponse { status: ok() }))
     }
 
     async fn check_vni_in_use(
         &self,
-        _req: Request<CheckVniInUseRequest>,
+        req: Request<CheckVniInUseRequest>,
     ) -> Result<Response<CheckVniInUseResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let in_use = control.vni_in_use(req.into_inner().vni);
+        Ok(Response::new(CheckVniInUseResponse {
+            status: ok(),
+            in_use,
+        }))
     }
 
     async fn reset_vni(
         &self,
-        _req: Request<ResetVniRequest>,
+        req: Request<ResetVniRequest>,
     ) -> Result<Response<ResetVniResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        control
+            .reset_vni(req.into_inner().vni)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(ResetVniResponse { status: ok() }))
     }
 
     async fn list_firewall_rules(
