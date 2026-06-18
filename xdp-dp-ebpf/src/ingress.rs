@@ -141,15 +141,31 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
         let d = ctx.data();
         let de = ctx.data_end();
         match crate::conntrack::ct_key(d, de, ETH_LEN + IPV6_LEN, vni) {
-            Some(key) => match unsafe { crate::maps::CONNTRACK.get(&key) } {
-                Some(e) if e.flags & CT_REWRITE_DST != 0 => {
-                    let mut e = *e;
-                    crate::conntrack::ct_apply(ctx, ETH_LEN + IPV6_LEN, &e);
-                    crate::conntrack::ct_touch(ctx, ETH_LEN + IPV6_LEN, &key, &mut e);
-                    Some(e.xlate_ip)
+            Some(mut key) => {
+                // NAT returns are demuxed peer-independently: if the inner dst is a registered
+                // nat_ip, zero the external src ip+port so the key matches the globally-unique
+                // (vni, 0, nat_ip, 0, nat_port) reverse entry the egress allocator stored.
+                if unsafe {
+                    NAT_IPS.get(&VipKey {
+                        vni,
+                        ipv4: key.dst_ip,
+                    })
                 }
-                _ => None,
-            },
+                .is_some()
+                {
+                    key.src_ip = [0; 4];
+                    key.src_port = 0;
+                }
+                match unsafe { crate::maps::CONNTRACK.get(&key) } {
+                    Some(e) if e.flags & CT_REWRITE_DST != 0 => {
+                        let mut e = *e;
+                        crate::conntrack::ct_apply(ctx, ETH_LEN + IPV6_LEN, &e);
+                        crate::conntrack::ct_touch(ctx, ETH_LEN + IPV6_LEN, &key, &mut e);
+                        Some(e.xlate_ip)
+                    }
+                    _ => None,
+                }
+            }
             None => None,
         }
     } else {

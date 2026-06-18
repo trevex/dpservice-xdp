@@ -68,14 +68,15 @@ pub fn nat_snat_egress(ctx: &XdpContext, ip_off: usize, vni: u32, is_external: b
             let mut i: u16 = 0;
             while i < PROBE_LIMIT {
                 let cand = nat.port_min.wrapping_add((start.wrapping_add(i)) % range);
-                // For ICMP the reply echoes our rewritten id, so the reverse src_port is the
-                // nat_port too; for TCP/UDP it is the unchanged ext (original dst) port.
-                let rev_src_port = if proto == IPPROTO_ICMP { cand } else { dport };
+                // Peer-independent NAT return key: (vni, 0, nat_ip, 0, nat_port). The external peer
+                // (src ip) and the external port are NOT part of the key, so an allocated nat_port
+                // is GLOBALLY unique per nat_ip (dpservice model) — two flows to different
+                // destinations cannot share a port. Ingress reverses returns by the same zeroed key.
                 let rev_key = CtKey {
                     vni,
-                    src_ip: dst,
+                    src_ip: [0; 4],
                     dst_ip: nat.nat_ipv4,
-                    src_port: rev_src_port,
+                    src_port: 0,
                     dst_port: cand,
                     proto,
                     _pad: [0; 3],

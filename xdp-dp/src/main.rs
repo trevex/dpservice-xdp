@@ -623,6 +623,7 @@ async fn main() -> anyhow::Result<()> {
             // NAT-GW: each --nat programs (vni, guest_ip) -> (nat_ip, port_min, port_max). Egress
             // SNAT fires when the dst route is flagged external (see --external).
             let mut nat_map = maps::Nat::open(&mut ebpf)?;
+            let mut nat_ips_map = maps::NatIps::open(&mut ebpf)?;
             for n in &nats {
                 let (gip_str, cfg) = n.split_once('=').context("--nat must be guestip=cfg")?;
                 let gip = parse_ipv4(gip_str)?;
@@ -638,6 +639,9 @@ async fn main() -> anyhow::Result<()> {
                         port_max,
                     },
                 )?;
+                // Mark the nat_ip so ingress demuxes NAT returns peer-independently (and answers
+                // ICMP echo for it). Mirrors the gRPC create_nat path.
+                let _ = nat_ips_map.set(0, nat_ip);
             }
 
             // Firewall: each --fw-rule programs a per-interface rule; rules are appended in order
