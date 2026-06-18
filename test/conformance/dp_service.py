@@ -7,11 +7,12 @@ import fcntl
 import os
 import shlex
 import subprocess
+import time
 from scapy.arch import get_if_hwaddr
 
 from config import *
 from grpc_client import GrpcClient
-from helpers import interface_init, stop_process
+from helpers import interface_init, is_port_open, stop_process
 
 
 class DpService:
@@ -67,6 +68,17 @@ class DpService:
 	def stop(self):
 		if self.process:
 			stop_process(self.process)
+		# `xdp-dp serve` runs under `sudo`, which does NOT forward SIGTERM/SIGKILL to its child, so
+		# stop_process only reaps the sudo wrapper — the root daemon survives, holds the gRPC port,
+		# and the next test file's daemon then races/binds-fails. Kill the actual daemon and wait for
+		# the port to free so each package-scoped daemon starts from a clean slate. (Killing the
+		# process also closes its BPF link fds, detaching the XDP programs from the veths.)
+		subprocess.run(["sudo", "pkill", "-9", "-f", "xdp-dp serve"], check=False)
+		port = grpc_port_b if self.secondary else grpc_port
+		for _ in range(50):
+			if not is_port_open(port):
+				break
+			time.sleep(0.1)
 		self.become_active()
 
 	def become_active(self):
