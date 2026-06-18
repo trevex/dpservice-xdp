@@ -32,6 +32,10 @@ impl Interfaces {
         self.map.insert(key, val, 0).context("insert iface")
     }
 
+    pub fn remove(&mut self, key: IfaceKey) -> anyhow::Result<()> {
+        self.map.remove(&key).context("remove iface")
+    }
+
     pub fn get(&self, key: &IfaceKey) -> Option<IfaceValue> {
         self.map.get(key, 0).ok()
     }
@@ -99,6 +103,10 @@ impl PortMetaMap {
         self.map
             .insert(ifindex, meta, 0)
             .context("insert port_meta")
+    }
+
+    pub fn remove(&mut self, ifindex: u32) -> anyhow::Result<()> {
+        self.map.remove(&ifindex).context("remove port_meta")
     }
 
     pub fn get(&self, ifindex: u32) -> Option<PortMeta> {

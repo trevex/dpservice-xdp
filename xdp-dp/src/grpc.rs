@@ -354,8 +354,18 @@ impl DpdKironcore for Service {
         // Server-configured overlay gateways (dpservice uses a fixed gateway, not a per-/24 one).
         let gateway_ipv4 = self.gateway_ipv4;
         let gateway_ipv6 = self.gateway_ipv6;
-        // gateway_ipv6 wired into create_interface in Task 3
-        let _ = gateway_ipv6;
+
+        // Optional IPv6 (dual-stack); all-zero if absent.
+        let ipv6 = match r.ipv6_config.as_ref().and_then(|c| {
+            if c.primary_address.is_empty() {
+                None
+            } else {
+                Some(c.primary_address.as_slice())
+            }
+        }) {
+            Some(b) => decode_ipv6(b)?,
+            None => [0u8; 16],
+        };
 
         let interface_id = r.interface_id;
         let device = r.device_name;
@@ -378,7 +388,9 @@ impl DpdKironcore for Service {
                 &device,
                 vni,
                 ipv4,
+                ipv6,
                 gateway_ipv4,
+                gateway_ipv6,
                 underlay,
                 total_mbps,
                 public_mbps,
@@ -451,9 +463,17 @@ impl DpdKironcore for Service {
 
     async fn delete_interface(
         &self,
-        _req: Request<DeleteInterfaceRequest>,
+        req: Request<DeleteInterfaceRequest>,
     ) -> Result<Response<DeleteInterfaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let id = req.into_inner().interface_id;
+        control
+            .detach_interface(&id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(DeleteInterfaceResponse { status: ok() }))
     }
 
     async fn list_prefixes(

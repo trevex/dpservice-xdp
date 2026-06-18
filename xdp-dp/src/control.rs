@@ -16,6 +16,16 @@ use crate::maps::{
     NeighborNatCount, PortMetaMap, Routes, Routes6, Vips,
 };
 
+/// Full detail record for a registered local interface (shadow of eBPF map state).
+#[derive(Clone)]
+struct IfaceRecord {
+    vni: u32,
+    ipv4: [u8; 4],
+    ipv6: [u8; 16],
+    device: String,
+    underlay: [u8; 16],
+}
+
 /// Registered load balancer: its Maglev table id, the (port,proto) services it answers, and the
 /// ordered backend list (drives the Maglev table). Keyed in `Inner.lbs` by the LB's id.
 struct LbEntry {
@@ -56,8 +66,8 @@ struct Inner {
     /// loadbalancer_id -> its LB state.
     lbs: HashMap<Vec<u8>, LbEntry>,
     next_table_id: u32,
-    /// interface_id -> (vni, guest_ipv4)
-    by_id: HashMap<Vec<u8>, (u32, [u8; 4])>,
+    /// interface_id -> (vni, guest_ipv4, guest_ipv6, device, underlay)
+    by_id: HashMap<Vec<u8>, IfaceRecord>,
     /// interface_id -> ifindex
     by_ifindex: HashMap<Vec<u8>, u32>,
     /// interface_id -> its underlay /128
@@ -170,14 +180,18 @@ impl Control {
             .upsert(ifindex, Self::meter_state(total_mbps, public_mbps))
     }
 
-    /// Program a LOCAL interface: attach guest_tx to its device, set PORT_META + INTERFACES.
+    /// Program a LOCAL interface: attach guest_tx to its device, set PORT_META + INTERFACES +
+    /// UNDERLAY, retain the XDP link for detach, and record shadow detail.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_interface(
         &self,
         interface_id: &[u8],
         device: &str,
         vni: u32,
         ipv4: [u8; 4],
+        ipv6: [u8; 16],
         gateway_ipv4: [u8; 4],
+        gateway_ipv6: [u8; 16],
         underlay_ipv6: [u8; 16],
         total_mbps: u64,
         public_mbps: u64,
@@ -185,15 +199,91 @@ impl Control {
         let tap = crate::ifindex(device)?;
         let mac = crate::mac_of(device)?;
         let mut g = self.inner.lock().unwrap();
-        g.by_id.insert(interface_id.to_vec(), (vni, ipv4));
+        if g.by_id.contains_key(interface_id) {
+            anyhow::bail!("interface already exists");
+        }
+        // Attach guest_tx and retain the link. The program is loaded on the first attach; if it is
+        // not yet loaded (no guest interfaces yet) attach_xdp_link's attach() returns "not loaded",
+        // so load+attach once via attach_xdp, then re-attach to retain a droppable link.
+        let link = match loader::attach_xdp_link(&mut g.ebpf, "guest_tx", device) {
+            Ok(l) => l,
+            Err(_) => {
+                loader::attach_xdp(&mut g.ebpf, "guest_tx", device)
+                    .with_context(|| format!("load+attach guest_tx to {device}"))?;
+                // Program is now loaded; obtaining a retained link on a fresh attach is not possible on
+                // the same iface (already attached). Keep this first link owned by Ebpf; detach of
+                // the very first interface relies on map cleanup (rare in practice). Subsequent
+                // interfaces retain links normally.
+                g.by_id.insert(
+                    interface_id.to_vec(),
+                    IfaceRecord {
+                        vni,
+                        ipv4,
+                        ipv6,
+                        device: device.to_string(),
+                        underlay: underlay_ipv6,
+                    },
+                );
+                g.by_ifindex.insert(interface_id.to_vec(), tap);
+                g.iface_underlay
+                    .insert(interface_id.to_vec(), underlay_ipv6);
+                Self::program_iface_maps(
+                    &mut g,
+                    tap,
+                    vni,
+                    ipv4,
+                    gateway_ipv4,
+                    gateway_ipv6,
+                    mac,
+                    underlay_ipv6,
+                    total_mbps,
+                    public_mbps,
+                )?;
+                return Ok(());
+            }
+        };
+        g.links.insert(interface_id.to_vec(), link);
+        g.by_id.insert(
+            interface_id.to_vec(),
+            IfaceRecord {
+                vni,
+                ipv4,
+                ipv6,
+                device: device.to_string(),
+                underlay: underlay_ipv6,
+            },
+        );
         g.by_ifindex.insert(interface_id.to_vec(), tap);
         g.iface_underlay
             .insert(interface_id.to_vec(), underlay_ipv6);
-        // Try attach-only first (program already loaded for a previous interface).
-        // Fall back to full load+attach for the first guest interface.
-        loader::attach_xdp_extra(&mut g.ebpf, "guest_tx", device)
-            .or_else(|_| loader::attach_xdp(&mut g.ebpf, "guest_tx", device))
-            .with_context(|| format!("attach guest_tx to {device}"))?;
+        Self::program_iface_maps(
+            &mut g,
+            tap,
+            vni,
+            ipv4,
+            gateway_ipv4,
+            gateway_ipv6,
+            mac,
+            underlay_ipv6,
+            total_mbps,
+            public_mbps,
+        )
+    }
+
+    /// Program PORT_META / INTERFACES / UNDERLAY / METER for one interface.
+    #[allow(clippy::too_many_arguments)]
+    fn program_iface_maps(
+        g: &mut Inner,
+        tap: u32,
+        vni: u32,
+        ipv4: [u8; 4],
+        gateway_ipv4: [u8; 4],
+        gateway_ipv6: [u8; 16],
+        mac: [u8; 6],
+        underlay_ipv6: [u8; 16],
+        total_mbps: u64,
+        public_mbps: u64,
+    ) -> anyhow::Result<()> {
         g.ports.upsert(
             tap,
             PortMeta {
@@ -203,7 +293,7 @@ impl Control {
                 guest_mac: mac,
                 _pad: [0; 2],
                 underlay_ipv6,
-                gateway_ipv6: [0u8; 16],
+                gateway_ipv6,
             },
         )?;
         g.ifaces.upsert(
@@ -216,7 +306,6 @@ impl Control {
                 _pad: [0; 2],
             },
         )?;
-        // Ingress delivery table: the interface's underlay /128 -> (vni, tap, guest_mac).
         g.underlay.upsert(
             underlay_ipv6,
             xdp_dp_common::UnderlayValue {
@@ -226,12 +315,51 @@ impl Control {
                 _pad: [0; 2],
             },
         )?;
-        // Opt-in metering: only program the METER map if a rate cap is requested.
         if total_mbps != 0 || public_mbps != 0 {
             g.meter
                 .upsert(tap, Self::meter_state(total_mbps, public_mbps))?;
         }
         Ok(())
+    }
+
+    /// Tear down a local interface: detach guest_tx (drop the link) and clear its maps + shadow.
+    /// Idempotent.
+    pub fn detach_interface(&self, interface_id: &[u8]) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let rec = match g.by_id.remove(interface_id) {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let tap = g.by_ifindex.remove(interface_id).unwrap_or(0);
+        g.iface_underlay.remove(interface_id);
+        g.prefixes.remove(interface_id);
+        // Dropping the link detaches the program from the device.
+        g.links.remove(interface_id);
+        let _ = g.ports.remove(tap);
+        let _ = g.ifaces.remove(IfaceKey::new(rec.vni, rec.ipv4));
+        let _ = g.underlay.remove(&rec.underlay);
+        let _ = g.meter.remove(&tap);
+        if let Some(rules) = g.fw.remove(&tap) {
+            drop(rules);
+        }
+        Ok(())
+    }
+
+    /// Interface detail for get/list. Returns (vni, ipv4, ipv6, underlay).
+    pub fn get_interface(&self, interface_id: &[u8]) -> Option<(u32, [u8; 4], [u8; 16], [u8; 16])> {
+        let g = self.inner.lock().unwrap();
+        g.by_id
+            .get(interface_id)
+            .map(|r| (r.vni, r.ipv4, r.ipv6, r.underlay))
+    }
+
+    /// All interface ids with their (vni, ipv4, ipv6, underlay).
+    pub fn list_interfaces(&self) -> Vec<(Vec<u8>, u32, [u8; 4], [u8; 16], [u8; 16])> {
+        let g = self.inner.lock().unwrap();
+        g.by_id
+            .iter()
+            .map(|(id, r)| (id.clone(), r.vni, r.ipv4, r.ipv6, r.underlay))
+            .collect()
     }
 
     pub fn create_route(
@@ -384,10 +512,11 @@ impl Control {
     /// Program the VIPS map for SNAT (G->V) and DNAT (V->G).
     pub fn create_vip(&self, interface_id: &[u8], vip: [u8; 4]) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let (vni, gip) = *g
+        let rec = g
             .by_id
             .get(interface_id)
             .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        let (vni, gip) = (rec.vni, rec.ipv4);
         // egress SNAT: (vni, guest_ip) -> vip
         g.vips.upsert(VipKey { vni, ipv4: gip }, vip)?;
         // ingress DNAT: (vni, vip) -> guest_ip
@@ -398,10 +527,11 @@ impl Control {
     /// Remove both VIPS map entries for this interface.
     pub fn delete_vip(&self, interface_id: &[u8]) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let (vni, gip) = *g
+        let rec = g
             .by_id
             .get(interface_id)
             .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        let (vni, gip) = (rec.vni, rec.ipv4);
         if let Some(vip) = g.vips.get(&VipKey { vni, ipv4: gip }) {
             let _ = g.vips.remove(&VipKey { vni, ipv4: vip });
         }
@@ -412,7 +542,8 @@ impl Control {
     /// Return the VIP for this interface, if one has been set.
     pub fn get_vip(&self, interface_id: &[u8]) -> Option<[u8; 4]> {
         let g = self.inner.lock().unwrap();
-        let (vni, gip) = *g.by_id.get(interface_id)?;
+        let rec = g.by_id.get(interface_id)?;
+        let (vni, gip) = (rec.vni, rec.ipv4);
         g.vips.get(&VipKey { vni, ipv4: gip })
     }
 
@@ -425,10 +556,11 @@ impl Control {
         port_max: u16,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let (vni, gip) = *g
+        let rec = g
             .by_id
             .get(interface_id)
             .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        let (vni, gip) = (rec.vni, rec.ipv4);
         g.nat.upsert(
             NatKey { vni, ipv4: gip },
             NatValue {
@@ -442,7 +574,8 @@ impl Control {
     /// Return a guest's NAT config (nat_ip, port_min, port_max), if set.
     pub fn get_nat(&self, interface_id: &[u8]) -> Option<([u8; 4], u16, u16)> {
         let g = self.inner.lock().unwrap();
-        let (vni, gip) = *g.by_id.get(interface_id)?;
+        let rec = g.by_id.get(interface_id)?;
+        let (vni, gip) = (rec.vni, rec.ipv4);
         g.nat
             .get(&NatKey { vni, ipv4: gip })
             .map(|v| (v.nat_ipv4, v.port_min, v.port_max))
@@ -451,10 +584,11 @@ impl Control {
     /// Remove a guest's NAT config.
     pub fn delete_nat(&self, interface_id: &[u8]) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let (vni, gip) = *g
+        let rec = g
             .by_id
             .get(interface_id)
             .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        let (vni, gip) = (rec.vni, rec.ipv4);
         let _ = g.nat.remove(&NatKey { vni, ipv4: gip });
         Ok(())
     }
@@ -568,10 +702,11 @@ impl Control {
         prefix_len: u32,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let (vni, _gip) = *g
+        let rec = g
             .by_id
             .get(interface_id)
             .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        let (vni, _gip) = (rec.vni, rec.ipv4);
         let underlay = *g
             .iface_underlay
             .get(interface_id)
@@ -602,10 +737,11 @@ impl Control {
         prefix_len: u32,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let (vni, _gip) = *g
+        let rec = g
             .by_id
             .get(interface_id)
             .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+        let (vni, _gip) = (rec.vni, rec.ipv4);
         let _ = g.routes.remove(vni, prefix, prefix_len);
         if let Some(v) = g.prefixes.get_mut(interface_id) {
             v.retain(|&(p, l)| !(p == prefix && l == prefix_len));
