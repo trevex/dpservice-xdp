@@ -41,11 +41,11 @@ The control plane is a `tonic` gRPC server implementing the `DPDKironcore` contr
 Everything is provided by the Nix flake — Rust (via rustup, pinned in `rust-toolchain.toml`), `bpf-linker`, `protobuf`, `python3`+`scapy`+`pytest`, the genuine `dpservice-cli` (built from source via `buildGoModule`), plus `qemu`, `iproute2`, `ethtool`, `tcpdump`, etc. There are no host-specific paths; run things through the flake.
 
 ```sh
-nix develop            # enter the dev shell
+nix develop            # enter the dev shell (all targets assume you are inside it)
 make                   # list all targets
 ```
 
-Common workflows (each runs inside the flake devShell automatically):
+Common workflows (run them from inside `nix develop`):
 
 ```sh
 make build             # build xdp-dp (host crates + the eBPF object via aya-build)

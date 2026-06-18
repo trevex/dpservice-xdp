@@ -1,13 +1,11 @@
 # ironcore-net-xdp — common workflows.
 #
-# Every target runs inside the flake devShell (`nix develop -c ...`), so all tooling — the Rust
+# Run these from inside the flake devShell (`nix develop`), which provides all tooling — the Rust
 # toolchain (rustup), bpf-linker, protobuf, python3+scapy+pytest, the genuine dpservice-cli, qemu,
-# iproute2, ethtool, tcpdump — comes from the flake. There are no host-specific paths.
+# iproute2, ethtool, tcpdump. The targets use bare tool names; there are no host-specific paths.
 #
 # The conformance / e2e / ha / tap targets need passwordless sudo (XDP attach, netns, raw sockets);
 # the scripts elevate individual commands themselves.
-
-NIX := nix develop -c
 
 .DEFAULT_GOAL := help
 
@@ -19,11 +17,11 @@ help: ## Show this help
 # --- build -----------------------------------------------------------------
 .PHONY: build
 build: ## Build the xdp-dp binary (host crates + the eBPF object via aya-build)
-	$(NIX) cargo build -p xdp-dp
+	cargo build -p xdp-dp
 
 .PHONY: release
 release: ## Build the xdp-dp binary in release mode
-	$(NIX) cargo build -p xdp-dp --release
+	cargo build -p xdp-dp --release
 
 .PHONY: cli
 cli: ## Build the genuine dpservice-cli (flake package) into ./result
@@ -32,45 +30,45 @@ cli: ## Build the genuine dpservice-cli (flake package) into ./result
 # --- quality ---------------------------------------------------------------
 .PHONY: fmt
 fmt: ## Format all Rust code
-	$(NIX) cargo fmt --all
+	cargo fmt --all
 
 .PHONY: lint
 lint: ## Clippy across all targets (host crates)
-	$(NIX) cargo clippy --all-targets
+	cargo clippy --all-targets
 
 .PHONY: check
 check: ## fmt --check + clippy (what the pre-commit hooks run)
-	$(NIX) cargo fmt --all -- --check
-	$(NIX) cargo clippy --all-targets
+	cargo fmt --all -- --check
+	cargo clippy --all-targets
 
 # --- tests -----------------------------------------------------------------
 .PHONY: test
 test: ## Host unit + POD-layout tests (no root needed)
-	$(NIX) cargo test -p xdp-dp-common -p xdp-dp
+	cargo test -p xdp-dp-common -p xdp-dp
 
 .PHONY: verifier
 verifier: ## Load both XDP programs through the kernel verifier (needs root)
-	$(NIX) cargo test -p xdp-dp both_programs_pass_verifier -- --ignored
+	cargo test -p xdp-dp both_programs_pass_verifier -- --ignored
 
 .PHONY: conformance
 conformance: ## dpservice conformance suite vs `xdp-dp serve` (veth harness; needs sudo)
-	$(NIX) ./test/conformance/run.sh
+	./test/conformance/run.sh
 
 .PHONY: e2e
 e2e: ## 3-node netns end-to-end overlay test (needs sudo)
-	$(NIX) ./test/netns-e2e.sh run
+	./test/netns-e2e.sh run
 
 .PHONY: ha
 ha: ## HA pinned-maps smoke (kill+adopt; needs sudo)
-	$(NIX) ./test/ha-smoke.sh run
+	./test/ha-smoke.sh run
 
 .PHONY: tap-dhcp-probe
 tap-dhcp-probe: ## Native-mode DHCP frame-growth fidelity probe on a real tap (needs sudo)
-	$(NIX) ./test/tap-dhcp-probe.sh
+	./test/tap-dhcp-probe.sh
 
 .PHONY: tap-vm-smoke
 tap-vm-smoke: ## Boot a CirrOS VM on a real tap and verify guest_tx/ARP (needs sudo + KVM)
-	$(NIX) ./test/tap-vm-smoke.sh run
+	./test/tap-vm-smoke.sh run
 
 .PHONY: test-all
 test-all: test e2e ha conformance ## Run the full local test matrix (needs sudo)
@@ -78,5 +76,5 @@ test-all: test e2e ha conformance ## Run the full local test matrix (needs sudo)
 # --- housekeeping ----------------------------------------------------------
 .PHONY: clean
 clean: ## Remove build artifacts
-	$(NIX) cargo clean
+	cargo clean
 	rm -rf result
