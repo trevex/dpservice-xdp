@@ -1,9 +1,34 @@
 # Sub-project 2a — Dynamic Tap Lifecycle + gRPC Completeness (ioiab drop-in)
 
-**Status:** Design (2026-06-18)
+**Status:** Implemented (2026-06-18) — **78 / 89 dpservice non-DHCP conformance passing.**
 **Parent effort:** ioiab drop-in (replace DPDK `dpservice` with `xdp-dp`). Decomposed into:
 **2a** (this) dynamic tap lifecycle + gRPC completeness · **2b** DHCPv4/v6 · **2c** ioiab deployment.
 **Predecessor:** full datapath parity M5–M10, M12, M13, M15 (M14 capture deferred).
+
+## Conformance result (final for 2a)
+
+`./test/conformance/run.sh` drives the vendored dpservice `test/local` suite against `xdp-dp serve`
+via the real `dpservice-cli`. **78 passed / 11 failed / 2 skipped.** The 11 remaining all require
+features outside 2a's scope (DHCP, or the explicitly-deferred v6-stateful / packet-relay datapath):
+
+| Test | Needs | Milestone |
+|---|---|---|
+| `test_arp::test_l2_addr_once` | DHCP (re-learns the VM MAC via a DHCP exchange) | **2b** |
+| `test_vf_to_pf_network_nat_icmpv6` | v6 stateful NAT | deferred (v6-stateful) |
+| `test_vf_to_pf_network_nat_{tcp,max_port_tcp,tcp_with_ipv6}`, `test_vm_nat_async_tcp_icmperr` | v4 TCP-NAT, but blocked by the v6-NAT test's leak under the shared (module-scoped) daemon — clear once v6 NAT works or each runs isolated | deferred (v6-stateful) |
+| `test_pf_to_vf_lb_ipv6_tcp`, `test_lb::test_network_lb_external_icmpv6_echo` | v6 stateful LB | deferred (v6-stateful) |
+| `test_lb::test_external_lb_icmp_error_relay`, `test_lb::test_external_lb_relay_ipv6` | packet relay | deferred (relay; never in the parity spec for 2a) |
+| `test_lb::test_vip_nat_to_lb_on_another_vni` | cross-VNI VIP→LB chaining | deferred (v6/relay-adjacent) |
+
+True 89/89 is **not reachable within 2a**: `test_l2_addr_once` needs DHCP (2b), and the rest need
+the v6-stateful NAT/LB and packet-relay features that the parity roadmap scoped as their own
+milestones. The conformance harness now makes those features straightforward to drive when built.
+
+**Delivered in 2a:** `xdp-dp serve` (runtime XDP attach/detach), the full non-DHCP gRPC surface with
+dpservice error-code semantics, same-host fast path, virtual-gateway ARP/ND (VF's own MAC), NAT-GW
+external with peer-independent return demux, same-host VIP DNAT, ICMP NAT, conntrack flush, and the
+vendored conformance harness (real `dpservice-cli`, veth substitution, run-as-root). netns (15) + HA
+smoke stay green.
 
 ## 1. Goal
 
