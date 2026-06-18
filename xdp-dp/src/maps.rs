@@ -509,6 +509,33 @@ impl Meter {
     }
 }
 
+/// Typed handle over the `NAT_IPS` BPF map ((vni, nat_ip) -> 1u8), marking NAT IP addresses
+/// so the ingress can generate ICMP echo replies without involving the VM.
+#[allow(dead_code)]
+pub struct NatIps {
+    map: HashMap<MapData, VipKey, u8>,
+}
+
+#[allow(dead_code)]
+impl NatIps {
+    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
+        let map = HashMap::try_from(ebpf.take_map("NAT_IPS").context("NAT_IPS map missing")?)?;
+        Ok(Self { map })
+    }
+
+    pub fn set(&mut self, vni: u32, nat_ip: [u8; 4]) -> anyhow::Result<()> {
+        self.map
+            .insert(VipKey { vni, ipv4: nat_ip }, 1u8, 0)
+            .context("insert nat_ip")
+    }
+
+    pub fn remove(&mut self, vni: u32, nat_ip: [u8; 4]) -> anyhow::Result<()> {
+        self.map
+            .remove(&VipKey { vni, ipv4: nat_ip })
+            .context("remove nat_ip")
+    }
+}
+
 /// Typed handle over the single-entry `NEIGHBOR_NAT_COUNT` Array map.
 #[allow(dead_code)]
 pub struct NeighborNatCount {

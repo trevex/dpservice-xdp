@@ -5,3 +5,6 @@
 /.pre-commit-config.yaml
 # dpservice-cli binary built from source (run fetch-cli.sh or it's built by run.sh)
 /test/conformance/bin/
+# Python bytecode cache
+__pycache__/
+*.pyc

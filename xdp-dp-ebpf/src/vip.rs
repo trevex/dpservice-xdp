@@ -14,6 +14,13 @@ pub fn snat_egress(ctx: &XdpContext, ip_off: usize, vni: u32) {
     rewrite(ctx, ip_off, vni, true);
 }
 
+/// Egress DNAT: rewrite the inner IPv4 DESTINATION if a VIP maps to a guest IP. Used for
+/// same-host VIP traffic where the sender's packet never reaches the ingress (uplink_rx) path.
+#[inline(always)]
+pub fn dnat_egress(ctx: &XdpContext, ip_off: usize, vni: u32) {
+    rewrite(ctx, ip_off, vni, false);
+}
+
 /// Ingress DNAT: rewrite the inner IPv4 DEST if a VIP maps to an interface IP.
 #[inline(always)]
 pub fn dnat_ingress(ctx: &XdpContext, ip_off: usize, vni: u32) {

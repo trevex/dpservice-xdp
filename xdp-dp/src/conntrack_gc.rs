@@ -1,5 +1,6 @@
 //! Userspace conntrack aging: periodically evict entries idle longer than their timeout. Mirrors
 //! dpservice (30 s default, 1-day established-TCP). Times are kernel-monotonic ns (bpf_ktime).
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use xdp_dp_common::{CtEntry, TCP_ESTABLISHED};
@@ -28,18 +29,23 @@ fn ktime_now_ns() -> u64 {
 }
 
 /// Sweep loop: every `interval`, remove entries whose idle age exceeds their timeout.
-pub async fn run(mut ct: Conntrack, interval: Duration) {
+/// The conntrack map is shared via Arc<Mutex<>> with the control plane for flush operations.
+pub async fn run(ct: Arc<Mutex<Conntrack>>, interval: Duration) {
     loop {
         tokio::time::sleep(interval).await;
         let now = ktime_now_ns();
-        let stale: Vec<_> = ct
-            .entries()
-            .into_iter()
-            .filter(|(_, e)| now.saturating_sub(e.last_seen) > timeout_ns(e))
-            .map(|(k, _)| k)
-            .collect();
+        let stale: Vec<_> = {
+            let ct_guard = ct.lock().unwrap();
+            ct_guard
+                .entries()
+                .into_iter()
+                .filter(|(_, e)| now.saturating_sub(e.last_seen) > timeout_ns(e))
+                .map(|(k, _)| k)
+                .collect()
+        };
+        let mut ct_guard = ct.lock().unwrap();
         for k in stale {
-            let _ = ct.remove(&k);
+            let _ = ct_guard.remove(&k);
         }
     }
 }

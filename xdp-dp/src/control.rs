@@ -1,20 +1,20 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use aya::programs::xdp::XdpLink;
 use aya::Ebpf;
 use xdp_dp_common::{
-    FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, LbKey, LbValue, Local, MaglevKey, NatKey,
-    NatValue, NeighborNatEntry, PortMeta, RouteValue, VipKey, FW_DIR_EGRESS, FW_MAX_RULES,
+    CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, LbKey, LbValue, Local, MaglevKey,
+    NatKey, NatValue, NeighborNatEntry, PortMeta, RouteValue, VipKey, FW_DIR_EGRESS, FW_MAX_RULES,
     NB_MAX_ENTRIES,
 };
 
 use crate::grpc::LbIpBytes;
 use crate::loader;
 use crate::maps::{
-    Conntrack, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev, Meter, Nat, NeighborNat,
-    NeighborNatCount, PortMetaMap, Routes, Routes6, Vips,
+    Conntrack, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev, Meter, Nat, NatIps,
+    NeighborNat, NeighborNatCount, PortMetaMap, Routes, Routes6, Vips,
 };
 
 /// Full detail record for a registered local interface (shadow of eBPF map state).
@@ -78,8 +78,10 @@ struct PrefixRecord {
 /// Owns the loaded eBPF object + map handles; mutated by the gRPC handlers.
 pub struct Control {
     inner: Mutex<Inner>,
-    /// Conntrack map handle, taken once by the GC task via `take_conntrack`.
-    conntrack: Mutex<Option<Conntrack>>,
+    /// Conntrack map handle, shared with the GC task. Held in an Arc so both
+    /// the control plane (for CT flush on NAT/neigh-NAT delete) and the GC task
+    /// can access it concurrently without moving ownership.
+    conntrack: Arc<Mutex<Conntrack>>,
 }
 
 struct Inner {
@@ -99,6 +101,7 @@ struct Inner {
     meter: Meter,
     neigh_nat: NeighborNat,
     neigh_nat_count: NeighborNatCount,
+    nat_ips: NatIps,
     /// In-memory neighbor NAT entries (drives the BPF map reprogram).
     neigh_nats: Vec<NeighborNatEntry>,
     /// loadbalancer_id -> its LB state.
@@ -135,6 +138,10 @@ impl Control {
     ) -> anyhow::Result<Self> {
         let mut ebpf = loader::load_ebpf()?;
         loader::attach_xdp(&mut ebpf, "uplink_rx", uplink)?;
+        // Pre-load guest_tx so that every subsequent attach_xdp_link call only needs attach(),
+        // not load() + attach(). This ensures the first interface's link is always retained and
+        // can be dropped on detach (no "XDP program stays attached after delete" ghost).
+        loader::load_program(&mut ebpf, "guest_tx")?;
         let mut locals = LocalMap::open(&mut ebpf)?;
         locals.set(&Local {
             uplink_ifindex,
@@ -156,7 +163,8 @@ impl Control {
         let meter = Meter::open(&mut ebpf)?;
         let neigh_nat = NeighborNat::open(&mut ebpf)?;
         let neigh_nat_count = NeighborNatCount::open(&mut ebpf)?;
-        let conntrack = Conntrack::open(&mut ebpf)?;
+        let nat_ips = NatIps::open(&mut ebpf)?;
+        let conntrack = Arc::new(Mutex::new(Conntrack::open(&mut ebpf)?));
         Ok(Self {
             inner: Mutex::new(Inner {
                 ebpf,
@@ -175,6 +183,7 @@ impl Control {
                 meter,
                 neigh_nat,
                 neigh_nat_count,
+                nat_ips,
                 neigh_nats: Vec::new(),
                 lbs: HashMap::new(),
                 next_table_id: 1,
@@ -188,13 +197,13 @@ impl Control {
                 routes_shadow: Vec::new(),
                 routes6_shadow: Vec::new(),
             }),
-            conntrack: Mutex::new(Some(conntrack)),
+            conntrack,
         })
     }
 
-    /// Hand out the conntrack map handle once (for the GC task). Returns None if already taken.
-    pub fn take_conntrack(&self) -> Option<Conntrack> {
-        self.conntrack.lock().unwrap().take()
+    /// Return a shared handle to the conntrack map (for the GC task and flush operations).
+    pub fn take_conntrack(&self) -> Arc<Mutex<Conntrack>> {
+        Arc::clone(&self.conntrack)
     }
 
     fn meter_state(total_mbps: u64, public_mbps: u64) -> xdp_dp_common::MeterState {
@@ -260,47 +269,10 @@ impl Control {
         }
         // NOTE: preferred underlay collision is NOT checked here; it is checked only when
         // the caller explicitly supplies a preferred_underlay_route (see grpc.rs handler).
-        // Attach guest_tx and retain the link. The program is loaded on the first attach; if it is
-        // not yet loaded (no guest interfaces yet) attach_xdp_link's attach() returns "not loaded",
-        // so load+attach once via attach_xdp, then re-attach to retain a droppable link.
-        let link = match loader::attach_xdp_link(&mut g.ebpf, "guest_tx", device) {
-            Ok(l) => l,
-            Err(_) => {
-                loader::attach_xdp(&mut g.ebpf, "guest_tx", device)
-                    .with_context(|| format!("load+attach guest_tx to {device}"))?;
-                // Program is now loaded; obtaining a retained link on a fresh attach is not possible on
-                // the same iface (already attached). Keep this first link owned by Ebpf; detach of
-                // the very first interface relies on map cleanup (rare in practice). Subsequent
-                // interfaces retain links normally.
-                g.by_id.insert(
-                    interface_id.to_vec(),
-                    IfaceRecord {
-                        vni,
-                        ipv4,
-                        ipv6,
-                        device: device.to_string(),
-                        underlay: underlay_ipv6,
-                    },
-                );
-                g.by_ifindex.insert(interface_id.to_vec(), tap);
-                g.iface_underlay
-                    .insert(interface_id.to_vec(), underlay_ipv6);
-                Self::program_iface_maps(
-                    &mut g,
-                    tap,
-                    vni,
-                    ipv4,
-                    ipv6,
-                    gateway_ipv4,
-                    gateway_ipv6,
-                    mac,
-                    underlay_ipv6,
-                    total_mbps,
-                    public_mbps,
-                )?;
-                return Ok(());
-            }
-        };
+        // guest_tx was pre-loaded in bring_up, so attach_xdp_link always succeeds and we always
+        // get a droppable link back — dropping it detaches the program on interface teardown.
+        let link = loader::attach_xdp_link(&mut g.ebpf, "guest_tx", device)
+            .with_context(|| format!("load+attach guest_tx to {device}"))?;
         g.links.insert(interface_id.to_vec(), link);
         g.by_id.insert(
             interface_id.to_vec(),
@@ -413,12 +385,15 @@ impl Control {
 
     /// Tear down a local interface: detach guest_tx (drop the link) and clear its maps + shadow.
     /// Returns true if found and deleted, false if not found.
+    /// When the last interface on a VNI is removed, also auto-resets the VNI (purges neighbor NATs,
+    /// VIPs, and routes for that VNI) to match dpservice's behaviour.
     pub fn detach_interface(&self, interface_id: &[u8]) -> anyhow::Result<bool> {
         let mut g = self.inner.lock().unwrap();
         let rec = match g.by_id.remove(interface_id) {
             Some(r) => r,
             None => return Ok(false),
         };
+        let vni = rec.vni;
         let tap = g.by_ifindex.remove(interface_id).unwrap_or(0);
         g.iface_underlay.remove(interface_id);
         g.prefixes.remove(interface_id);
@@ -435,6 +410,70 @@ impl Control {
         }
         if let Some(rules) = g.fw.remove(&tap) {
             drop(rules);
+        }
+        // Auto-reset VNI when the last local interface on it is removed:
+        // purge neighbor NATs (and orphaned VIP/NAT/route state) for that VNI. This matches
+        // dpservice's async-deletion model where the VNI is implicitly reset on last-iface removal.
+        let vni_still_in_use =
+            g.by_id.values().any(|r| r.vni == vni) || g.lbs.values().any(|lb| lb.vni == vni);
+        if !vni_still_in_use {
+            // Purge neighbor NATs for this VNI.
+            let before = g.neigh_nats.len();
+            g.neigh_nats.retain(|e| e.vni != vni);
+            if g.neigh_nats.len() != before {
+                let n = g.neigh_nats.len() as u32;
+                let remaining: Vec<NeighborNatEntry> = g.neigh_nats.clone();
+                for (i, e) in remaining.iter().enumerate() {
+                    let _ = g.neigh_nat.upsert(i as u32, *e);
+                }
+                let _ = g.neigh_nat_count.set(n);
+            }
+            // Purge VIP entries for the removed interface's guest IP (and its reverse).
+            let maybe_vip = g.vips.get(&VipKey {
+                vni,
+                ipv4: rec.ipv4,
+            });
+            if let Some(vip) = maybe_vip {
+                let _ = g.vips.remove(&VipKey { vni, ipv4: vip });
+            }
+            let _ = g.vips.remove(&VipKey {
+                vni,
+                ipv4: rec.ipv4,
+            });
+            // Purge NAT config for the removed interface's guest IP.
+            let _ = g.nat.remove(&NatKey {
+                vni,
+                ipv4: rec.ipv4,
+            });
+            // Purge routes for this VNI (same as reset_vni).
+            let routes_to_del: Vec<([u8; 4], u32)> = g
+                .routes_shadow
+                .iter()
+                .filter(|&&(v, _, _, _, _)| v == vni)
+                .map(|&(_, p, l, _, _)| (p, l))
+                .collect();
+            for (p, l) in &routes_to_del {
+                let _ = g.routes.remove(vni, *p, *l);
+            }
+            g.routes_shadow.retain(|&(v, p, l, _, _)| {
+                !routes_to_del
+                    .iter()
+                    .any(|&(rp, rl)| v == vni && rp == p && rl == l)
+            });
+            let routes6_to_del: Vec<([u8; 16], u32)> = g
+                .routes6_shadow
+                .iter()
+                .filter(|&&(v, _, _, _, _)| v == vni)
+                .map(|&(_, p, l, _, _)| (p, l))
+                .collect();
+            for (p, l) in &routes6_to_del {
+                let _ = g.routes6.remove(vni, *p, *l);
+            }
+            g.routes6_shadow.retain(|&(v, p, l, _, _)| {
+                !routes6_to_del
+                    .iter()
+                    .any(|&(rp, rl)| v == vni && rp == p && rl == l)
+            });
         }
         Ok(true)
     }
@@ -474,6 +513,7 @@ impl Control {
         ipv4: [u8; 4],
         prefix_len: u32,
         nexthop_ipv6: [u8; 16],
+        nexthop_vni: u32,
         is_external: bool,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
@@ -489,14 +529,14 @@ impl Control {
             ipv4,
             prefix_len,
             RouteValue {
-                nexthop_vni: vni,
+                nexthop_vni,
                 nexthop_ipv6,
                 is_external: is_external as u8,
                 _pad: [0; 3],
             },
         )?;
         g.routes_shadow
-            .push((vni, ipv4, prefix_len, vni, nexthop_ipv6));
+            .push((vni, ipv4, prefix_len, nexthop_vni, nexthop_ipv6));
         Ok(())
     }
 
@@ -519,6 +559,7 @@ impl Control {
         ipv6: [u8; 16],
         prefix_len: u32,
         nexthop_ipv6: [u8; 16],
+        nexthop_vni: u32,
         is_external: bool,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
@@ -534,14 +575,14 @@ impl Control {
             ipv6,
             prefix_len,
             RouteValue {
-                nexthop_vni: vni,
+                nexthop_vni,
                 nexthop_ipv6,
                 is_external: is_external as u8,
                 _pad: [0; 3],
             },
         )?;
         g.routes6_shadow
-            .push((vni, ipv6, prefix_len, vni, nexthop_ipv6));
+            .push((vni, ipv6, prefix_len, nexthop_vni, nexthop_ipv6));
         Ok(())
     }
 
@@ -932,6 +973,8 @@ impl Control {
                 port_max,
             },
         )?;
+        // Mark this nat_ip in NAT_IPS so the ingress can generate ICMP echo replies for it.
+        let _ = g.nat_ips.set(vni, nat_ip);
         Ok(preferred_ul.unwrap_or(underlay))
     }
 
@@ -976,18 +1019,83 @@ impl Control {
         result
     }
 
+    /// Flush CONNTRACK entries whose egress 5-tuple originated from `(vni, src_ip)`.
+    /// For NAT flows this removes both the forward entry (CT_REWRITE_SRC, key.src_ip == gip)
+    /// and the reverse entry (CT_REWRITE_DST, key.dst_ip == nat_ip with xlate_port in range).
+    fn ct_flush_for_guest(
+        ct: &mut Conntrack,
+        vni: u32,
+        gip: [u8; 4],
+        nat_ip: [u8; 4],
+        port_min: u16,
+        port_max: u16,
+    ) {
+        // Collect all keys to remove first to avoid borrow issues during iteration.
+        let to_remove: Vec<CtKey> = ct
+            .entries()
+            .into_iter()
+            .filter_map(|(k, e)| {
+                if k.vni != vni {
+                    return None;
+                }
+                // Forward NAT entry: src_ip == guest IP, CT_REWRITE_SRC set.
+                let is_fwd = k.src_ip == gip
+                    && (e.flags & xdp_dp_common::CT_REWRITE_SRC != 0
+                        || e.flags & xdp_dp_common::CT_F_SRC_NAT != 0);
+                // Reverse NAT entry: dst_ip == nat_ip, dst_port in the NAT port range.
+                let is_rev = k.dst_ip == nat_ip
+                    && k.dst_port >= port_min
+                    && k.dst_port < port_max
+                    && e.flags & xdp_dp_common::CT_REWRITE_DST != 0;
+                if is_fwd || is_rev {
+                    Some(k)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for k in to_remove {
+            let _ = ct.remove(&k);
+        }
+    }
+
     /// Remove a guest's NAT config. Returns true if found and deleted, false if no NAT was set.
     pub fn delete_nat(&self, interface_id: &[u8]) -> anyhow::Result<bool> {
-        let mut g = self.inner.lock().unwrap();
-        let rec = g
-            .by_id
-            .get(interface_id)
-            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
-        let (vni, gip) = (rec.vni, rec.ipv4);
-        if g.nat.get(&NatKey { vni, ipv4: gip }).is_none() {
-            return Ok(false);
-        }
-        let _ = g.nat.remove(&NatKey { vni, ipv4: gip });
+        let (vni, gip, nat_ip, port_min, port_max) = {
+            let mut g = self.inner.lock().unwrap();
+            let rec = g
+                .by_id
+                .get(interface_id)
+                .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
+            let (vni, gip) = (rec.vni, rec.ipv4);
+            let nat_val = match g.nat.get(&NatKey { vni, ipv4: gip }) {
+                Some(v) => v,
+                None => return Ok(false),
+            };
+            let nat_ip = nat_val.nat_ipv4;
+            let port_min = nat_val.port_min;
+            let port_max = nat_val.port_max;
+            let _ = g.nat.remove(&NatKey { vni, ipv4: gip });
+            // Remove the NAT_IPS marker if no other interface in this VNI uses the same nat_ip.
+            let still_used = g.by_id.iter().any(|(other_id, r)| {
+                other_id.as_slice() != interface_id
+                    && r.vni == vni
+                    && g.nat
+                        .get(&NatKey {
+                            vni: r.vni,
+                            ipv4: r.ipv4,
+                        })
+                        .map(|v| v.nat_ipv4 == nat_ip)
+                        .unwrap_or(false)
+            });
+            if !still_used {
+                let _ = g.nat_ips.remove(vni, nat_ip);
+            }
+            (vni, gip, nat_ip, port_min, port_max)
+        };
+        // Flush CT entries for this guest outside the inner lock (conntrack lock is separate).
+        let mut ct = self.conntrack.lock().unwrap();
+        Self::ct_flush_for_guest(&mut ct, vni, gip, nat_ip, port_min, port_max);
         Ok(true)
     }
 

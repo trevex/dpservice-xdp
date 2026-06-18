@@ -3,11 +3,99 @@ use aya_ebpf::{
     helpers::{bpf_redirect, bpf_xdp_adjust_head},
     programs::XdpContext,
 };
-use xdp_dp_common::CT_REWRITE_DST;
+use xdp_dp_common::{VipKey, CT_REWRITE_DST};
 
 use crate::arp_nd::GW_MAC;
-use crate::maps::LOCAL;
-use crate::parse::{write6, ETH_LEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_IPIP, IPV6_LEN};
+use crate::maps::{LOCAL, NAT_IPS};
+use crate::parse::{
+    write16, write6, ETH_LEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_ICMP, IPPROTO_IPIP, IPV6_LEN,
+};
+
+const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMP_ECHO_REPLY: u8 = 0;
+
+/// When an ICMP echo request arrives on the uplink destined to a NAT IP (tap≠0) or LB VNF
+/// (tap=0), the dataplane generates the ICMP reply itself and re-encaps it back out the uplink.
+/// Returns Some(xdp_action) if handled, None to continue normal processing.
+#[inline(always)]
+fn try_icmp_echo_reply(
+    ctx: &XdpContext,
+    vni: u32,
+    tap_ifindex: u32,
+    outer_src: [u8; 16], // outer IPv6 src (sender's underlay)
+    outer_dst: [u8; 16], // outer IPv6 dst (our underlay / lb_underlay)
+) -> Option<u32> {
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    let ip_off = ETH_LEN + IPV6_LEN;
+
+    // Need at least inner IPv4 header (20 bytes) + ICMP echo header (8 bytes).
+    if data + ip_off + 28 > data_end {
+        return None;
+    }
+    let p = data as *mut u8;
+
+    // Require IHL == 5 (no IP options) so L4 offset is constant.
+    if unsafe { *p.add(ip_off) } & 0x0f != 5 {
+        return None;
+    }
+    if unsafe { *p.add(ip_off + 9) } != IPPROTO_ICMP {
+        return None;
+    }
+    let l4 = ip_off + 20;
+    if unsafe { *p.add(l4) } != ICMP_ECHO_REQUEST {
+        return None;
+    }
+
+    let inner_dst = unsafe { core::ptr::read_unaligned(p.add(ip_off + 16) as *const [u8; 4]) };
+
+    // For LB VNF (tap=0): always intercept — the LB VIP has no associated VM to reply.
+    // For regular interface (tap≠0): intercept only if inner_dst is a registered NAT IP.
+    if tap_ifindex != 0 {
+        if unsafe {
+            NAT_IPS.get(&VipKey {
+                vni,
+                ipv4: inner_dst,
+            })
+        }
+        .is_none()
+        {
+            return None;
+        }
+    }
+
+    // Generate ICMP echo reply in-place:
+    // 1. Flip ICMP type 8→0 and update checksum incrementally.
+    let old_cksum = u16::from_be(unsafe { core::ptr::read_unaligned(p.add(l4 + 2) as *const u16) });
+    // RFC 1624: new_cksum = ~(~old_cksum + ~old_val + new_val)
+    // old_val = 0x0800 (type=8, code=0 as big-endian u16), new_val = 0x0000 (type=0).
+    let mut sum = !old_cksum as u32 + !(0x0800u16) as u32 + 0u32;
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    let new_cksum = !(sum as u16);
+    unsafe {
+        *p.add(l4) = ICMP_ECHO_REPLY;
+        core::ptr::write_unaligned(p.add(l4 + 2) as *mut u16, new_cksum.to_be());
+    }
+
+    // 2. Swap inner IPv4 src/dst (IP checksum is commutative — no change needed).
+    let inner_src = unsafe { core::ptr::read_unaligned(p.add(ip_off + 12) as *const [u8; 4]) };
+    unsafe {
+        core::ptr::write_unaligned(p.add(ip_off + 12) as *mut [u8; 4], inner_dst);
+        core::ptr::write_unaligned(p.add(ip_off + 16) as *mut [u8; 4], inner_src);
+    }
+
+    // 3. Swap outer IPv6 src/dst and rewrite outer Ethernet for uplink output.
+    let local = LOCAL.get(0)?;
+    unsafe {
+        write6(p, &local.gateway_mac); // dst = gateway MAC
+        write6(p.add(6), &local.uplink_mac); // src = our uplink MAC
+        write16(p.add(ETH_LEN + 8), &outer_dst); // outer IPv6 src = our underlay
+        write16(p.add(ETH_LEN + 24), &outer_src); // outer IPv6 dst = sender's underlay
+    }
+
+    Some(unsafe { bpf_redirect(local.uplink_ifindex, 0) } as u32)
+}
 
 pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
     let data = ctx.data();
@@ -85,6 +173,16 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
                     return Ok(crate::encap::reforward(ctx, local, &outer_dst, &owner_ul));
                 }
             }
+        }
+    }
+
+    // ICMP echo reply generation: if an ICMP echo request arrives for a NAT IP (tap≠0) or an LB
+    // VNF (tap=0), the dataplane generates the reply in-place and sends it back out the uplink,
+    // without involving the VM. This matches dpservice's packet_relay_node behaviour.
+    if lb_ul.is_none() && nat_guest.is_none() {
+        let outer_src = unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 8) as *const [u8; 16]) };
+        if let Some(act) = try_icmp_echo_reply(ctx, vni, tap_ifindex, outer_src, outer_dst) {
+            return Ok(act);
         }
     }
 

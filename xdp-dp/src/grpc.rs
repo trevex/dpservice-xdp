@@ -164,12 +164,30 @@ fn decode_fw_rule(r: &FirewallRule) -> Result<xdp_dp_common::FwRule, Status> {
         FW_ACTION_DROP
     };
 
+    // Helper: decode a firewall prefix. IPv6 prefixes cannot be matched by our IPv4 firewall
+    // engine (FwRule only stores /32 masks), so treat them as "any" (0.0.0.0/0) — the packet
+    // still passes the proto/port filters, giving the expected allow-all-v6 behaviour.
+    fn decode_fw_prefix(addr: &IpAddress, length: u32) -> Result<([u8; 4], [u8; 4]), Status> {
+        // IPv6: match-any mask (0.0.0.0/0) so the rule applies to all IPv6 packets.
+        if addr.ipver == IpVersion::Ipv6 as i32
+            || std::str::from_utf8(&addr.address)
+                .ok()
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(|a| a.is_ipv6())
+                .unwrap_or(false)
+        {
+            return Ok(([0u8; 4], [0u8; 4]));
+        }
+        let ip = decode_ipv4(&addr.address)?;
+        Ok((ip, mask_from_len(length)))
+    }
+
     let (src_ip, src_mask) = match &r.source_prefix {
         Some(Prefix {
             ip: Some(addr),
             length,
             ..
-        }) => (decode_ipv4(&addr.address)?, mask_from_len(*length)),
+        }) => decode_fw_prefix(addr, *length)?,
         _ => ([0u8; 4], [0u8; 4]),
     };
     let (dst_ip, dst_mask) = match &r.destination_prefix {
@@ -177,7 +195,7 @@ fn decode_fw_rule(r: &FirewallRule) -> Result<xdp_dp_common::FwRule, Status> {
             ip: Some(addr),
             length,
             ..
-        }) => (decode_ipv4(&addr.address)?, mask_from_len(*length)),
+        }) => decode_fw_prefix(addr, *length)?,
         _ => ([0u8; 4], [0u8; 4]),
     };
 
@@ -634,10 +652,18 @@ impl DpdKironcore for Service {
             }));
         }
 
+        // A route is "external" (NAT-eligible south-north egress) when it is the default route
+        // (prefix_len == 0), matching dpservice's `is_default_route = route_depth == 0` logic.
+        let is_external = prefix_len == 0;
+
+        // Record the caller-supplied nexthop_vni (0 = same VNI, used for list_routes output).
+        let nhop_vni = route.nexthop_vni;
+
         // Dispatch on address family: IPv6 prefixes go to create_route6, IPv4 to create_route.
         if prefix_ip.ipver == IpVersion::Ipv6 as i32 {
             let ipv6 = decode_ipv6(&prefix_ip.address)?;
-            match control.create_route6(vni, ipv6, prefix_len, nexthop_ipv6, false) {
+            match control.create_route6(vni, ipv6, prefix_len, nexthop_ipv6, nhop_vni, is_external)
+            {
                 Ok(()) => {}
                 Err(e) => {
                     let msg = e.to_string();
@@ -659,7 +685,7 @@ impl DpdKironcore for Service {
                 raw_ipv4[2] & mask[2],
                 raw_ipv4[3] & mask[3],
             ];
-            match control.create_route(vni, ipv4, prefix_len, nexthop_ipv6, false) {
+            match control.create_route(vni, ipv4, prefix_len, nexthop_ipv6, nhop_vni, is_external) {
                 Ok(()) => {}
                 Err(e) => {
                     let msg = e.to_string();

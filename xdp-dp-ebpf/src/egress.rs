@@ -44,11 +44,18 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     }
     // Conntrack + egress firewall. Established flows: apply translation + refresh. New flows:
     // enforce the SOURCE interface's EGRESS firewall (whitelist; no rules => accept).
+    //
+    // Only apply CT_REWRITE_SRC (egress-direction) translations here. CT_REWRITE_DST entries are
+    // reverse-NAT entries created for ingress return traffic; they must NOT be applied in the
+    // egress path (otherwise a non-NAT'd VM replying to a NATted peer would have its dst
+    // incorrectly rewritten and be delivered locally instead of going out to the router).
     if let Some(key) = crate::conntrack::ct_key(data, data_end, ETH_LEN, meta.vni) {
         match unsafe { crate::maps::CONNTRACK.get(&key) } {
             Some(e) => {
                 let mut e = *e;
-                crate::conntrack::ct_apply(ctx, ETH_LEN, &e);
+                if e.flags & xdp_dp_common::CT_REWRITE_SRC != 0 {
+                    crate::conntrack::ct_apply(ctx, ETH_LEN, &e);
+                }
                 crate::conntrack::ct_touch(ctx, ETH_LEN, &key, &mut e);
             }
             None => {
@@ -68,6 +75,10 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
     }
     // SNAT: rewrite inner IPv4 source if a VIP mapping exists (G->V).
     crate::vip::snat_egress(ctx, ETH_LEN, meta.vni);
+    // DNAT: rewrite inner IPv4 destination if a VIP mapping exists (V->G). This handles
+    // same-host VIP traffic where the sender sends to another VM's VIP; the ingress path
+    // (uplink_rx) never sees this packet, so DNAT must be applied here before route lookup.
+    crate::vip::dnat_egress(ctx, ETH_LEN, meta.vni);
     // inner IPv4 dst at ETH_LEN + 16
     let dst = unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 16) as *const [u8; 4]) };
     let route = ROUTES

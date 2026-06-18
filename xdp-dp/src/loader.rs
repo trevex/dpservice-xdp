@@ -43,6 +43,17 @@ pub fn load_ebpf() -> anyhow::Result<Ebpf> {
     loader.load(bytes).context("load ebpf object")
 }
 
+/// Load (verify) a named XDP program without attaching it. Call this once at startup so that
+/// subsequent `attach_xdp_link` calls only need to attach (not load).
+pub fn load_program(ebpf: &mut Ebpf, prog_name: &str) -> anyhow::Result<()> {
+    let prog: &mut Xdp = ebpf
+        .program_mut(prog_name)
+        .with_context(|| format!("{prog_name} program missing"))?
+        .try_into()?;
+    prog.load().with_context(|| format!("verify {prog_name}"))?;
+    Ok(())
+}
+
 /// Load (verify) and attach a named XDP program to one interface. Call this for the first
 /// interface; use `attach_xdp_loaded` for subsequent interfaces with the same program name.
 pub fn attach_xdp(ebpf: &mut Ebpf, prog_name: &str, iface: &str) -> anyhow::Result<()> {

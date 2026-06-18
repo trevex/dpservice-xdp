@@ -38,6 +38,10 @@ pub static MAGLEV: HashMap<MaglevKey, [u8; 16]> = HashMap::with_max_entries(6553
 pub static CONNTRACK: LruHashMap<CtKey, CtEntry> = LruHashMap::with_max_entries(1_048_576, 0);
 #[map]
 pub static NAT: HashMap<NatKey, NatValue> = HashMap::with_max_entries(1024, 0);
+/// Marks a (vni, nat_ip) as a network-NAT IP (value = 1). Used by ingress to detect incoming
+/// ICMP echo requests targeting the NAT IP and reply in the dataplane (without involving the VM).
+#[map]
+pub static NAT_IPS: HashMap<VipKey, u8> = HashMap::with_max_entries(1024, 0);
 #[map]
 pub static FW_RULES: HashMap<FwRuleKey, FwRule> = HashMap::with_max_entries(16384, 0);
 #[map]
