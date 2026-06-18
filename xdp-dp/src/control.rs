@@ -76,6 +76,8 @@ struct Inner {
     prefixes: HashMap<Vec<u8>, Vec<([u8; 4], u32)>>,
     /// ifindex -> ordered (rule_id, rule) pairs
     fw: HashMap<u32, Vec<(Vec<u8>, FwRule)>>,
+    /// interface_id -> list of (prefix_ip, prefix_len) LB-prefix shadow entries (announce-only).
+    lb_prefixes: HashMap<Vec<u8>, Vec<([u8; 4], u32)>>,
     /// interface_id -> the owned guest_tx XDP link (dropping it detaches the program).
     links: HashMap<Vec<u8>, XdpLink>,
     /// (vni, prefix_ipv4, prefix_len, nexthop_underlay) for list/delete_route.
@@ -141,6 +143,7 @@ impl Control {
                 iface_underlay: HashMap::new(),
                 prefixes: HashMap::new(),
                 fw: HashMap::new(),
+                lb_prefixes: HashMap::new(),
                 links: HashMap::new(),
                 routes_shadow: Vec::new(),
             }),
@@ -527,6 +530,67 @@ impl Control {
         Ok(())
     }
 
+    /// Return detail for a single LB: (vni, ip, lb_underlay, ports).
+    pub fn get_lb(&self, id: &[u8]) -> Option<(u32, [u8; 4], [u8; 16], Vec<(u16, u8)>)> {
+        let g = self.inner.lock().unwrap();
+        g.lbs
+            .get(id)
+            .map(|e| (e.vni, e.ip, e.lb_underlay, e.ports.clone()))
+    }
+
+    /// List all LBs: (id, vni, ip, lb_underlay, ports).
+    pub fn list_lbs(&self) -> Vec<(Vec<u8>, u32, [u8; 4], [u8; 16], Vec<(u16, u8)>)> {
+        let g = self.inner.lock().unwrap();
+        g.lbs
+            .iter()
+            .map(|(id, e)| (id.clone(), e.vni, e.ip, e.lb_underlay, e.ports.clone()))
+            .collect()
+    }
+
+    /// List the backend underlay addresses for a given LB.
+    pub fn list_lb_targets(&self, id: &[u8]) -> Vec<[u8; 16]> {
+        let g = self.inner.lock().unwrap();
+        g.lbs
+            .get(id)
+            .map(|e| e.backends.clone())
+            .unwrap_or_default()
+    }
+
+    /// Add an LB-prefix shadow entry (announce-only; no datapath route needed).
+    pub fn add_lb_prefix(
+        &self,
+        interface_id: &[u8],
+        prefix: [u8; 4],
+        prefix_len: u32,
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        g.lb_prefixes
+            .entry(interface_id.to_vec())
+            .or_default()
+            .push((prefix, prefix_len));
+        Ok(())
+    }
+
+    /// Remove an LB-prefix shadow entry.
+    pub fn del_lb_prefix(
+        &self,
+        interface_id: &[u8],
+        prefix: [u8; 4],
+        prefix_len: u32,
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(v) = g.lb_prefixes.get_mut(interface_id) {
+            v.retain(|&(p, l)| !(p == prefix && l == prefix_len));
+        }
+        Ok(())
+    }
+
+    /// Return all LB-prefix shadow entries for an interface.
+    pub fn list_lb_prefixes(&self, interface_id: &[u8]) -> Vec<([u8; 4], u32)> {
+        let g = self.inner.lock().unwrap();
+        g.lb_prefixes.get(interface_id).cloned().unwrap_or_default()
+    }
+
     /// Remove a load balancer: clear its `LB` service entries and `MAGLEV` slots.
     pub fn delete_lb(&self, id: &[u8]) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
@@ -622,6 +686,22 @@ impl Control {
         g.nat
             .get(&NatKey { vni, ipv4: gip })
             .map(|v| (v.nat_ipv4, v.port_min, v.port_max))
+    }
+
+    /// List all local NAT entries: (interface_id, guest_ipv4, nat_ip, port_min, port_max).
+    pub fn list_local_nats(&self) -> Vec<(Vec<u8>, [u8; 4], [u8; 4], u16, u16)> {
+        let g = self.inner.lock().unwrap();
+        g.by_id
+            .iter()
+            .filter_map(|(id, rec)| {
+                g.nat
+                    .get(&NatKey {
+                        vni: rec.vni,
+                        ipv4: rec.ipv4,
+                    })
+                    .map(|v| (id.clone(), rec.ipv4, v.nat_ipv4, v.port_min, v.port_max))
+            })
+            .collect()
     }
 
     /// Remove a guest's NAT config.
