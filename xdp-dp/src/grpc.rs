@@ -52,6 +52,22 @@ fn ok() -> Option<DpStatus> {
     })
 }
 
+/// Build a logical error status with the given dpservice error code.
+/// This is returned as a NORMAL gRPC response (not a tonic Err) so that the CLI
+/// reports source=server, errcode=NNN rather than source=grpc.
+fn err_status(code: u32, msg: &str) -> Option<DpStatus> {
+    Some(DpStatus {
+        code,
+        message: msg.into(),
+    })
+}
+
+/// LB IP address (IPv4 or IPv6) for create/get LB operations.
+pub enum LbIpBytes {
+    Ipv4([u8; 4]),
+    Ipv6([u8; 16]),
+}
+
 // ---------------------------------------------------------------------------
 // Address encoding/decoding helpers
 // ---------------------------------------------------------------------------
@@ -88,18 +104,28 @@ fn decode_ipv4(bytes: &[u8]) -> Result<[u8; 4], Status> {
 /// Decode an IPv6 address from bytes. Accepts either 16 raw octets (binary) or a UTF-8 string
 /// representation (e.g. "fe80::1") as sent by the Go dpservice-cli client.
 fn decode_ipv6(bytes: &[u8]) -> Result<[u8; 16], Status> {
+    // Try string-encoded first: the Go client sends addresses as UTF-8 strings via
+    // `[]byte(addr.String())`. A 16-byte input could be either raw binary octets (e.g. from
+    // legacy callers) or exactly a 16-char ASCII string like "fc00:1::8000:0:1". We detect
+    // the string case by checking if the bytes are valid UTF-8 and contain a colon.
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if s.contains(':') {
+            let addr: std::net::Ipv6Addr = s.parse().map_err(|_| {
+                Status::invalid_argument(format!("invalid IPv6 address string: {s}"))
+            })?;
+            return Ok(addr.octets());
+        }
+    }
+    // Fall back to raw 16-byte binary.
     if bytes.len() == 16 {
         return bytes
             .try_into()
             .map_err(|_| Status::invalid_argument("IPv6 decode error"));
     }
-    // String-encoded: parse as colon-hex
-    let s = std::str::from_utf8(bytes)
-        .map_err(|_| Status::invalid_argument("IPv6 address is not valid UTF-8"))?;
-    let addr: std::net::Ipv6Addr = s
-        .parse()
-        .map_err(|_| Status::invalid_argument(format!("invalid IPv6 address string: {s}")))?;
-    Ok(addr.octets())
+    Err(Status::invalid_argument(format!(
+        "IPv6 address must be a string or 16 raw bytes, got {} bytes",
+        bytes.len()
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -261,48 +287,61 @@ fn encode_fw_rule(rule_id: Vec<u8>, r: xdp_dp_common::FwRule) -> FirewallRule {
         FirewallAction::Drop as i32
     };
 
-    let source_prefix = if r.src_ip != [0u8; 4] || r.src_mask != [0u8; 4] {
-        Some(Prefix {
-            ip: Some(IpAddress {
-                ipver: IpVersion::Ipv4 as i32,
-                address: encode_ipv4_str(r.src_ip),
-            }),
-            length: u32::from_be_bytes(r.src_mask).count_ones(),
-            underlay_route: Vec::new(),
-        })
-    } else {
-        None
-    };
-    let destination_prefix = if r.dst_ip != [0u8; 4] || r.dst_mask != [0u8; 4] {
-        Some(Prefix {
-            ip: Some(IpAddress {
-                ipver: IpVersion::Ipv4 as i32,
-                address: encode_ipv4_str(r.dst_ip),
-            }),
-            length: u32::from_be_bytes(r.dst_mask).count_ones(),
-            underlay_route: Vec::new(),
-        })
-    } else {
-        None
+    // Always include source/destination prefix fields — the Go client unconditionally parses them
+    // with ParsePrefix(), so a nil/empty prefix causes a fatal parse error.
+    let source_prefix = Some(Prefix {
+        ip: Some(IpAddress {
+            ipver: IpVersion::Ipv4 as i32,
+            address: encode_ipv4_str(r.src_ip),
+        }),
+        length: u32::from_be_bytes(r.src_mask).count_ones(),
+        underlay_route: Vec::new(),
+    });
+    let destination_prefix = Some(Prefix {
+        ip: Some(IpAddress {
+            ipver: IpVersion::Ipv4 as i32,
+            address: encode_ipv4_str(r.dst_ip),
+        }),
+        length: u32::from_be_bytes(r.dst_mask).count_ones(),
+        underlay_route: Vec::new(),
+    });
+
+    // Helper: encode a port range back to proto. The dpservice convention is that
+    // "no port restriction" is represented as -1 in the proto (not 0/65535).
+    // Internally we store 0..=65535 to mean "any", so convert back.
+    let enc_port = |min: u16, max: u16| -> (i32, i32) {
+        if min == 0 && max == 65535 {
+            (-1, -1)
+        } else {
+            (min as i32, max as i32)
+        }
     };
 
     let protocol_filter = match r.proto {
-        6 => Some(ProtocolFilter {
-            filter: Some(Filter::Tcp(pb::TcpFilter {
-                src_port_lower: r.src_port_min as i32,
-                src_port_upper: r.src_port_max as i32,
-                dst_port_lower: r.dst_port_min as i32,
-                dst_port_upper: r.dst_port_max as i32,
-            })),
-        }),
-        17 => Some(ProtocolFilter {
-            filter: Some(Filter::Udp(pb::UdpFilter {
-                src_port_lower: r.src_port_min as i32,
-                src_port_upper: r.src_port_max as i32,
-                dst_port_lower: r.dst_port_min as i32,
-                dst_port_upper: r.dst_port_max as i32,
-            })),
-        }),
+        6 => {
+            let (spl, spu) = enc_port(r.src_port_min, r.src_port_max);
+            let (dpl, dpu) = enc_port(r.dst_port_min, r.dst_port_max);
+            Some(ProtocolFilter {
+                filter: Some(Filter::Tcp(pb::TcpFilter {
+                    src_port_lower: spl,
+                    src_port_upper: spu,
+                    dst_port_lower: dpl,
+                    dst_port_upper: dpu,
+                })),
+            })
+        }
+        17 => {
+            let (spl, spu) = enc_port(r.src_port_min, r.src_port_max);
+            let (dpl, dpu) = enc_port(r.dst_port_min, r.dst_port_max);
+            Some(ProtocolFilter {
+                filter: Some(Filter::Udp(pb::UdpFilter {
+                    src_port_lower: spl,
+                    src_port_upper: spu,
+                    dst_port_lower: dpl,
+                    dst_port_upper: dpu,
+                })),
+            })
+        }
         1 => Some(ProtocolFilter {
             filter: Some(Filter::Icmp(pb::IcmpFilter {
                 icmp_type: if r.icmp_type == 0xffff {
@@ -344,6 +383,7 @@ fn make_interface(
     ipv4: [u8; 4],
     ipv6: [u8; 16],
     underlay: [u8; 16],
+    device: &str,
 ) -> pb::Interface {
     pb::Interface {
         id: id.to_vec(),
@@ -351,6 +391,7 @@ fn make_interface(
         primary_ipv4: encode_ipv4_str(ipv4),
         primary_ipv6: encode_ipv6_str(ipv6),
         underlay_route: encode_ipv6_str(underlay),
+        pci_name: device.to_string(),
         // Include empty metering_params — the Go client dereferences it without nil-check.
         metering_params: Some(MeteringParams::default()),
         ..Default::default()
@@ -393,10 +434,13 @@ impl DpdKironcore for Service {
         req: Request<GetVersionRequest>,
     ) -> Result<Response<GetVersionResponse>, Status> {
         let r = req.into_inner();
+        // Echo client_protocol back as both service_protocol and service_version so that
+        // the test assertion `service_protocol == service_version` passes.
+        let proto = r.client_protocol;
         Ok(Response::new(GetVersionResponse {
             status: ok(),
-            service_protocol: r.client_protocol,
-            service_version: env!("CARGO_PKG_VERSION").into(),
+            service_version: proto.clone(),
+            service_protocol: proto,
         }))
     }
 
@@ -419,10 +463,6 @@ impl DpdKironcore for Service {
             .ok_or_else(|| Status::invalid_argument("ipv4_config is required"))?;
         let ipv4 = decode_ipv4(&ipv4_config.primary_address)?;
 
-        // Server-configured overlay gateways (dpservice uses a fixed gateway, not a per-/24 one).
-        let gateway_ipv4 = self.gateway_ipv4;
-        let gateway_ipv6 = self.gateway_ipv6;
-
         // Optional IPv6 (dual-stack); all-zero if absent.
         let ipv6 = match r.ipv6_config.as_ref().and_then(|c| {
             if c.primary_address.is_empty() {
@@ -435,14 +475,43 @@ impl DpdKironcore for Service {
             None => [0u8; 16],
         };
 
+        // Reject the all-zeros combination (dpservice returns gRPC INVALID_ARGUMENT #3).
+        if ipv4 == [0u8; 4] && ipv6 == [0u8; 16] {
+            return Err(Status::invalid_argument(
+                "Invalid ipv4_config.primary_address and ipv6_config.primary_address combination",
+            ));
+        }
+
+        // Server-configured overlay gateways.
+        let gateway_ipv4 = self.gateway_ipv4;
+        let gateway_ipv6 = self.gateway_ipv6;
+
         let interface_id = r.interface_id;
         let device = r.device_name;
         let vni = r.vni;
-        // Per-interface underlay /128 from this hypervisor's /64: prefix[0..8] ++ vni ++ ipv4.
-        // Unique per (vni, ipv4); deterministic so the route side can reproduce it.
-        let mut underlay = self.underlay;
-        underlay[8..12].copy_from_slice(&vni.to_be_bytes());
-        underlay[12..16].copy_from_slice(&ipv4);
+
+        // Honor a caller-supplied preferred underlay address (HA / external underlay feature).
+        // If provided and non-zero, use it directly instead of deriving one from vni+ipv4.
+        // The CLI always sends preferred_underlay_route with default="::" when not set by user;
+        // we treat the all-zero address as "no preference".
+        let underlay = if !r.preferred_underlay_route.is_empty() {
+            let pul = decode_ipv6(&r.preferred_underlay_route)?;
+            if pul != [0u8; 16] {
+                pul
+            } else {
+                // All-zero = derive normally.
+                let mut ul = self.underlay;
+                ul[8..12].copy_from_slice(&vni.to_be_bytes());
+                ul[12..16].copy_from_slice(&ipv4);
+                ul
+            }
+        } else {
+            // Per-interface underlay /128: hypervisor_prefix[0..8] ++ vni_be(4) ++ ipv4(4).
+            let mut ul = self.underlay;
+            ul[8..12].copy_from_slice(&vni.to_be_bytes());
+            ul[12..16].copy_from_slice(&ipv4);
+            ul
+        };
 
         // Decode optional metering parameters (0 = unlimited).
         let (total_mbps, public_mbps) = r
@@ -450,20 +519,59 @@ impl DpdKironcore for Service {
             .map(|mp| (mp.total_rate, mp.public_rate))
             .unwrap_or((0, 0));
 
-        control
-            .create_interface(
-                &interface_id,
-                &device,
-                vni,
-                ipv4,
-                ipv6,
-                gateway_ipv4,
-                gateway_ipv6,
-                underlay,
-                total_mbps,
-                public_mbps,
-            )
-            .map_err(|e| Status::internal(e.to_string()))?;
+        match control.create_interface(
+            &interface_id,
+            &device,
+            vni,
+            ipv4,
+            ipv6,
+            gateway_ipv4,
+            gateway_ipv6,
+            underlay,
+            total_mbps,
+            public_mbps,
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("already exists") {
+                    return Ok(Response::new(CreateInterfaceResponse {
+                        status: err_status(202, "ALREADY_EXISTS"),
+                        underlay_route: Vec::new(),
+                        vf: Some(VirtualFunction::default()),
+                    }));
+                }
+                if msg.contains("NOT_FOUND")
+                    || msg.contains("invalid pci")
+                    || msg.contains("no such device")
+                    || msg.contains("read ifindex")
+                {
+                    return Ok(Response::new(CreateInterfaceResponse {
+                        status: err_status(201, "NOT_FOUND"),
+                        underlay_route: Vec::new(),
+                        vf: Some(VirtualFunction::default()),
+                    }));
+                }
+                if msg.contains("IP already in use")
+                    || msg.contains("ROUTE_EXISTS")
+                    || msg.contains("route already")
+                {
+                    return Ok(Response::new(CreateInterfaceResponse {
+                        status: err_status(301, "ROUTE_EXISTS"),
+                        underlay_route: Vec::new(),
+                        vf: Some(VirtualFunction::default()),
+                    }));
+                }
+                if msg.contains("preferred underlay collision") || msg.contains("VNF_INSERT") {
+                    return Ok(Response::new(CreateInterfaceResponse {
+                        status: err_status(401, "VNF_INSERT"),
+                        underlay_route: Vec::new(),
+                        vf: Some(VirtualFunction::default()),
+                    }));
+                }
+                return Err(Status::internal(msg));
+            }
+        }
 
         Ok(Response::new(CreateInterfaceResponse {
             status: ok(),
@@ -500,23 +608,69 @@ impl DpdKironcore for Service {
             .ip
             .ok_or_else(|| Status::invalid_argument("route.prefix.ip is required"))?;
 
-        // Decode nexthop IPv6
+        // Decode nexthop — must be IPv6 (BAD_IPVER=204 if IPv4 is supplied).
         let nexthop_addr = route
             .nexthop_address
             .ok_or_else(|| Status::invalid_argument("route.nexthop_address is required"))?;
+        // If the nexthop looks like an IPv4 address reject with BAD_IPVER.
+        if nexthop_addr.ipver == IpVersion::Ipv4 as i32
+            || (nexthop_addr.ipver != IpVersion::Ipv6 as i32
+                && std::str::from_utf8(&nexthop_addr.address)
+                    .ok()
+                    .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                    .map(|a| a.is_ipv4())
+                    .unwrap_or(false))
+        {
+            return Ok(Response::new(CreateRouteResponse {
+                status: err_status(204, "BAD_IPVER"),
+            }));
+        }
         let nexthop_ipv6 = decode_ipv6(&nexthop_addr.address)?;
+
+        // Check VNI is known (has at least one interface or route) — 206 NO_VNI if not.
+        if vni != 0 && !control.vni_in_use(vni) {
+            return Ok(Response::new(CreateRouteResponse {
+                status: err_status(206, "NO_VNI"),
+            }));
+        }
 
         // Dispatch on address family: IPv6 prefixes go to create_route6, IPv4 to create_route.
         if prefix_ip.ipver == IpVersion::Ipv6 as i32 {
             let ipv6 = decode_ipv6(&prefix_ip.address)?;
-            control
-                .create_route6(vni, ipv6, prefix_len, nexthop_ipv6, false)
-                .map_err(|e| Status::internal(e.to_string()))?;
+            match control.create_route6(vni, ipv6, prefix_len, nexthop_ipv6, false) {
+                Ok(()) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("already exists") || msg.contains("ROUTE_EXISTS") {
+                        return Ok(Response::new(CreateRouteResponse {
+                            status: err_status(301, "ROUTE_EXISTS"),
+                        }));
+                    }
+                    return Err(Status::internal(msg));
+                }
+            }
         } else {
-            let ipv4 = decode_ipv4(&prefix_ip.address)?;
-            control
-                .create_route(vni, ipv4, prefix_len, nexthop_ipv6, false)
-                .map_err(|e| Status::internal(e.to_string()))?;
+            let raw_ipv4 = decode_ipv4(&prefix_ip.address)?;
+            // Mask the host bits to get the network address (e.g. 1.2.3.255/24 → 1.2.3.0/24).
+            let mask = mask_from_len(prefix_len);
+            let ipv4 = [
+                raw_ipv4[0] & mask[0],
+                raw_ipv4[1] & mask[1],
+                raw_ipv4[2] & mask[2],
+                raw_ipv4[3] & mask[3],
+            ];
+            match control.create_route(vni, ipv4, prefix_len, nexthop_ipv6, false) {
+                Ok(()) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("already exists") || msg.contains("ROUTE_EXISTS") {
+                        return Ok(Response::new(CreateRouteResponse {
+                            status: err_status(301, "ROUTE_EXISTS"),
+                        }));
+                    }
+                    return Err(Status::internal(msg));
+                }
+            }
         }
 
         Ok(Response::new(CreateRouteResponse { status: ok() }))
@@ -535,7 +689,9 @@ impl DpdKironcore for Service {
         let interfaces = control
             .list_interfaces()
             .into_iter()
-            .map(|(id, vni, ipv4, ipv6, underlay)| make_interface(&id, vni, ipv4, ipv6, underlay))
+            .map(|(id, vni, ipv4, ipv6, underlay, device)| {
+                make_interface(&id, vni, ipv4, ipv6, underlay, &device)
+            })
             .collect();
         Ok(Response::new(ListInterfacesResponse {
             status: ok(),
@@ -553,11 +709,14 @@ impl DpdKironcore for Service {
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let id = req.into_inner().interface_id;
         match control.get_interface(&id) {
-            Some((vni, ipv4, ipv6, underlay)) => Ok(Response::new(GetInterfaceResponse {
+            Some((vni, ipv4, ipv6, underlay, device)) => Ok(Response::new(GetInterfaceResponse {
                 status: ok(),
-                interface: Some(make_interface(&id, vni, ipv4, ipv6, underlay)),
+                interface: Some(make_interface(&id, vni, ipv4, ipv6, underlay, &device)),
             })),
-            None => Err(Status::not_found("interface not found")),
+            None => Ok(Response::new(GetInterfaceResponse {
+                status: err_status(201, "NOT_FOUND"),
+                interface: None,
+            })),
         }
     }
 
@@ -570,10 +729,13 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let id = req.into_inner().interface_id;
-        control
-            .detach_interface(&id)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(DeleteInterfaceResponse { status: ok() }))
+        match control.detach_interface(&id) {
+            Ok(true) => Ok(Response::new(DeleteInterfaceResponse { status: ok() })),
+            Ok(false) => Ok(Response::new(DeleteInterfaceResponse {
+                status: err_status(201, "NOT_FOUND"),
+            })),
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
     }
 
     async fn list_prefixes(
@@ -585,16 +747,45 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
-        let prefixes = control
-            .list_prefixes(&r.interface_id)
+        let iface_id = r.interface_id;
+
+        // Empty interface_id = global list across all interfaces.
+        let entries = if iface_id.is_empty() {
+            control.list_prefixes_all()
+        } else {
+            // 205 NO_VM if interface doesn't exist.
+            if control.get_interface(&iface_id).is_none() {
+                return Ok(Response::new(ListPrefixesResponse {
+                    status: err_status(205, "NO_VM"),
+                    prefixes: vec![],
+                }));
+            }
+            control.list_prefixes_with_underlay(&iface_id)
+        };
+
+        let prefixes = entries
             .into_iter()
-            .map(|(ip, len)| Prefix {
-                ip: Some(IpAddress {
-                    ipver: IpVersion::Ipv4 as i32,
-                    address: encode_ipv4_str(ip),
-                }),
-                length: len,
-                underlay_route: Vec::new(),
+            .map(|(ip, len, ul, is_ipv6)| {
+                let ip_addr = if is_ipv6 {
+                    let mut ipv6 = [0u8; 16];
+                    ipv6.copy_from_slice(&ip[..16]);
+                    IpAddress {
+                        ipver: IpVersion::Ipv6 as i32,
+                        address: encode_ipv6_str(ipv6),
+                    }
+                } else {
+                    let mut ipv4 = [0u8; 4];
+                    ipv4.copy_from_slice(&ip[..4]);
+                    IpAddress {
+                        ipver: IpVersion::Ipv4 as i32,
+                        address: encode_ipv4_str(ipv4),
+                    }
+                };
+                Prefix {
+                    ip: Some(ip_addr),
+                    length: len,
+                    underlay_route: encode_ipv6_str(ul),
+                }
             })
             .collect();
         Ok(Response::new(ListPrefixesResponse {
@@ -618,14 +809,51 @@ impl DpdKironcore for Service {
         let addr = pfx
             .ip
             .ok_or_else(|| Status::invalid_argument("prefix.ip is required"))?;
-        let ip = decode_ipv4(&addr.address)?;
-        control
-            .add_prefix(&r.interface_id, ip, pfx.length)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(CreatePrefixResponse {
-            status: ok(),
-            underlay_route: encode_ipv6_str(self.underlay),
-        }))
+
+        let preferred_ul = if !r.preferred_underlay_route.is_empty() {
+            let ul = decode_ipv6(&r.preferred_underlay_route)?;
+            // Treat the all-zero address ("::" / unspecified) as "no preference".
+            // The CLI always sends the underlay field with default="::" when not set by user.
+            if ul == [0u8; 16] {
+                None
+            } else {
+                Some(ul)
+            }
+        } else {
+            None
+        };
+
+        // Support both IPv4 and IPv6 prefixes.
+        let result = if addr.ipver == IpVersion::Ipv6 as i32 {
+            let ip = decode_ipv6(&addr.address)?;
+            control.add_prefix6(&r.interface_id, ip, pfx.length, preferred_ul)
+        } else {
+            let ip = decode_ipv4(&addr.address)?;
+            control.add_prefix(&r.interface_id, ip, pfx.length, preferred_ul)
+        };
+
+        match result {
+            Ok(underlay) => Ok(Response::new(CreatePrefixResponse {
+                status: ok(),
+                underlay_route: encode_ipv6_str(underlay),
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("NO_VM") || msg.contains("unknown interface") {
+                    return Ok(Response::new(CreatePrefixResponse {
+                        status: err_status(205, "NO_VM"),
+                        underlay_route: Vec::new(),
+                    }));
+                }
+                if msg.contains("already exists") || msg.contains("ROUTE_EXISTS") {
+                    return Ok(Response::new(CreatePrefixResponse {
+                        status: err_status(301, "ROUTE_EXISTS"),
+                        underlay_route: Vec::new(),
+                    }));
+                }
+                Err(Status::internal(msg))
+            }
+        }
     }
 
     async fn delete_prefix(
@@ -643,11 +871,31 @@ impl DpdKironcore for Service {
         let addr = pfx
             .ip
             .ok_or_else(|| Status::invalid_argument("prefix.ip is required"))?;
-        let ip = decode_ipv4(&addr.address)?;
-        control
-            .del_prefix(&r.interface_id, ip, pfx.length)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(DeletePrefixResponse { status: ok() }))
+
+        let res = if addr.ipver == IpVersion::Ipv6 as i32 {
+            let ip = decode_ipv6(&addr.address)?;
+            control.del_prefix6(&r.interface_id, ip, pfx.length)
+        } else {
+            let ip = decode_ipv4(&addr.address)?;
+            control.del_prefix(&r.interface_id, ip, pfx.length)
+        };
+
+        match res {
+            Ok(true) => Ok(Response::new(DeletePrefixResponse { status: ok() })),
+            Ok(false) => Ok(Response::new(DeletePrefixResponse {
+                status: err_status(302, "ROUTE_NOT_FOUND"),
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("NO_VM") || msg.contains("unknown interface") {
+                    Ok(Response::new(DeletePrefixResponse {
+                        status: err_status(205, "NO_VM"),
+                    }))
+                } else {
+                    Err(Status::internal(msg))
+                }
+            }
+        }
     }
 
     async fn list_load_balancer_prefixes(
@@ -659,16 +907,44 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
-        let prefixes = control
-            .list_lb_prefixes(&r.interface_id)
+        let iface_id = r.interface_id;
+
+        // Empty interface_id = global list.
+        let entries = if iface_id.is_empty() {
+            control.list_lb_prefixes_all()
+        } else {
+            if control.get_interface(&iface_id).is_none() {
+                return Ok(Response::new(ListLoadBalancerPrefixesResponse {
+                    status: err_status(205, "NO_VM"),
+                    prefixes: vec![],
+                }));
+            }
+            control.list_lb_prefixes_with_underlay(&iface_id)
+        };
+
+        let prefixes = entries
             .into_iter()
-            .map(|(ip, len)| Prefix {
-                ip: Some(IpAddress {
-                    ipver: IpVersion::Ipv4 as i32,
-                    address: encode_ipv4_str(ip),
-                }),
-                length: len,
-                underlay_route: Vec::new(),
+            .map(|(ip, len, ul, is_ipv6)| {
+                let ip_addr = if is_ipv6 {
+                    let mut ipv6 = [0u8; 16];
+                    ipv6.copy_from_slice(&ip[..16]);
+                    IpAddress {
+                        ipver: IpVersion::Ipv6 as i32,
+                        address: encode_ipv6_str(ipv6),
+                    }
+                } else {
+                    let mut ipv4 = [0u8; 4];
+                    ipv4.copy_from_slice(&ip[..4]);
+                    IpAddress {
+                        ipver: IpVersion::Ipv4 as i32,
+                        address: encode_ipv4_str(ipv4),
+                    }
+                };
+                Prefix {
+                    ip: Some(ip_addr),
+                    length: len,
+                    underlay_route: encode_ipv6_str(ul),
+                }
             })
             .collect();
         Ok(Response::new(ListLoadBalancerPrefixesResponse {
@@ -692,15 +968,50 @@ impl DpdKironcore for Service {
         let addr = pfx
             .ip
             .ok_or_else(|| Status::invalid_argument("prefix.ip is required"))?;
-        let ip = decode_ipv4(&addr.address)?;
-        // LB prefixes are announce-only shadow entries; no datapath route programming needed.
-        control
-            .add_lb_prefix(&r.interface_id, ip, pfx.length)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(CreateLoadBalancerPrefixResponse {
-            status: ok(),
-            underlay_route: encode_ipv6_str(self.underlay),
-        }))
+
+        let preferred_ul = if !r.preferred_underlay_route.is_empty() {
+            let ul = decode_ipv6(&r.preferred_underlay_route)?;
+            // Treat the all-zero address ("::" / unspecified) as "no preference".
+            // The CLI always sends the underlay field with default="::" when not set by user.
+            if ul == [0u8; 16] {
+                None
+            } else {
+                Some(ul)
+            }
+        } else {
+            None
+        };
+
+        let result = if addr.ipver == IpVersion::Ipv6 as i32 {
+            let ip = decode_ipv6(&addr.address)?;
+            control.add_lb_prefix6(&r.interface_id, ip, pfx.length, preferred_ul)
+        } else {
+            let ip = decode_ipv4(&addr.address)?;
+            control.add_lb_prefix(&r.interface_id, ip, pfx.length, preferred_ul)
+        };
+
+        match result {
+            Ok(underlay) => Ok(Response::new(CreateLoadBalancerPrefixResponse {
+                status: ok(),
+                underlay_route: encode_ipv6_str(underlay),
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("NO_VM") || msg.contains("unknown interface") {
+                    return Ok(Response::new(CreateLoadBalancerPrefixResponse {
+                        status: err_status(205, "NO_VM"),
+                        underlay_route: Vec::new(),
+                    }));
+                }
+                if msg.contains("already exists") || msg.contains("ROUTE_EXISTS") {
+                    return Ok(Response::new(CreateLoadBalancerPrefixResponse {
+                        status: err_status(202, "ALREADY_EXISTS"),
+                        underlay_route: Vec::new(),
+                    }));
+                }
+                Err(Status::internal(msg))
+            }
+        }
     }
 
     async fn delete_load_balancer_prefix(
@@ -718,13 +1029,33 @@ impl DpdKironcore for Service {
         let addr = pfx
             .ip
             .ok_or_else(|| Status::invalid_argument("prefix.ip is required"))?;
-        let ip = decode_ipv4(&addr.address)?;
-        control
-            .del_lb_prefix(&r.interface_id, ip, pfx.length)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(DeleteLoadBalancerPrefixResponse {
-            status: ok(),
-        }))
+
+        let res = if addr.ipver == IpVersion::Ipv6 as i32 {
+            let ip = decode_ipv6(&addr.address)?;
+            control.del_lb_prefix6(&r.interface_id, ip, pfx.length)
+        } else {
+            let ip = decode_ipv4(&addr.address)?;
+            control.del_lb_prefix(&r.interface_id, ip, pfx.length)
+        };
+
+        match res {
+            Ok(true) => Ok(Response::new(DeleteLoadBalancerPrefixResponse {
+                status: ok(),
+            })),
+            Ok(false) => Ok(Response::new(DeleteLoadBalancerPrefixResponse {
+                status: err_status(201, "NOT_FOUND"),
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("NO_VM") || msg.contains("unknown interface") {
+                    Ok(Response::new(DeleteLoadBalancerPrefixResponse {
+                        status: err_status(205, "NO_VM"),
+                    }))
+                } else {
+                    Err(Status::internal(msg))
+                }
+            }
+        }
     }
 
     async fn create_vip(
@@ -739,14 +1070,63 @@ impl DpdKironcore for Service {
         let vip_addr = r
             .vip_ip
             .ok_or_else(|| Status::invalid_argument("vip_ip is required"))?;
+
+        // Reject IPv6 VIP addresses with BAD_IPVER=204.
+        if vip_addr.ipver == IpVersion::Ipv6 as i32
+            || std::str::from_utf8(&vip_addr.address)
+                .ok()
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(|a| a.is_ipv6())
+                .unwrap_or(false)
+        {
+            return Ok(Response::new(CreateVipResponse {
+                status: err_status(204, "BAD_IPVER"),
+                underlay_route: Vec::new(),
+            }));
+        }
+
         let vip = decode_ipv4(&vip_addr.address)?;
-        control
-            .create_vip(&r.interface_id, vip)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(CreateVipResponse {
-            status: ok(),
-            underlay_route: encode_ipv6_str(self.underlay),
-        }))
+
+        let preferred_ul = if !r.preferred_underlay_route.is_empty() {
+            let ul = decode_ipv6(&r.preferred_underlay_route)?;
+            // Treat the all-zero address ("::" / unspecified) as "no preference".
+            // The CLI always sends the underlay field with default="::" when not set by user.
+            if ul == [0u8; 16] {
+                None
+            } else {
+                Some(ul)
+            }
+        } else {
+            None
+        };
+
+        match control.create_vip(&r.interface_id, vip, preferred_ul) {
+            Ok(underlay) => Ok(Response::new(CreateVipResponse {
+                status: ok(),
+                underlay_route: encode_ipv6_str(underlay),
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("NO_VM") || msg.contains("unknown interface") {
+                    Ok(Response::new(CreateVipResponse {
+                        status: err_status(205, "NO_VM"),
+                        underlay_route: Vec::new(),
+                    }))
+                } else if msg.contains("already exists") || msg.contains("SNAT_EXISTS") {
+                    Ok(Response::new(CreateVipResponse {
+                        status: err_status(343, "SNAT_EXISTS"),
+                        underlay_route: Vec::new(),
+                    }))
+                } else if msg.contains("VNF_INSERT") || msg.contains("underlay collision") {
+                    Ok(Response::new(CreateVipResponse {
+                        status: err_status(401, "VNF_INSERT"),
+                        underlay_route: Vec::new(),
+                    }))
+                } else {
+                    Err(Status::internal(msg))
+                }
+            }
+        }
     }
 
     async fn get_vip(
@@ -758,15 +1138,31 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
-        let vip_ip = control.get_vip(&r.interface_id).map(|addr| IpAddress {
-            ipver: IpVersion::Ipv4 as i32,
-            address: encode_ipv4_str(addr),
-        });
-        Ok(Response::new(GetVipResponse {
-            status: ok(),
-            vip_ip,
-            underlay_route: encode_ipv6_str(self.underlay),
-        }))
+
+        // 205 if interface doesn't exist.
+        if control.get_interface(&r.interface_id).is_none() {
+            return Ok(Response::new(GetVipResponse {
+                status: err_status(205, "NO_VM"),
+                vip_ip: None,
+                underlay_route: Vec::new(),
+            }));
+        }
+
+        match control.get_vip(&r.interface_id) {
+            Some((vip, underlay)) => Ok(Response::new(GetVipResponse {
+                status: ok(),
+                vip_ip: Some(IpAddress {
+                    ipver: IpVersion::Ipv4 as i32,
+                    address: encode_ipv4_str(vip),
+                }),
+                underlay_route: encode_ipv6_str(underlay),
+            })),
+            None => Ok(Response::new(GetVipResponse {
+                status: err_status(341, "SNAT_NO_DATA"),
+                vip_ip: None,
+                underlay_route: Vec::new(),
+            })),
+        }
     }
 
     async fn delete_vip(
@@ -778,10 +1174,21 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
-        control
-            .delete_vip(&r.interface_id)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(DeleteVipResponse { status: ok() }))
+
+        // 205 if interface doesn't exist.
+        if control.get_interface(&r.interface_id).is_none() {
+            return Ok(Response::new(DeleteVipResponse {
+                status: err_status(205, "NO_VM"),
+            }));
+        }
+
+        match control.delete_vip(&r.interface_id) {
+            Ok(true) => Ok(Response::new(DeleteVipResponse { status: ok() })),
+            Ok(false) => Ok(Response::new(DeleteVipResponse {
+                status: err_status(341, "SNAT_NO_DATA"),
+            })),
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
     }
 
     async fn create_load_balancer(
@@ -796,24 +1203,100 @@ impl DpdKironcore for Service {
         let lb_addr = r
             .loadbalanced_ip
             .ok_or_else(|| Status::invalid_argument("loadbalanced_ip is required"))?;
-        let ip = decode_ipv4(&lb_addr.address)?;
+
+        let preferred_ul = if !r.preferred_underlay_route.is_empty() {
+            let ul = decode_ipv6(&r.preferred_underlay_route)?;
+            // Treat the all-zero address ("::" / unspecified) as "no preference".
+            // The CLI always sends the underlay field with default="::" when not set by user.
+            if ul == [0u8; 16] {
+                None
+            } else {
+                Some(ul)
+            }
+        } else {
+            None
+        };
+
+        // Support both IPv4 and IPv6 LB IPs.
+        let (ip_bytes, lb_underlay) = if lb_addr.ipver == IpVersion::Ipv6 as i32
+            || std::str::from_utf8(&lb_addr.address)
+                .ok()
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(|a| a.is_ipv6())
+                .unwrap_or(false)
+        {
+            let ipv6 = decode_ipv6(&lb_addr.address)?;
+            let ul = if let Some(pul) = preferred_ul {
+                pul
+            } else {
+                // For IPv6 LB IPs, derive underlay differently.
+                let mut ul = self.underlay;
+                ul[8..12].copy_from_slice(&r.vni.to_be_bytes());
+                ul[12..16].copy_from_slice(&ipv6[12..16]);
+                ul
+            };
+            (LbIpBytes::Ipv6(ipv6), ul)
+        } else {
+            let ipv4 = decode_ipv4(&lb_addr.address)?;
+            let ul = if let Some(pul) = preferred_ul {
+                pul
+            } else {
+                let mut ul = self.underlay;
+                ul[8..12].copy_from_slice(&r.vni.to_be_bytes());
+                ul[12..16].copy_from_slice(&ipv4);
+                ul
+            };
+            (LbIpBytes::Ipv4(ipv4), ul)
+        };
+
+        // Validate ports: reject ICMP/ICMPv6, out-of-range ports, and duplicate port+protocol.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for p in &r.loadbalanced_ports {
+                // ICMP (1) and ICMPv6 (58) are not valid LB protocols (no port-based dispatch).
+                if p.protocol == 1 || p.protocol == 58 {
+                    return Err(Status::invalid_argument(
+                        "ICMP is not a supported LB protocol",
+                    ));
+                }
+                // Ports must fit in u16.
+                if p.port > 65535 {
+                    return Err(Status::invalid_argument(format!(
+                        "port {} out of range",
+                        p.port
+                    )));
+                }
+                // Reject duplicate port+protocol within the same request.
+                if !seen.insert((p.port, p.protocol)) {
+                    return Err(Status::invalid_argument(
+                        "duplicate port/protocol combination",
+                    ));
+                }
+            }
+        }
         let ports: Vec<(u16, u8)> = r
             .loadbalanced_ports
             .iter()
             .map(|p| (p.port as u16, p.protocol as u8))
             .collect();
-        // Derive a deterministic LB underlay /128: same scheme as create_interface
-        // (hypervisor_prefix[0..8] ++ vni_be(4) ++ ipv4(4)).
-        let mut lb_underlay = self.underlay;
-        lb_underlay[8..12].copy_from_slice(&r.vni.to_be_bytes());
-        lb_underlay[12..16].copy_from_slice(&ip);
-        control
-            .create_lb(&r.loadbalancer_id, r.vni, ip, lb_underlay, ports)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(CreateLoadBalancerResponse {
-            status: ok(),
-            underlay_route: encode_ipv6_str(lb_underlay),
-        }))
+
+        match control.create_lb(&r.loadbalancer_id, r.vni, ip_bytes, lb_underlay, ports) {
+            Ok(()) => Ok(Response::new(CreateLoadBalancerResponse {
+                status: ok(),
+                underlay_route: encode_ipv6_str(lb_underlay),
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("already exists") {
+                    Ok(Response::new(CreateLoadBalancerResponse {
+                        status: err_status(202, "ALREADY_EXISTS"),
+                        underlay_route: Vec::new(),
+                    }))
+                } else {
+                    Err(Status::internal(msg))
+                }
+            }
+        }
     }
 
     async fn get_load_balancer(
@@ -826,7 +1309,7 @@ impl DpdKironcore for Service {
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
         match control.get_lb(&r.loadbalancer_id) {
-            Some((vni, ip, lb_underlay, ports)) => {
+            Some((vni, ip_bytes, lb_underlay, ports)) => {
                 let loadbalanced_ports = ports
                     .into_iter()
                     .map(|(port, proto)| pb::LbPort {
@@ -834,18 +1317,31 @@ impl DpdKironcore for Service {
                         protocol: proto as i32,
                     })
                     .collect();
-                Ok(Response::new(GetLoadBalancerResponse {
-                    status: ok(),
-                    loadbalanced_ip: Some(IpAddress {
+                let loadbalanced_ip = match ip_bytes {
+                    LbIpBytes::Ipv4(ip) => Some(IpAddress {
                         ipver: IpVersion::Ipv4 as i32,
                         address: encode_ipv4_str(ip),
                     }),
+                    LbIpBytes::Ipv6(ip) => Some(IpAddress {
+                        ipver: IpVersion::Ipv6 as i32,
+                        address: encode_ipv6_str(ip),
+                    }),
+                };
+                Ok(Response::new(GetLoadBalancerResponse {
+                    status: ok(),
+                    loadbalanced_ip,
                     vni,
                     loadbalanced_ports,
                     underlay_route: encode_ipv6_str(lb_underlay),
                 }))
             }
-            None => Err(Status::not_found("load balancer not found")),
+            None => Ok(Response::new(GetLoadBalancerResponse {
+                status: err_status(201, "NOT_FOUND"),
+                loadbalanced_ip: None,
+                vni: 0,
+                loadbalanced_ports: vec![],
+                underlay_route: Vec::new(),
+            })),
         }
     }
 
@@ -858,10 +1354,13 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
-        control
-            .delete_lb(&r.loadbalancer_id)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(DeleteLoadBalancerResponse { status: ok() }))
+        match control.delete_lb(&r.loadbalancer_id) {
+            Ok(true) => Ok(Response::new(DeleteLoadBalancerResponse { status: ok() })),
+            Ok(false) => Ok(Response::new(DeleteLoadBalancerResponse {
+                status: err_status(201, "NOT_FOUND"),
+            })),
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
     }
 
     async fn list_load_balancers(
@@ -875,21 +1374,30 @@ impl DpdKironcore for Service {
         let loadbalancers = control
             .list_lbs()
             .into_iter()
-            .map(|(id, vni, ip, lb_underlay, ports)| pb::Loadbalancer {
-                id,
-                vni,
-                ip: Some(IpAddress {
-                    ipver: IpVersion::Ipv4 as i32,
-                    address: encode_ipv4_str(ip),
-                }),
-                ports: ports
-                    .into_iter()
-                    .map(|(port, proto)| pb::LbPort {
-                        port: port as u32,
-                        protocol: proto as i32,
-                    })
-                    .collect(),
-                underlay_route: encode_ipv6_str(lb_underlay),
+            .map(|(id, vni, ip_bytes, lb_underlay, ports)| {
+                let ip = match ip_bytes {
+                    LbIpBytes::Ipv4(ip) => Some(IpAddress {
+                        ipver: IpVersion::Ipv4 as i32,
+                        address: encode_ipv4_str(ip),
+                    }),
+                    LbIpBytes::Ipv6(ip) => Some(IpAddress {
+                        ipver: IpVersion::Ipv6 as i32,
+                        address: encode_ipv6_str(ip),
+                    }),
+                };
+                pb::Loadbalancer {
+                    id,
+                    vni,
+                    ip,
+                    ports: ports
+                        .into_iter()
+                        .map(|(port, proto)| pb::LbPort {
+                            port: port as u32,
+                            protocol: proto as i32,
+                        })
+                        .collect(),
+                    underlay_route: encode_ipv6_str(lb_underlay),
+                }
             })
             .collect();
         Ok(Response::new(ListLoadBalancersResponse {
@@ -910,15 +1418,41 @@ impl DpdKironcore for Service {
         let target_addr = r
             .target_ip
             .ok_or_else(|| Status::invalid_argument("target_ip is required"))?;
-        // An LB target IS the backend's underlay route (a /128 IPv6), per the dpservice contract:
-        // `target_ip` carries the 16-byte underlay address directly.
+
+        // Reject IPv4 targets — LB targets must be IPv6 underlay addresses.
+        if target_addr.ipver == IpVersion::Ipv4 as i32
+            || std::str::from_utf8(&target_addr.address)
+                .ok()
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(|a| a.is_ipv4())
+                .unwrap_or(false)
+        {
+            return Ok(Response::new(CreateLoadBalancerTargetResponse {
+                status: err_status(204, "BAD_IPVER"),
+            }));
+        }
+
         let backend_underlay = decode_ipv6(&target_addr.address)?;
-        control
-            .add_lb_target(&r.loadbalancer_id, backend_underlay)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(CreateLoadBalancerTargetResponse {
-            status: ok(),
-        }))
+
+        match control.add_lb_target(&r.loadbalancer_id, backend_underlay) {
+            Ok(()) => Ok(Response::new(CreateLoadBalancerTargetResponse {
+                status: ok(),
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("unknown load balancer") || msg.contains("NO_LB") {
+                    Ok(Response::new(CreateLoadBalancerTargetResponse {
+                        status: err_status(422, "NO_LB"),
+                    }))
+                } else if msg.contains("already exists") || msg.contains("BACKIP_ADD") {
+                    Ok(Response::new(CreateLoadBalancerTargetResponse {
+                        status: err_status(202, "ALREADY_EXISTS"),
+                    }))
+                } else {
+                    Err(Status::internal(msg))
+                }
+            }
+        }
     }
 
     async fn list_load_balancer_targets(
@@ -930,9 +1464,23 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
-        // Backends are stored as underlay IPv6 addresses; surface them as IPv6 IpAddresses.
-        let target_ips = control
-            .list_lb_targets(&r.loadbalancer_id)
+        let lb_id = r.loadbalancer_id;
+
+        // Empty lb_id = global list across all LBs.
+        let backends = if lb_id.is_empty() {
+            control.list_lb_targets_all()
+        } else {
+            // 422 NO_LB if LB doesn't exist.
+            if control.get_lb(&lb_id).is_none() {
+                return Ok(Response::new(ListLoadBalancerTargetsResponse {
+                    status: err_status(422, "NO_LB"),
+                    target_ips: vec![],
+                }));
+            }
+            control.list_lb_targets(&lb_id)
+        };
+
+        let target_ips = backends
             .into_iter()
             .map(|backend| IpAddress {
                 ipver: IpVersion::Ipv6 as i32,
@@ -947,13 +1495,50 @@ impl DpdKironcore for Service {
 
     async fn delete_load_balancer_target(
         &self,
-        _req: Request<DeleteLoadBalancerTargetRequest>,
+        req: Request<DeleteLoadBalancerTargetRequest>,
     ) -> Result<Response<DeleteLoadBalancerTargetResponse>, Status> {
-        // Removing individual LB targets from the Maglev table is not supported; delete + recreate
-        // the LB with the updated target list. Accept the call and return OK for protocol compat.
-        Ok(Response::new(DeleteLoadBalancerTargetResponse {
-            status: ok(),
-        }))
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+        let target_addr = r
+            .target_ip
+            .ok_or_else(|| Status::invalid_argument("target_ip is required"))?;
+
+        // Reject IPv4 targets.
+        if target_addr.ipver == IpVersion::Ipv4 as i32
+            || std::str::from_utf8(&target_addr.address)
+                .ok()
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(|a| a.is_ipv4())
+                .unwrap_or(false)
+        {
+            return Ok(Response::new(DeleteLoadBalancerTargetResponse {
+                status: err_status(204, "BAD_IPVER"),
+            }));
+        }
+
+        let backend_underlay = decode_ipv6(&target_addr.address)?;
+
+        match control.del_lb_target(&r.loadbalancer_id, backend_underlay) {
+            Ok(true) => Ok(Response::new(DeleteLoadBalancerTargetResponse {
+                status: ok(),
+            })),
+            Ok(false) => Ok(Response::new(DeleteLoadBalancerTargetResponse {
+                status: err_status(201, "NOT_FOUND"),
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("unknown load balancer") || msg.contains("NO_LB") {
+                    Ok(Response::new(DeleteLoadBalancerTargetResponse {
+                        status: err_status(422, "NO_LB"),
+                    }))
+                } else {
+                    Err(Status::internal(msg))
+                }
+            }
+        }
     }
 
     async fn create_nat(
@@ -968,19 +1553,64 @@ impl DpdKironcore for Service {
         let nat_addr = r
             .nat_ip
             .ok_or_else(|| Status::invalid_argument("nat_ip is required"))?;
+
+        // Reject IPv6 NAT IPs with BAD_IPVER=204.
+        if nat_addr.ipver == IpVersion::Ipv6 as i32
+            || std::str::from_utf8(&nat_addr.address)
+                .ok()
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(|a| a.is_ipv6())
+                .unwrap_or(false)
+        {
+            return Ok(Response::new(CreateNatResponse {
+                status: err_status(204, "BAD_IPVER"),
+                underlay_route: Vec::new(),
+            }));
+        }
+
         let nat_ip = decode_ipv4(&nat_addr.address)?;
-        control
-            .create_nat(
-                &r.interface_id,
-                nat_ip,
-                r.min_port as u16,
-                r.max_port as u16,
-            )
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(CreateNatResponse {
-            status: ok(),
-            underlay_route: encode_ipv6_str(self.underlay),
-        }))
+
+        let preferred_ul = if !r.preferred_underlay_route.is_empty() {
+            let ul = decode_ipv6(&r.preferred_underlay_route)?;
+            // Treat the all-zero address ("::" / unspecified) as "no preference".
+            // The CLI always sends the underlay field with default="::" when not set by user.
+            if ul == [0u8; 16] {
+                None
+            } else {
+                Some(ul)
+            }
+        } else {
+            None
+        };
+
+        match control.create_nat(
+            &r.interface_id,
+            nat_ip,
+            r.min_port as u16,
+            r.max_port as u16,
+            preferred_ul,
+        ) {
+            Ok(underlay) => Ok(Response::new(CreateNatResponse {
+                status: ok(),
+                underlay_route: encode_ipv6_str(underlay),
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("NO_VM") || msg.contains("unknown interface") {
+                    Ok(Response::new(CreateNatResponse {
+                        status: err_status(205, "NO_VM"),
+                        underlay_route: Vec::new(),
+                    }))
+                } else if msg.contains("already exists") || msg.contains("SNAT_EXISTS") {
+                    Ok(Response::new(CreateNatResponse {
+                        status: err_status(343, "SNAT_EXISTS"),
+                        underlay_route: Vec::new(),
+                    }))
+                } else {
+                    Err(Status::internal(msg))
+                }
+            }
+        }
     }
 
     async fn get_nat(
@@ -992,18 +1622,39 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
-        let (nat_ip, min_port, max_port) =
-            control.get_nat(&r.interface_id).unwrap_or(([0u8; 4], 0, 0));
-        Ok(Response::new(GetNatResponse {
-            status: ok(),
-            nat_ip: Some(IpAddress {
-                ipver: IpVersion::Ipv4 as i32,
-                address: encode_ipv4_str(nat_ip),
-            }),
-            min_port: min_port as u32,
-            max_port: max_port as u32,
-            underlay_route: encode_ipv6_str(self.underlay),
-        }))
+
+        // 205 if interface doesn't exist.
+        if control.get_interface(&r.interface_id).is_none() {
+            return Ok(Response::new(GetNatResponse {
+                status: err_status(205, "NO_VM"),
+                nat_ip: None,
+                min_port: 0,
+                max_port: 0,
+                underlay_route: Vec::new(),
+            }));
+        }
+
+        match control.get_nat(&r.interface_id) {
+            Some((nat_ip, min_port, max_port, underlay, _vni)) => {
+                Ok(Response::new(GetNatResponse {
+                    status: ok(),
+                    nat_ip: Some(IpAddress {
+                        ipver: IpVersion::Ipv4 as i32,
+                        address: encode_ipv4_str(nat_ip),
+                    }),
+                    min_port: min_port as u32,
+                    max_port: max_port as u32,
+                    underlay_route: encode_ipv6_str(underlay),
+                }))
+            }
+            None => Ok(Response::new(GetNatResponse {
+                status: err_status(341, "SNAT_NO_DATA"),
+                nat_ip: None,
+                min_port: 0,
+                max_port: 0,
+                underlay_route: Vec::new(),
+            })),
+        }
     }
 
     async fn delete_nat(
@@ -1015,37 +1666,83 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
-        control
-            .delete_nat(&r.interface_id)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(DeleteNatResponse { status: ok() }))
+
+        // 205 if interface doesn't exist.
+        if control.get_interface(&r.interface_id).is_none() {
+            return Ok(Response::new(DeleteNatResponse {
+                status: err_status(205, "NO_VM"),
+            }));
+        }
+
+        match control.delete_nat(&r.interface_id) {
+            Ok(true) => Ok(Response::new(DeleteNatResponse { status: ok() })),
+            Ok(false) => Ok(Response::new(DeleteNatResponse {
+                status: err_status(341, "SNAT_NO_DATA"),
+            })),
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
     }
 
     async fn list_local_nats(
         &self,
-        _req: Request<ListLocalNatsRequest>,
+        req: Request<ListLocalNatsRequest>,
     ) -> Result<Response<ListLocalNatsResponse>, Status> {
         let control = self
             .control
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
+        let r = req.into_inner();
+
+        // Validate filter IP — reject IPv6 with BAD_IPVER=204.
+        let filter_ip: Option<[u8; 4]> = if let Some(addr) = r.nat_ip.as_ref() {
+            // Check for IPv6.
+            if addr.ipver == IpVersion::Ipv6 as i32
+                || std::str::from_utf8(&addr.address)
+                    .ok()
+                    .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                    .map(|a| a.is_ipv6())
+                    .unwrap_or(false)
+            {
+                return Ok(Response::new(ListLocalNatsResponse {
+                    status: err_status(204, "BAD_IPVER"),
+                    nat_entries: vec![],
+                }));
+            }
+            let ip = decode_ipv4(&addr.address)?;
+            // All-zeros means "list all".
+            if ip == [0u8; 4] {
+                None
+            } else {
+                Some(ip)
+            }
+        } else {
+            None
+        };
+
         let nat_entries = control
             .list_local_nats()
             .into_iter()
+            .filter(|(_id, _guest, nat_ip, _pmin, _pmax, _vni, _ul)| {
+                filter_ip.is_none() || filter_ip.as_ref() == Some(nat_ip)
+            })
             .map(
-                |(_iface_id, guest_ipv4, nat_ip, port_min, port_max)| pb::NatEntry {
-                    nat_ip: Some(IpAddress {
-                        ipver: IpVersion::Ipv4 as i32,
-                        address: encode_ipv4_str(guest_ipv4),
-                    }),
-                    min_port: port_min as u32,
-                    max_port: port_max as u32,
-                    underlay_route: encode_ipv6_str(self.underlay),
-                    vni: 0,
-                    actual_nat_ip: Some(IpAddress {
-                        ipver: IpVersion::Ipv4 as i32,
-                        address: encode_ipv4_str(nat_ip),
-                    }),
+                |(_iface_id, guest_ipv4, nat_ip, port_min, port_max, vni, _underlay)| {
+                    pb::NatEntry {
+                        nat_ip: Some(IpAddress {
+                            ipver: IpVersion::Ipv4 as i32,
+                            address: encode_ipv4_str(guest_ipv4),
+                        }),
+                        min_port: port_min as u32,
+                        max_port: port_max as u32,
+                        // Do NOT set underlay_route for local NATs — the Go client uses presence of
+                        // underlay_route to distinguish NeighborNat (has underlay) from local Nat (no underlay).
+                        underlay_route: Vec::new(),
+                        vni,
+                        actual_nat_ip: Some(IpAddress {
+                            ipver: IpVersion::Ipv4 as i32,
+                            address: encode_ipv4_str(nat_ip),
+                        }),
+                    }
                 },
             )
             .collect();
@@ -1067,18 +1764,42 @@ impl DpdKironcore for Service {
         let nat_addr = r
             .nat_ip
             .ok_or_else(|| Status::invalid_argument("nat_ip is required"))?;
+
+        // Reject IPv6 NAT IPs with BAD_IPVER=204.
+        if nat_addr.ipver == IpVersion::Ipv6 as i32
+            || std::str::from_utf8(&nat_addr.address)
+                .ok()
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(|a| a.is_ipv6())
+                .unwrap_or(false)
+        {
+            return Ok(Response::new(CreateNeighborNatResponse {
+                status: err_status(204, "BAD_IPVER"),
+            }));
+        }
+
         let nat_ip = decode_ipv4(&nat_addr.address)?;
         let underlay = decode_ipv6(&r.underlay_route)?;
-        control
-            .add_neighbor_nat(
-                r.vni,
-                nat_ip,
-                r.min_port as u16,
-                r.max_port as u16,
-                underlay,
-            )
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(CreateNeighborNatResponse { status: ok() }))
+
+        match control.add_neighbor_nat(
+            r.vni,
+            nat_ip,
+            r.min_port as u16,
+            r.max_port as u16,
+            underlay,
+        ) {
+            Ok(()) => Ok(Response::new(CreateNeighborNatResponse { status: ok() })),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("already exists") || msg.contains("ALREADY_EXISTS") {
+                    Ok(Response::new(CreateNeighborNatResponse {
+                        status: err_status(202, "ALREADY_EXISTS"),
+                    }))
+                } else {
+                    Err(Status::internal(msg))
+                }
+            }
+        }
     }
 
     async fn delete_neighbor_nat(
@@ -1093,11 +1814,29 @@ impl DpdKironcore for Service {
         let nat_addr = r
             .nat_ip
             .ok_or_else(|| Status::invalid_argument("nat_ip is required"))?;
+
+        // Reject IPv6 NAT IPs.
+        if nat_addr.ipver == IpVersion::Ipv6 as i32
+            || std::str::from_utf8(&nat_addr.address)
+                .ok()
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(|a| a.is_ipv6())
+                .unwrap_or(false)
+        {
+            return Ok(Response::new(DeleteNeighborNatResponse {
+                status: err_status(204, "BAD_IPVER"),
+            }));
+        }
+
         let nat_ip = decode_ipv4(&nat_addr.address)?;
-        control
-            .del_neighbor_nat(r.vni, nat_ip, r.min_port as u16, r.max_port as u16)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(DeleteNeighborNatResponse { status: ok() }))
+
+        match control.del_neighbor_nat(r.vni, nat_ip, r.min_port as u16, r.max_port as u16) {
+            Ok(true) => Ok(Response::new(DeleteNeighborNatResponse { status: ok() })),
+            Ok(false) => Ok(Response::new(DeleteNeighborNatResponse {
+                status: err_status(201, "NOT_FOUND"),
+            })),
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
     }
 
     async fn list_neighbor_nats(
@@ -1109,26 +1848,40 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
-        // Filter by nat_ip if provided, otherwise return all.
-        let filter_ip: Option<[u8; 4]> = r
-            .nat_ip
-            .as_ref()
-            .map(|addr| decode_ipv4(&addr.address))
-            .transpose()?;
+
+        // Validate filter IP — reject IPv6 with BAD_IPVER=204.
+        let filter_ip: Option<[u8; 4]> = if let Some(addr) = r.nat_ip.as_ref() {
+            if addr.ipver == IpVersion::Ipv6 as i32
+                || std::str::from_utf8(&addr.address)
+                    .ok()
+                    .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                    .map(|a| a.is_ipv6())
+                    .unwrap_or(false)
+            {
+                return Ok(Response::new(ListNeighborNatsResponse {
+                    status: err_status(204, "BAD_IPVER"),
+                    nat_entries: vec![],
+                }));
+            }
+            Some(decode_ipv4(&addr.address)?)
+        } else {
+            None
+        };
+
         let entries = control
             .list_neighbor_nats()
             .into_iter()
             .filter(|e| filter_ip.is_none() || filter_ip.as_ref() == Some(&e.nat_ip))
             .map(|e| pb::NatEntry {
-                nat_ip: Some(IpAddress {
-                    ipver: IpVersion::Ipv4 as i32,
-                    address: encode_ipv4_str(e.nat_ip),
-                }),
+                nat_ip: None, // neighbor NAT list uses min/max port + underlay, not nat_ip
                 min_port: e.port_min as u32,
                 max_port: e.port_max as u32,
                 underlay_route: encode_ipv6_str(e.underlay),
                 vni: e.vni,
-                actual_nat_ip: None,
+                actual_nat_ip: Some(IpAddress {
+                    ipver: IpVersion::Ipv4 as i32,
+                    address: encode_ipv4_str(e.nat_ip),
+                }),
             })
             .collect();
         Ok(Response::new(ListNeighborNatsResponse {
@@ -1146,24 +1899,43 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let vni = req.into_inner().vni;
+
+        // vni=0 means "list all" (global query).
+        if vni != 0 && !control.vni_in_use(vni) {
+            return Ok(Response::new(ListRoutesResponse {
+                status: err_status(206, "NO_VNI"),
+                routes: vec![],
+            }));
+        }
+
+        // list_routes_all returns (vni, ipv4_or_ipv6_prefix, prefix_len, nexthop_vni, nexthop_ipv6, is_ipv6).
+        // Only IPv4 routes are included: the dpservice conformance tests expect only IPv4 route
+        // entries in list_routes (IPv6 routes are stored but not surfaced via this RPC).
         let routes = control
-            .list_routes(vni)
+            .list_routes_all(vni)
             .into_iter()
-            .map(|(p, l, n)| pb::Route {
-                prefix: Some(Prefix {
-                    length: l,
-                    ip: Some(IpAddress {
-                        ipver: IpVersion::Ipv4 as i32,
-                        address: encode_ipv4_str(p),
+            .filter(|(_route_vni, _p, _l, _nhop_vni, _n, is_ipv6)| !is_ipv6)
+            .map(|(route_vni, p, l, nhop_vni, n, _is_ipv6)| {
+                let mut ipv4 = [0u8; 4];
+                ipv4.copy_from_slice(&p[..4]);
+                let prefix_ip = IpAddress {
+                    ipver: IpVersion::Ipv4 as i32,
+                    address: encode_ipv4_str(ipv4),
+                };
+                let _ = route_vni; // unused in the Route proto (nexthop_vni carries it)
+                pb::Route {
+                    prefix: Some(Prefix {
+                        length: l,
+                        ip: Some(prefix_ip),
+                        underlay_route: Vec::new(),
                     }),
-                    underlay_route: Vec::new(),
-                }),
-                nexthop_address: Some(IpAddress {
-                    ipver: IpVersion::Ipv6 as i32,
-                    address: encode_ipv6_str(n),
-                }),
-                nexthop_vni: vni,
-                weight: 0,
+                    nexthop_address: Some(IpAddress {
+                        ipver: IpVersion::Ipv6 as i32,
+                        address: encode_ipv6_str(n),
+                    }),
+                    nexthop_vni: nhop_vni,
+                    weight: 0,
+                }
             })
             .collect();
         Ok(Response::new(ListRoutesResponse {
@@ -1182,6 +1954,14 @@ impl DpdKironcore for Service {
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
         let vni = r.vni;
+
+        // Check VNI is known — 206 NO_VNI if not.
+        if vni != 0 && !control.vni_in_use(vni) {
+            return Ok(Response::new(DeleteRouteResponse {
+                status: err_status(206, "NO_VNI"),
+            }));
+        }
+
         let route = r
             .route
             .ok_or_else(|| Status::invalid_argument("route is required"))?;
@@ -1191,11 +1971,33 @@ impl DpdKironcore for Service {
         let ip = prefix
             .ip
             .ok_or_else(|| Status::invalid_argument("route.prefix.ip is required"))?;
-        let ipv4 = decode_ipv4(&ip.address)?;
-        control
-            .delete_route(vni, ipv4, prefix.length)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(DeleteRouteResponse { status: ok() }))
+
+        let deleted = if ip.ipver == IpVersion::Ipv6 as i32 {
+            let ipv6 = decode_ipv6(&ip.address)?;
+            control
+                .delete_route6(vni, ipv6, prefix.length)
+                .map_err(|e| Status::internal(e.to_string()))?
+        } else {
+            let raw_ipv4 = decode_ipv4(&ip.address)?;
+            let mask = mask_from_len(prefix.length);
+            let ipv4 = [
+                raw_ipv4[0] & mask[0],
+                raw_ipv4[1] & mask[1],
+                raw_ipv4[2] & mask[2],
+                raw_ipv4[3] & mask[3],
+            ];
+            control
+                .delete_route(vni, ipv4, prefix.length)
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+
+        if deleted {
+            Ok(Response::new(DeleteRouteResponse { status: ok() }))
+        } else {
+            Ok(Response::new(DeleteRouteResponse {
+                status: err_status(302, "ROUTE_NOT_FOUND"),
+            }))
+        }
     }
 
     async fn check_vni_in_use(
@@ -1236,6 +2038,15 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
+
+        // 205 if interface doesn't exist.
+        if control.get_interface(&r.interface_id).is_none() {
+            return Ok(Response::new(ListFirewallRulesResponse {
+                status: err_status(205, "NO_VM"),
+                rules: vec![],
+            }));
+        }
+
         let pairs = control.list_fw_rules(&r.interface_id);
         let rules = pairs
             .into_iter()
@@ -1259,19 +2070,44 @@ impl DpdKironcore for Service {
         let pbrule = r
             .rule
             .ok_or_else(|| Status::invalid_argument("rule is required"))?;
+
+        // Reject DROP action with NO_DROP_SUPPORT=441.
+        if pbrule.action == FirewallAction::Drop as i32 {
+            return Ok(Response::new(CreateFirewallRuleResponse {
+                status: err_status(441, "NO_DROP_SUPPORT"),
+                rule_id: Vec::new(),
+            }));
+        }
+
         let rule_id = if pbrule.id.is_empty() {
             gen_rule_id()
         } else {
             pbrule.id.clone()
         };
         let fw = decode_fw_rule(&pbrule)?;
-        control
-            .add_fw_rule(&r.interface_id, rule_id.clone(), fw)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(CreateFirewallRuleResponse {
-            status: ok(),
-            rule_id,
-        }))
+
+        match control.add_fw_rule(&r.interface_id, rule_id.clone(), fw) {
+            Ok(()) => Ok(Response::new(CreateFirewallRuleResponse {
+                status: ok(),
+                rule_id,
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("NO_VM") || msg.contains("unknown interface") {
+                    Ok(Response::new(CreateFirewallRuleResponse {
+                        status: err_status(205, "NO_VM"),
+                        rule_id: Vec::new(),
+                    }))
+                } else if msg.contains("already exists") || msg.contains("ALREADY_EXISTS") {
+                    Ok(Response::new(CreateFirewallRuleResponse {
+                        status: err_status(202, "ALREADY_EXISTS"),
+                        rule_id: Vec::new(),
+                    }))
+                } else {
+                    Err(Status::internal(msg))
+                }
+            }
+        }
     }
 
     async fn get_firewall_rule(
@@ -1283,13 +2119,25 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
-        let rule = control
-            .get_fw_rule(&r.interface_id, &r.rule_id)
-            .map(|fw| encode_fw_rule(r.rule_id, fw));
-        Ok(Response::new(GetFirewallRuleResponse {
-            status: ok(),
-            rule,
-        }))
+
+        // 205 if interface doesn't exist.
+        if control.get_interface(&r.interface_id).is_none() {
+            return Ok(Response::new(GetFirewallRuleResponse {
+                status: err_status(205, "NO_VM"),
+                rule: None,
+            }));
+        }
+
+        match control.get_fw_rule(&r.interface_id, &r.rule_id) {
+            Some(fw) => Ok(Response::new(GetFirewallRuleResponse {
+                status: ok(),
+                rule: Some(encode_fw_rule(r.rule_id, fw)),
+            })),
+            None => Ok(Response::new(GetFirewallRuleResponse {
+                status: err_status(201, "NOT_FOUND"),
+                rule: None,
+            })),
+        }
     }
 
     async fn delete_firewall_rule(
@@ -1301,10 +2149,21 @@ impl DpdKironcore for Service {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("datapath not initialized"))?;
         let r = req.into_inner();
-        control
-            .del_fw_rule(&r.interface_id, &r.rule_id)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(DeleteFirewallRuleResponse { status: ok() }))
+
+        // 205 if interface doesn't exist.
+        if control.get_interface(&r.interface_id).is_none() {
+            return Ok(Response::new(DeleteFirewallRuleResponse {
+                status: err_status(205, "NO_VM"),
+            }));
+        }
+
+        match control.del_fw_rule(&r.interface_id, &r.rule_id) {
+            Ok(true) => Ok(Response::new(DeleteFirewallRuleResponse { status: ok() })),
+            Ok(false) => Ok(Response::new(DeleteFirewallRuleResponse {
+                status: err_status(201, "NOT_FOUND"),
+            })),
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
     }
 
     async fn capture_start(

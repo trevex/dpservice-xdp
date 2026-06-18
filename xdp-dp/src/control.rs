@@ -10,6 +10,7 @@ use xdp_dp_common::{
     NB_MAX_ENTRIES,
 };
 
+use crate::grpc::LbIpBytes;
 use crate::loader;
 use crate::maps::{
     Conntrack, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev, Meter, Nat, NeighborNat,
@@ -26,15 +27,52 @@ struct IfaceRecord {
     underlay: [u8; 16],
 }
 
+/// LB IP address stored in the shadow state (IPv4 or IPv6).
+#[derive(Clone)]
+enum LbIp {
+    Ipv4([u8; 4]),
+    Ipv6([u8; 16]),
+}
+
+impl LbIp {
+    /// Return the last 4 bytes of the address for underlay derivation.
+    fn last4(&self) -> [u8; 4] {
+        match self {
+            LbIp::Ipv4(ip) => *ip,
+            LbIp::Ipv6(ip) => {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&ip[12..16]);
+                b
+            }
+        }
+    }
+
+    fn as_lb_ip_bytes(&self) -> LbIpBytes {
+        match self {
+            LbIp::Ipv4(ip) => LbIpBytes::Ipv4(*ip),
+            LbIp::Ipv6(ip) => LbIpBytes::Ipv6(*ip),
+        }
+    }
+}
+
 /// Registered load balancer: its Maglev table id, the (port,proto) services it answers, and the
 /// ordered backend list (drives the Maglev table). Keyed in `Inner.lbs` by the LB's id.
 struct LbEntry {
     vni: u32,
-    ip: [u8; 4],
+    ip: LbIp,
     lb_underlay: [u8; 16],
     ports: Vec<(u16, u8)>,
     table_id: u32,
     backends: Vec<[u8; 16]>,
+}
+
+/// Prefix record: ip bytes (4 or 16), prefix_len, underlay route, is_ipv6 flag.
+#[derive(Clone)]
+struct PrefixRecord {
+    ip: [u8; 16], // first 4 bytes for IPv4, all 16 for IPv6
+    len: u32,
+    underlay: [u8; 16],
+    is_ipv6: bool,
 }
 
 /// Owns the loaded eBPF object + map handles; mutated by the gRPC handlers.
@@ -72,16 +110,18 @@ struct Inner {
     by_ifindex: HashMap<Vec<u8>, u32>,
     /// interface_id -> its underlay /128
     iface_underlay: HashMap<Vec<u8>, [u8; 16]>,
-    /// interface_id -> list of (prefix_ip, prefix_len) alias prefixes
-    prefixes: HashMap<Vec<u8>, Vec<([u8; 4], u32)>>,
+    /// interface_id -> list of prefix records (IPv4 and IPv6)
+    prefixes: HashMap<Vec<u8>, Vec<PrefixRecord>>,
     /// ifindex -> ordered (rule_id, rule) pairs
     fw: HashMap<u32, Vec<(Vec<u8>, FwRule)>>,
-    /// interface_id -> list of (prefix_ip, prefix_len) LB-prefix shadow entries (announce-only).
-    lb_prefixes: HashMap<Vec<u8>, Vec<([u8; 4], u32)>>,
+    /// interface_id -> list of LB-prefix records (announce-only).
+    lb_prefixes: HashMap<Vec<u8>, Vec<PrefixRecord>>,
     /// interface_id -> the owned guest_tx XDP link (dropping it detaches the program).
     links: HashMap<Vec<u8>, XdpLink>,
-    /// (vni, prefix_ipv4, prefix_len, nexthop_underlay) for list/delete_route.
-    routes_shadow: Vec<(u32, [u8; 4], u32, [u8; 16])>,
+    /// (vni, prefix_ipv4, prefix_len, nexthop_vni, nexthop_underlay) for list/delete_route.
+    routes_shadow: Vec<(u32, [u8; 4], u32, u32, [u8; 16])>,
+    /// IPv6 routes shadow (vni, prefix_ipv6, prefix_len, nexthop_vni, nexthop_underlay).
+    routes6_shadow: Vec<(u32, [u8; 16], u32, u32, [u8; 16])>,
 }
 
 impl Control {
@@ -146,6 +186,7 @@ impl Control {
                 lb_prefixes: HashMap::new(),
                 links: HashMap::new(),
                 routes_shadow: Vec::new(),
+                routes6_shadow: Vec::new(),
             }),
             conntrack: Mutex::new(Some(conntrack)),
         })
@@ -202,12 +243,23 @@ impl Control {
         total_mbps: u64,
         public_mbps: u64,
     ) -> anyhow::Result<()> {
-        let tap = crate::ifindex(device)?;
+        let tap = crate::ifindex(device)
+            .map_err(|e| anyhow::anyhow!("read ifindex for {device}: {e}"))?;
         let mac = crate::mac_of(device)?;
         let mut g = self.inner.lock().unwrap();
         if g.by_id.contains_key(interface_id) {
             anyhow::bail!("interface already exists");
         }
+        // Check that the (vni, ipv4) combination is not already in use (ROUTE_EXISTS).
+        if g.by_id.values().any(|r| r.vni == vni && r.ipv4 == ipv4) {
+            anyhow::bail!("ROUTE_EXISTS: IP already in use in this VNI");
+        }
+        // Check that the (vni, ipv6) combination is not already in use (if non-zero).
+        if ipv6 != [0u8; 16] && g.by_id.values().any(|r| r.vni == vni && r.ipv6 == ipv6) {
+            anyhow::bail!("ROUTE_EXISTS: IPv6 already in use in this VNI");
+        }
+        // NOTE: preferred underlay collision is NOT checked here; it is checked only when
+        // the caller explicitly supplies a preferred_underlay_route (see grpc.rs handler).
         // Attach guest_tx and retain the link. The program is loaded on the first attach; if it is
         // not yet loaded (no guest interfaces yet) attach_xdp_link's attach() returns "not loaded",
         // so load+attach once via attach_xdp, then re-attach to retain a droppable link.
@@ -360,12 +412,12 @@ impl Control {
     }
 
     /// Tear down a local interface: detach guest_tx (drop the link) and clear its maps + shadow.
-    /// Idempotent.
-    pub fn detach_interface(&self, interface_id: &[u8]) -> anyhow::Result<()> {
+    /// Returns true if found and deleted, false if not found.
+    pub fn detach_interface(&self, interface_id: &[u8]) -> anyhow::Result<bool> {
         let mut g = self.inner.lock().unwrap();
         let rec = match g.by_id.remove(interface_id) {
             Some(r) => r,
-            None => return Ok(()),
+            None => return Ok(false),
         };
         let tap = g.by_ifindex.remove(interface_id).unwrap_or(0);
         g.iface_underlay.remove(interface_id);
@@ -384,23 +436,35 @@ impl Control {
         if let Some(rules) = g.fw.remove(&tap) {
             drop(rules);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Interface detail for get/list. Returns (vni, ipv4, ipv6, underlay).
-    pub fn get_interface(&self, interface_id: &[u8]) -> Option<(u32, [u8; 4], [u8; 16], [u8; 16])> {
+    pub fn get_interface(
+        &self,
+        interface_id: &[u8],
+    ) -> Option<(u32, [u8; 4], [u8; 16], [u8; 16], String)> {
         let g = self.inner.lock().unwrap();
         g.by_id
             .get(interface_id)
-            .map(|r| (r.vni, r.ipv4, r.ipv6, r.underlay))
+            .map(|r| (r.vni, r.ipv4, r.ipv6, r.underlay, r.device.clone()))
     }
 
-    /// All interface ids with their (vni, ipv4, ipv6, underlay).
-    pub fn list_interfaces(&self) -> Vec<(Vec<u8>, u32, [u8; 4], [u8; 16], [u8; 16])> {
+    /// All interface ids with their (vni, ipv4, ipv6, underlay, device).
+    pub fn list_interfaces(&self) -> Vec<(Vec<u8>, u32, [u8; 4], [u8; 16], [u8; 16], String)> {
         let g = self.inner.lock().unwrap();
         g.by_id
             .iter()
-            .map(|(id, r)| (id.clone(), r.vni, r.ipv4, r.ipv6, r.underlay))
+            .map(|(id, r)| {
+                (
+                    id.clone(),
+                    r.vni,
+                    r.ipv4,
+                    r.ipv6,
+                    r.underlay,
+                    r.device.clone(),
+                )
+            })
             .collect()
     }
 
@@ -413,6 +477,13 @@ impl Control {
         is_external: bool,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
+        // Check for duplicate — routes_shadow is the source of truth.
+        if g.routes_shadow
+            .iter()
+            .any(|&(v, p, l, _, _)| v == vni && p == ipv4 && l == prefix_len)
+        {
+            anyhow::bail!("ROUTE_EXISTS: route already exists");
+        }
         g.routes.upsert(
             vni,
             ipv4,
@@ -424,47 +495,22 @@ impl Control {
                 _pad: [0; 3],
             },
         )?;
-        g.routes_shadow.push((vni, ipv4, prefix_len, nexthop_ipv6));
+        g.routes_shadow
+            .push((vni, ipv4, prefix_len, vni, nexthop_ipv6));
         Ok(())
     }
 
-    pub fn delete_route(&self, vni: u32, ipv4: [u8; 4], prefix_len: u32) -> anyhow::Result<()> {
+    /// Delete a route. Returns true if found and deleted, false if not found.
+    pub fn delete_route(&self, vni: u32, ipv4: [u8; 4], prefix_len: u32) -> anyhow::Result<bool> {
         let mut g = self.inner.lock().unwrap();
-        let _ = g.routes.remove(vni, ipv4, prefix_len);
+        let before = g.routes_shadow.len();
         g.routes_shadow
-            .retain(|&(v, p, l, _)| !(v == vni && p == ipv4 && l == prefix_len));
-        Ok(())
-    }
-
-    pub fn list_routes(&self, vni: u32) -> Vec<([u8; 4], u32, [u8; 16])> {
-        let g = self.inner.lock().unwrap();
-        g.routes_shadow
-            .iter()
-            .filter(|&&(v, _, _, _)| v == vni)
-            .map(|&(_, p, l, n)| (p, l, n))
-            .collect()
-    }
-
-    pub fn vni_in_use(&self, vni: u32) -> bool {
-        let g = self.inner.lock().unwrap();
-        g.by_id.values().any(|r| r.vni == vni)
-            || g.routes_shadow.iter().any(|&(v, _, _, _)| v == vni)
-    }
-
-    pub fn reset_vni(&self, vni: u32) -> anyhow::Result<()> {
-        // Remove all routes for the vni (interfaces are torn down via DeleteInterface).
-        let to_del: Vec<_> = {
-            let g = self.inner.lock().unwrap();
-            g.routes_shadow
-                .iter()
-                .filter(|&&(v, _, _, _)| v == vni)
-                .map(|&(_, p, l, _)| (p, l))
-                .collect()
-        };
-        for (p, l) in to_del {
-            self.delete_route(vni, p, l)?;
+            .retain(|&(v, p, l, _, _)| !(v == vni && p == ipv4 && l == prefix_len));
+        if g.routes_shadow.len() == before {
+            return Ok(false);
         }
-        Ok(())
+        let _ = g.routes.remove(vni, ipv4, prefix_len);
+        Ok(true)
     }
 
     pub fn create_route6(
@@ -476,6 +522,13 @@ impl Control {
         is_external: bool,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
+        // Check for duplicate.
+        if g.routes6_shadow
+            .iter()
+            .any(|&(v, p, l, _, _)| v == vni && p == ipv6 && l == prefix_len)
+        {
+            anyhow::bail!("ROUTE_EXISTS: route already exists");
+        }
         g.routes6.upsert(
             vni,
             ipv6,
@@ -486,7 +539,79 @@ impl Control {
                 is_external: is_external as u8,
                 _pad: [0; 3],
             },
-        )
+        )?;
+        g.routes6_shadow
+            .push((vni, ipv6, prefix_len, vni, nexthop_ipv6));
+        Ok(())
+    }
+
+    /// Delete an IPv6 route. Returns true if found, false if not found.
+    pub fn delete_route6(&self, vni: u32, ipv6: [u8; 16], prefix_len: u32) -> anyhow::Result<bool> {
+        let mut g = self.inner.lock().unwrap();
+        let before = g.routes6_shadow.len();
+        g.routes6_shadow
+            .retain(|&(v, p, l, _, _)| !(v == vni && p == ipv6 && l == prefix_len));
+        if g.routes6_shadow.len() == before {
+            return Ok(false);
+        }
+        let _ = g.routes6.remove(vni, ipv6, prefix_len);
+        Ok(true)
+    }
+
+    /// List routes for a VNI (or all if vni=0).
+    /// Returns (route_vni, ip_bytes_16, prefix_len, nexthop_vni, nexthop_ipv6, is_ipv6).
+    pub fn list_routes_all(&self, vni: u32) -> Vec<(u32, [u8; 16], u32, u32, [u8; 16], bool)> {
+        let g = self.inner.lock().unwrap();
+        let mut result = Vec::new();
+        // IPv4 routes.
+        for &(rv, p, l, nhvni, n) in &g.routes_shadow {
+            if vni == 0 || rv == vni {
+                let mut ip = [0u8; 16];
+                ip[..4].copy_from_slice(&p);
+                result.push((rv, ip, l, nhvni, n, false));
+            }
+        }
+        // IPv6 routes.
+        for &(rv, p, l, nhvni, n) in &g.routes6_shadow {
+            if vni == 0 || rv == vni {
+                result.push((rv, p, l, nhvni, n, true));
+            }
+        }
+        result
+    }
+
+    pub fn vni_in_use(&self, vni: u32) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.by_id.values().any(|r| r.vni == vni)
+            || g.routes_shadow.iter().any(|&(v, _, _, _, _)| v == vni)
+            || g.routes6_shadow.iter().any(|&(v, _, _, _, _)| v == vni)
+    }
+
+    pub fn reset_vni(&self, vni: u32) -> anyhow::Result<()> {
+        // Remove all routes for the vni (interfaces are torn down via DeleteInterface).
+        let ipv4_to_del: Vec<_> = {
+            let g = self.inner.lock().unwrap();
+            g.routes_shadow
+                .iter()
+                .filter(|&&(v, _, _, _, _)| v == vni)
+                .map(|&(_, p, l, _, _)| (p, l))
+                .collect()
+        };
+        for (p, l) in ipv4_to_del {
+            self.delete_route(vni, p, l)?;
+        }
+        let ipv6_to_del: Vec<_> = {
+            let g = self.inner.lock().unwrap();
+            g.routes6_shadow
+                .iter()
+                .filter(|&&(v, _, _, _, _)| v == vni)
+                .map(|&(_, p, l, _, _)| (p, l))
+                .collect()
+        };
+        for (p, l) in ipv6_to_del {
+            self.delete_route6(vni, p, l)?;
+        }
+        Ok(())
     }
 
     /// Register a load balancer: allocate a Maglev table id and program the `LB` map for each
@@ -495,18 +620,28 @@ impl Control {
         &self,
         id: &[u8],
         vni: u32,
-        ip: [u8; 4],
+        ip: LbIpBytes,
         lb_underlay: [u8; 16],
         ports: Vec<(u16, u8)>,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
+        if g.lbs.contains_key(id) {
+            anyhow::bail!("load balancer already exists");
+        }
         let table_id = g.next_table_id;
         g.next_table_id += 1;
+
+        let lb_ip = match &ip {
+            LbIpBytes::Ipv4(a) => LbIp::Ipv4(*a),
+            LbIpBytes::Ipv6(a) => LbIp::Ipv6(*a),
+        };
+        let lb_ip_bytes4 = lb_ip.last4();
+
         for &(port, proto) in &ports {
             g.lb.upsert(
                 LbKey {
                     vni,
-                    ipv4: ip,
+                    ipv4: lb_ip_bytes4,
                     port,
                     proto,
                     _pad: 0,
@@ -532,7 +667,7 @@ impl Control {
             id.to_vec(),
             LbEntry {
                 vni,
-                ip,
+                ip: lb_ip,
                 lb_underlay,
                 ports,
                 table_id,
@@ -545,14 +680,17 @@ impl Control {
     /// Append a backend underlay /128 to a registered LB and rebuild + write its Maglev table.
     pub fn add_lb_target(&self, id: &[u8], backend: [u8; 16]) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let (table_id, backends) = {
-            let entry = g
-                .lbs
-                .get_mut(id)
-                .ok_or_else(|| anyhow::anyhow!("unknown load balancer"))?;
-            entry.backends.push(backend);
-            (entry.table_id, entry.backends.clone())
-        };
+        let entry = g
+            .lbs
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("unknown load balancer"))?;
+        // Reject duplicates.
+        if entry.backends.contains(&backend) {
+            anyhow::bail!("load balancer target already exists");
+        }
+        entry.backends.push(backend);
+        let table_id = entry.table_id;
+        let backends = entry.backends.clone();
         let table = crate::maglev::build(&backends);
         for (slot, &bi) in table.iter().enumerate() {
             g.maglev.upsert(
@@ -566,20 +704,63 @@ impl Control {
         Ok(())
     }
 
-    /// Return detail for a single LB: (vni, ip, lb_underlay, ports).
-    pub fn get_lb(&self, id: &[u8]) -> Option<(u32, [u8; 4], [u8; 16], Vec<(u16, u8)>)> {
+    /// Remove a backend from an LB. Returns true if found, false if not.
+    pub fn del_lb_target(&self, id: &[u8], backend: [u8; 16]) -> anyhow::Result<bool> {
+        let mut g = self.inner.lock().unwrap();
+        let entry = g
+            .lbs
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("unknown load balancer"))?;
+        let before = entry.backends.len();
+        entry.backends.retain(|b| b != &backend);
+        if entry.backends.len() == before {
+            return Ok(false);
+        }
+        // Rebuild Maglev table.
+        let table_id = entry.table_id;
+        let backends = entry.backends.clone();
+        if backends.is_empty() {
+            // Clear all Maglev slots.
+            for slot in 0..crate::maglev::TABLE_SIZE {
+                let _ = g.maglev.remove(&MaglevKey { table_id, slot });
+            }
+        } else {
+            let table = crate::maglev::build(&backends);
+            for (slot, &bi) in table.iter().enumerate() {
+                g.maglev.upsert(
+                    MaglevKey {
+                        table_id,
+                        slot: slot as u32,
+                    },
+                    backends[bi as usize],
+                )?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Return detail for a single LB: (vni, ip_bytes, lb_underlay, ports).
+    pub fn get_lb(&self, id: &[u8]) -> Option<(u32, LbIpBytes, [u8; 16], Vec<(u16, u8)>)> {
         let g = self.inner.lock().unwrap();
         g.lbs
             .get(id)
-            .map(|e| (e.vni, e.ip, e.lb_underlay, e.ports.clone()))
+            .map(|e| (e.vni, e.ip.as_lb_ip_bytes(), e.lb_underlay, e.ports.clone()))
     }
 
-    /// List all LBs: (id, vni, ip, lb_underlay, ports).
-    pub fn list_lbs(&self) -> Vec<(Vec<u8>, u32, [u8; 4], [u8; 16], Vec<(u16, u8)>)> {
+    /// List all LBs: (id, vni, ip_bytes, lb_underlay, ports).
+    pub fn list_lbs(&self) -> Vec<(Vec<u8>, u32, LbIpBytes, [u8; 16], Vec<(u16, u8)>)> {
         let g = self.inner.lock().unwrap();
         g.lbs
             .iter()
-            .map(|(id, e)| (id.clone(), e.vni, e.ip, e.lb_underlay, e.ports.clone()))
+            .map(|(id, e)| {
+                (
+                    id.clone(),
+                    e.vni,
+                    e.ip.as_lb_ip_bytes(),
+                    e.lb_underlay,
+                    e.ports.clone(),
+                )
+            })
             .collect()
     }
 
@@ -592,52 +773,28 @@ impl Control {
             .unwrap_or_default()
     }
 
-    /// Add an LB-prefix shadow entry (announce-only; no datapath route needed).
-    pub fn add_lb_prefix(
-        &self,
-        interface_id: &[u8],
-        prefix: [u8; 4],
-        prefix_len: u32,
-    ) -> anyhow::Result<()> {
-        let mut g = self.inner.lock().unwrap();
-        g.lb_prefixes
-            .entry(interface_id.to_vec())
-            .or_default()
-            .push((prefix, prefix_len));
-        Ok(())
-    }
-
-    /// Remove an LB-prefix shadow entry.
-    pub fn del_lb_prefix(
-        &self,
-        interface_id: &[u8],
-        prefix: [u8; 4],
-        prefix_len: u32,
-    ) -> anyhow::Result<()> {
-        let mut g = self.inner.lock().unwrap();
-        if let Some(v) = g.lb_prefixes.get_mut(interface_id) {
-            v.retain(|&(p, l)| !(p == prefix && l == prefix_len));
-        }
-        Ok(())
-    }
-
-    /// Return all LB-prefix shadow entries for an interface.
-    pub fn list_lb_prefixes(&self, interface_id: &[u8]) -> Vec<([u8; 4], u32)> {
+    /// List all backends across all LBs (global).
+    pub fn list_lb_targets_all(&self) -> Vec<[u8; 16]> {
         let g = self.inner.lock().unwrap();
-        g.lb_prefixes.get(interface_id).cloned().unwrap_or_default()
+        g.lbs
+            .values()
+            .flat_map(|e| e.backends.iter().copied())
+            .collect()
     }
 
     /// Remove a load balancer: clear its `LB` service entries and `MAGLEV` slots.
-    pub fn delete_lb(&self, id: &[u8]) -> anyhow::Result<()> {
+    /// Returns true if found and deleted, false if not found.
+    pub fn delete_lb(&self, id: &[u8]) -> anyhow::Result<bool> {
         let mut g = self.inner.lock().unwrap();
         let entry = match g.lbs.remove(id) {
             Some(e) => e,
-            None => return Ok(()),
+            None => return Ok(false),
         };
+        let ip4 = entry.ip.last4();
         for &(port, proto) in &entry.ports {
             let _ = g.lb.remove(&LbKey {
                 vni: entry.vni,
-                ipv4: entry.ip,
+                ipv4: ip4,
                 port,
                 proto,
                 _pad: 0,
@@ -649,61 +806,122 @@ impl Control {
                 slot,
             });
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Program the VIPS map for SNAT (G->V) and DNAT (V->G).
-    pub fn create_vip(&self, interface_id: &[u8], vip: [u8; 4]) -> anyhow::Result<()> {
+    /// Returns the underlay route for this interface on success.
+    pub fn create_vip(
+        &self,
+        interface_id: &[u8],
+        vip: [u8; 4],
+        preferred_ul: Option<[u8; 16]>,
+    ) -> anyhow::Result<[u8; 16]> {
         let mut g = self.inner.lock().unwrap();
         let rec = g
             .by_id
             .get(interface_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
         let (vni, gip) = (rec.vni, rec.ipv4);
+        let underlay = rec.underlay;
+        // Check for existing VIP.
+        if g.vips.get(&VipKey { vni, ipv4: gip }).is_some() {
+            anyhow::bail!("SNAT_EXISTS: VIP already set for this interface");
+        }
+        // Check preferred underlay collision.
+        let effective_underlay = if let Some(pul) = preferred_ul {
+            if g.by_id.values().any(|r| r.underlay == pul)
+                || g.lbs.values().any(|lb| lb.lb_underlay == pul)
+            {
+                anyhow::bail!("VNF_INSERT: preferred underlay collision");
+            }
+            pul
+        } else {
+            underlay
+        };
         // egress SNAT: (vni, guest_ip) -> vip
         g.vips.upsert(VipKey { vni, ipv4: gip }, vip)?;
         // ingress DNAT: (vni, vip) -> guest_ip
         g.vips.upsert(VipKey { vni, ipv4: vip }, gip)?;
-        Ok(())
+        Ok(effective_underlay)
     }
 
     /// Remove both VIPS map entries for this interface.
-    pub fn delete_vip(&self, interface_id: &[u8]) -> anyhow::Result<()> {
+    /// Returns true if a VIP existed and was removed, false if none existed.
+    pub fn delete_vip(&self, interface_id: &[u8]) -> anyhow::Result<bool> {
         let mut g = self.inner.lock().unwrap();
         let rec = g
             .by_id
             .get(interface_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
         let (vni, gip) = (rec.vni, rec.ipv4);
+        if g.vips.get(&VipKey { vni, ipv4: gip }).is_none() {
+            return Ok(false);
+        }
         if let Some(vip) = g.vips.get(&VipKey { vni, ipv4: gip }) {
             let _ = g.vips.remove(&VipKey { vni, ipv4: vip });
         }
         let _ = g.vips.remove(&VipKey { vni, ipv4: gip });
-        Ok(())
+        Ok(true)
     }
 
-    /// Return the VIP for this interface, if one has been set.
-    pub fn get_vip(&self, interface_id: &[u8]) -> Option<[u8; 4]> {
+    /// Return the VIP and underlay for this interface, if one has been set.
+    pub fn get_vip(&self, interface_id: &[u8]) -> Option<([u8; 4], [u8; 16])> {
         let g = self.inner.lock().unwrap();
         let rec = g.by_id.get(interface_id)?;
         let (vni, gip) = (rec.vni, rec.ipv4);
-        g.vips.get(&VipKey { vni, ipv4: gip })
+        let underlay = rec.underlay;
+        g.vips
+            .get(&VipKey { vni, ipv4: gip })
+            .map(|vip| (vip, underlay))
     }
 
     /// Program a guest's NAT config: (vni, guest_ip) -> (nat_ip, port_min, port_max).
+    /// Returns the underlay route on success.
     pub fn create_nat(
         &self,
         interface_id: &[u8],
         nat_ip: [u8; 4],
         port_min: u16,
         port_max: u16,
-    ) -> anyhow::Result<()> {
+        preferred_ul: Option<[u8; 16]>,
+    ) -> anyhow::Result<[u8; 16]> {
         let mut g = self.inner.lock().unwrap();
         let rec = g
             .by_id
             .get(interface_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
         let (vni, gip) = (rec.vni, rec.ipv4);
+        let underlay = rec.underlay;
+
+        // Check for existing NAT on this interface (any NAT IP).
+        if g.nat.get(&NatKey { vni, ipv4: gip }).is_some() {
+            anyhow::bail!("SNAT_EXISTS: NAT already configured for this interface");
+        }
+
+        // Check for overlapping port range across all interfaces in this VNI with the same nat_ip.
+        for (_id, r) in &g.by_id {
+            if r.vni == vni {
+                if let Some(v) = g.nat.get(&NatKey { vni, ipv4: r.ipv4 }) {
+                    if v.nat_ipv4 == nat_ip {
+                        // Overlapping port range?
+                        if port_min < v.port_max && port_max > v.port_min {
+                            anyhow::bail!("SNAT_EXISTS: overlapping NAT port range");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check preferred underlay collision.
+        if let Some(pul) = preferred_ul {
+            if g.by_id.values().any(|r| r.underlay == pul)
+                || g.lbs.values().any(|lb| lb.lb_underlay == pul)
+            {
+                anyhow::bail!("VNF_INSERT: preferred underlay collision");
+            }
+        }
+
         g.nat.upsert(
             NatKey { vni, ipv4: gip },
             NatValue {
@@ -711,23 +929,26 @@ impl Control {
                 port_min,
                 port_max,
             },
-        )
+        )?;
+        Ok(preferred_ul.unwrap_or(underlay))
     }
 
-    /// Return a guest's NAT config (nat_ip, port_min, port_max), if set.
-    pub fn get_nat(&self, interface_id: &[u8]) -> Option<([u8; 4], u16, u16)> {
+    /// Return a guest's NAT config (nat_ip, port_min, port_max, underlay, vni), if set.
+    pub fn get_nat(&self, interface_id: &[u8]) -> Option<([u8; 4], u16, u16, [u8; 16], u32)> {
         let g = self.inner.lock().unwrap();
         let rec = g.by_id.get(interface_id)?;
         let (vni, gip) = (rec.vni, rec.ipv4);
+        let underlay = rec.underlay;
         g.nat
             .get(&NatKey { vni, ipv4: gip })
-            .map(|v| (v.nat_ipv4, v.port_min, v.port_max))
+            .map(|v| (v.nat_ipv4, v.port_min, v.port_max, underlay, vni))
     }
 
-    /// List all local NAT entries: (interface_id, guest_ipv4, nat_ip, port_min, port_max).
-    pub fn list_local_nats(&self) -> Vec<(Vec<u8>, [u8; 4], [u8; 4], u16, u16)> {
+    /// List all local NAT entries: (interface_id, guest_ipv4, nat_ip, port_min, port_max, vni, underlay).
+    pub fn list_local_nats(&self) -> Vec<(Vec<u8>, [u8; 4], [u8; 4], u16, u16, u32, [u8; 16])> {
         let g = self.inner.lock().unwrap();
-        g.by_id
+        let mut result: Vec<(Vec<u8>, [u8; 4], [u8; 4], u16, u16, u32, [u8; 16])> = g
+            .by_id
             .iter()
             .filter_map(|(id, rec)| {
                 g.nat
@@ -735,21 +956,37 @@ impl Control {
                         vni: rec.vni,
                         ipv4: rec.ipv4,
                     })
-                    .map(|v| (id.clone(), rec.ipv4, v.nat_ipv4, v.port_min, v.port_max))
+                    .map(|v| {
+                        (
+                            id.clone(),
+                            rec.ipv4,
+                            v.nat_ipv4,
+                            v.port_min,
+                            v.port_max,
+                            rec.vni,
+                            rec.underlay,
+                        )
+                    })
             })
-            .collect()
+            .collect();
+        // Sort by guest IP in descending order to match expected list ordering.
+        result.sort_by(|a, b| b.1.cmp(&a.1));
+        result
     }
 
-    /// Remove a guest's NAT config.
-    pub fn delete_nat(&self, interface_id: &[u8]) -> anyhow::Result<()> {
+    /// Remove a guest's NAT config. Returns true if found and deleted, false if no NAT was set.
+    pub fn delete_nat(&self, interface_id: &[u8]) -> anyhow::Result<bool> {
         let mut g = self.inner.lock().unwrap();
         let rec = g
             .by_id
             .get(interface_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
         let (vni, gip) = (rec.vni, rec.ipv4);
+        if g.nat.get(&NatKey { vni, ipv4: gip }).is_none() {
+            return Ok(false);
+        }
         let _ = g.nat.remove(&NatKey { vni, ipv4: gip });
-        Ok(())
+        Ok(true)
     }
 
     // -----------------------------------------------------------------------
@@ -790,6 +1027,7 @@ impl Control {
     }
 
     /// Add or replace a firewall rule on an interface.
+    /// Returns an error with "already exists" if a rule with that ID already exists.
     pub fn add_fw_rule(
         &self,
         interface_id: &[u8],
@@ -800,7 +1038,7 @@ impl Control {
         let ifindex = *g
             .by_ifindex
             .get(interface_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
         let entry = g.fw.entry(ifindex).or_default();
         if entry.len() >= FW_MAX_RULES as usize {
             anyhow::bail!(
@@ -808,25 +1046,30 @@ impl Control {
                 FW_MAX_RULES
             );
         }
-        if let Some(slot) = entry.iter_mut().find(|(id, _)| id == &rule_id) {
-            slot.1 = rule;
-        } else {
-            entry.push((rule_id, rule));
+        // Reject duplicate rule IDs.
+        if entry.iter().any(|(id, _)| id == &rule_id) {
+            anyhow::bail!("ALREADY_EXISTS: firewall rule already exists");
         }
+        entry.push((rule_id, rule));
         Self::fw_reprogram(&mut g, ifindex)
     }
 
     /// Remove a firewall rule by id from an interface.
-    pub fn del_fw_rule(&self, interface_id: &[u8], rule_id: &[u8]) -> anyhow::Result<()> {
+    /// Returns true if removed, false if not found.
+    pub fn del_fw_rule(&self, interface_id: &[u8], rule_id: &[u8]) -> anyhow::Result<bool> {
         let mut g = self.inner.lock().unwrap();
         let ifindex = *g
             .by_ifindex
             .get(interface_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
-        if let Some(entry) = g.fw.get_mut(&ifindex) {
-            entry.retain(|(id, _)| id.as_slice() != rule_id);
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
+        let entry = g.fw.entry(ifindex).or_default();
+        let before = entry.len();
+        entry.retain(|(id, _)| id.as_slice() != rule_id);
+        if entry.len() == before {
+            return Ok(false);
         }
-        Self::fw_reprogram(&mut g, ifindex)
+        Self::fw_reprogram(&mut g, ifindex)?;
+        Ok(true)
     }
 
     /// Get a single firewall rule by id.
@@ -853,30 +1096,111 @@ impl Control {
     // -----------------------------------------------------------------------
 
     /// Announce an alias prefix routed to an interface: program a route (vni, prefix/len) -> the
-    /// interface's underlay /128.
+    /// interface's underlay /128. Returns the underlay route.
     pub fn add_prefix(
         &self,
         interface_id: &[u8],
         prefix: [u8; 4],
         prefix_len: u32,
-    ) -> anyhow::Result<()> {
+        preferred_ul: Option<[u8; 16]>,
+    ) -> anyhow::Result<[u8; 16]> {
         let mut g = self.inner.lock().unwrap();
         let rec = g
             .by_id
             .get(interface_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
         let (vni, _gip) = (rec.vni, rec.ipv4);
         let underlay = *g
             .iface_underlay
             .get(interface_id)
             .ok_or_else(|| anyhow::anyhow!("interface has no underlay"))?;
+        let effective_ul = preferred_ul.unwrap_or(underlay);
+
+        // Check for duplicate.
+        if let Some(v) = g.prefixes.get(interface_id) {
+            if v.iter()
+                .any(|pr| !pr.is_ipv6 && pr.ip[..4] == prefix && pr.len == prefix_len)
+            {
+                anyhow::bail!("ROUTE_EXISTS: prefix already exists");
+            }
+        }
+        // Also check other interfaces in the same VNI.
+        for (oid, pv) in &g.prefixes {
+            if oid != interface_id {
+                if let Some(orec) = g.by_id.get(oid) {
+                    if orec.vni == vni {
+                        if pv
+                            .iter()
+                            .any(|pr| !pr.is_ipv6 && pr.ip[..4] == prefix && pr.len == prefix_len)
+                        {
+                            anyhow::bail!("ROUTE_EXISTS: prefix already in use in this VNI");
+                        }
+                    }
+                }
+            }
+        }
+
         g.routes.upsert(
             vni,
             prefix,
             prefix_len,
             RouteValue {
                 nexthop_vni: vni,
-                nexthop_ipv6: underlay,
+                nexthop_ipv6: effective_ul,
+                is_external: 0,
+                _pad: [0; 3],
+            },
+        )?;
+        let mut ip16 = [0u8; 16];
+        ip16[..4].copy_from_slice(&prefix);
+        g.prefixes
+            .entry(interface_id.to_vec())
+            .or_default()
+            .push(PrefixRecord {
+                ip: ip16,
+                len: prefix_len,
+                underlay: effective_ul,
+                is_ipv6: false,
+            });
+        Ok(effective_ul)
+    }
+
+    /// Add an IPv6 alias prefix. Returns the underlay route.
+    pub fn add_prefix6(
+        &self,
+        interface_id: &[u8],
+        prefix: [u8; 16],
+        prefix_len: u32,
+        preferred_ul: Option<[u8; 16]>,
+    ) -> anyhow::Result<[u8; 16]> {
+        let mut g = self.inner.lock().unwrap();
+        let rec = g
+            .by_id
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
+        let vni = rec.vni;
+        let underlay = *g
+            .iface_underlay
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("interface has no underlay"))?;
+        let effective_ul = preferred_ul.unwrap_or(underlay);
+
+        // Check for duplicate.
+        if let Some(v) = g.prefixes.get(interface_id) {
+            if v.iter()
+                .any(|pr| pr.is_ipv6 && pr.ip == prefix && pr.len == prefix_len)
+            {
+                anyhow::bail!("ROUTE_EXISTS: IPv6 prefix already exists");
+            }
+        }
+
+        g.routes6.upsert(
+            vni,
+            prefix,
+            prefix_len,
+            RouteValue {
+                nexthop_vni: vni,
+                nexthop_ipv6: effective_ul,
                 is_external: 0,
                 _pad: [0; 3],
             },
@@ -884,34 +1208,237 @@ impl Control {
         g.prefixes
             .entry(interface_id.to_vec())
             .or_default()
-            .push((prefix, prefix_len));
-        Ok(())
+            .push(PrefixRecord {
+                ip: prefix,
+                len: prefix_len,
+                underlay: effective_ul,
+                is_ipv6: true,
+            });
+        Ok(effective_ul)
     }
 
-    /// Remove an alias prefix: delete the LPM route entry and forget the local record.
+    /// Remove an alias prefix. Returns true if removed, false if not found.
     pub fn del_prefix(
         &self,
         interface_id: &[u8],
         prefix: [u8; 4],
         prefix_len: u32,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let mut g = self.inner.lock().unwrap();
         let rec = g
             .by_id
             .get(interface_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
         let (vni, _gip) = (rec.vni, rec.ipv4);
-        let _ = g.routes.remove(vni, prefix, prefix_len);
-        if let Some(v) = g.prefixes.get_mut(interface_id) {
-            v.retain(|&(p, l)| !(p == prefix && l == prefix_len));
+        let pv = g.prefixes.get_mut(interface_id);
+        if let Some(v) = pv {
+            let before = v.len();
+            v.retain(|pr| !((!pr.is_ipv6) && pr.ip[..4] == prefix && pr.len == prefix_len));
+            if v.len() < before {
+                let _ = g.routes.remove(vni, prefix, prefix_len);
+                return Ok(true);
+            }
         }
-        Ok(())
+        Ok(false)
     }
 
-    /// Return all alias prefixes for an interface as (prefix_ip, prefix_len) pairs.
-    pub fn list_prefixes(&self, interface_id: &[u8]) -> Vec<([u8; 4], u32)> {
+    /// Remove an IPv6 alias prefix. Returns true if removed, false if not found.
+    pub fn del_prefix6(
+        &self,
+        interface_id: &[u8],
+        prefix: [u8; 16],
+        prefix_len: u32,
+    ) -> anyhow::Result<bool> {
+        let mut g = self.inner.lock().unwrap();
+        let rec = g
+            .by_id
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
+        let vni = rec.vni;
+        let pv = g.prefixes.get_mut(interface_id);
+        if let Some(v) = pv {
+            let before = v.len();
+            v.retain(|pr| !(pr.is_ipv6 && pr.ip == prefix && pr.len == prefix_len));
+            if v.len() < before {
+                let _ = g.routes6.remove(vni, prefix, prefix_len);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Return all alias prefixes for an interface as (ip_bytes_16, len, underlay, is_ipv6).
+    pub fn list_prefixes_with_underlay(
+        &self,
+        interface_id: &[u8],
+    ) -> Vec<([u8; 16], u32, [u8; 16], bool)> {
         let g = self.inner.lock().unwrap();
-        g.prefixes.get(interface_id).cloned().unwrap_or_default()
+        g.prefixes
+            .get(interface_id)
+            .map(|v| {
+                v.iter()
+                    .map(|pr| (pr.ip, pr.len, pr.underlay, pr.is_ipv6))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Return all prefix records across all interfaces (global list).
+    pub fn list_prefixes_all(&self) -> Vec<([u8; 16], u32, [u8; 16], bool)> {
+        let g = self.inner.lock().unwrap();
+        g.prefixes
+            .values()
+            .flat_map(|v| v.iter().map(|pr| (pr.ip, pr.len, pr.underlay, pr.is_ipv6)))
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // LB prefix management
+    // -----------------------------------------------------------------------
+
+    /// Add an LB-prefix shadow entry (announce-only; no datapath route needed).
+    /// Returns the underlay route.
+    pub fn add_lb_prefix(
+        &self,
+        interface_id: &[u8],
+        prefix: [u8; 4],
+        prefix_len: u32,
+        preferred_ul: Option<[u8; 16]>,
+    ) -> anyhow::Result<[u8; 16]> {
+        let mut g = self.inner.lock().unwrap();
+        let rec = g
+            .by_id
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
+        let underlay = rec.underlay;
+        let effective_ul = preferred_ul.unwrap_or(underlay);
+
+        // Check for duplicate.
+        if let Some(v) = g.lb_prefixes.get(interface_id) {
+            if v.iter()
+                .any(|pr| !pr.is_ipv6 && pr.ip[..4] == prefix && pr.len == prefix_len)
+            {
+                anyhow::bail!("ALREADY_EXISTS: LB prefix already exists");
+            }
+        }
+
+        let mut ip16 = [0u8; 16];
+        ip16[..4].copy_from_slice(&prefix);
+        g.lb_prefixes
+            .entry(interface_id.to_vec())
+            .or_default()
+            .push(PrefixRecord {
+                ip: ip16,
+                len: prefix_len,
+                underlay: effective_ul,
+                is_ipv6: false,
+            });
+        Ok(effective_ul)
+    }
+
+    /// Add an IPv6 LB-prefix shadow entry. Returns the underlay route.
+    pub fn add_lb_prefix6(
+        &self,
+        interface_id: &[u8],
+        prefix: [u8; 16],
+        prefix_len: u32,
+        preferred_ul: Option<[u8; 16]>,
+    ) -> anyhow::Result<[u8; 16]> {
+        let mut g = self.inner.lock().unwrap();
+        let rec = g
+            .by_id
+            .get(interface_id)
+            .ok_or_else(|| anyhow::anyhow!("NO_VM: unknown interface"))?;
+        let underlay = rec.underlay;
+        let effective_ul = preferred_ul.unwrap_or(underlay);
+
+        // Check for duplicate.
+        if let Some(v) = g.lb_prefixes.get(interface_id) {
+            if v.iter()
+                .any(|pr| pr.is_ipv6 && pr.ip == prefix && pr.len == prefix_len)
+            {
+                anyhow::bail!("ALREADY_EXISTS: IPv6 LB prefix already exists");
+            }
+        }
+
+        g.lb_prefixes
+            .entry(interface_id.to_vec())
+            .or_default()
+            .push(PrefixRecord {
+                ip: prefix,
+                len: prefix_len,
+                underlay: effective_ul,
+                is_ipv6: true,
+            });
+        Ok(effective_ul)
+    }
+
+    /// Remove an LB-prefix shadow entry. Returns true if removed, false if not found.
+    pub fn del_lb_prefix(
+        &self,
+        interface_id: &[u8],
+        prefix: [u8; 4],
+        prefix_len: u32,
+    ) -> anyhow::Result<bool> {
+        let mut g = self.inner.lock().unwrap();
+        // Check interface exists.
+        if !g.by_id.contains_key(interface_id) {
+            anyhow::bail!("NO_VM: unknown interface");
+        }
+        if let Some(v) = g.lb_prefixes.get_mut(interface_id) {
+            let before = v.len();
+            v.retain(|pr| !((!pr.is_ipv6) && pr.ip[..4] == prefix && pr.len == prefix_len));
+            if v.len() < before {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Remove an IPv6 LB-prefix shadow entry. Returns true if removed, false if not found.
+    pub fn del_lb_prefix6(
+        &self,
+        interface_id: &[u8],
+        prefix: [u8; 16],
+        prefix_len: u32,
+    ) -> anyhow::Result<bool> {
+        let mut g = self.inner.lock().unwrap();
+        if !g.by_id.contains_key(interface_id) {
+            anyhow::bail!("NO_VM: unknown interface");
+        }
+        if let Some(v) = g.lb_prefixes.get_mut(interface_id) {
+            let before = v.len();
+            v.retain(|pr| !(pr.is_ipv6 && pr.ip == prefix && pr.len == prefix_len));
+            if v.len() < before {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Return LB-prefix entries for an interface as (ip_bytes_16, len, underlay, is_ipv6).
+    pub fn list_lb_prefixes_with_underlay(
+        &self,
+        interface_id: &[u8],
+    ) -> Vec<([u8; 16], u32, [u8; 16], bool)> {
+        let g = self.inner.lock().unwrap();
+        g.lb_prefixes
+            .get(interface_id)
+            .map(|v| {
+                v.iter()
+                    .map(|pr| (pr.ip, pr.len, pr.underlay, pr.is_ipv6))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Return all LB-prefix records across all interfaces (global).
+    pub fn list_lb_prefixes_all(&self) -> Vec<([u8; 16], u32, [u8; 16], bool)> {
+        let g = self.inner.lock().unwrap();
+        g.lb_prefixes
+            .values()
+            .flat_map(|v| v.iter().map(|pr| (pr.ip, pr.len, pr.underlay, pr.is_ipv6)))
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -941,42 +1468,54 @@ impl Control {
         if g.neigh_nats.len() >= NB_MAX_ENTRIES as usize {
             anyhow::bail!("neighbor NAT table full (max {})", NB_MAX_ENTRIES);
         }
-        // Deduplicate: replace existing entry with same (vni, nat_ip, port_min, port_max).
-        if let Some(slot) = g.neigh_nats.iter_mut().find(|e| {
-            e.vni == vni && e.nat_ip == nat_ip && e.port_min == port_min && e.port_max == port_max
+        // Check for duplicate or overlapping port range.
+        if g.neigh_nats.iter().any(|e| {
+            e.nat_ip == nat_ip
+                && (
+                    // Exact match (same vni and ports) → always duplicate.
+                    (e.vni == vni && e.port_min == port_min && e.port_max == port_max)
+                // Overlapping port range for the same nat_ip (any vni) → also duplicate.
+                || (e.port_min < port_max && e.port_max > port_min)
+                )
         }) {
-            slot.underlay = underlay;
-            slot.enabled = 1;
-        } else {
-            g.neigh_nats.push(NeighborNatEntry {
-                underlay,
-                nat_ip,
-                vni,
-                port_min,
-                port_max,
-                enabled: 1,
-                _pad: [0; 3],
-            });
+            anyhow::bail!(
+                "ALREADY_EXISTS: neighbor NAT entry already exists or port range overlaps"
+            );
         }
+        g.neigh_nats.push(NeighborNatEntry {
+            underlay,
+            nat_ip,
+            vni,
+            port_min,
+            port_max,
+            enabled: 1,
+            _pad: [0; 3],
+        });
         Self::neigh_nat_reprogram(&mut g)
     }
 
     /// Remove a neighbor-NAT entry matching (vni, nat_ip, port_min, port_max).
+    /// Returns true if removed, false if not found.
     pub fn del_neighbor_nat(
         &self,
         vni: u32,
         nat_ip: [u8; 4],
         port_min: u16,
         port_max: u16,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let mut g = self.inner.lock().unwrap();
+        let before = g.neigh_nats.len();
         g.neigh_nats.retain(|e| {
             !(e.vni == vni
                 && e.nat_ip == nat_ip
                 && e.port_min == port_min
                 && e.port_max == port_max)
         });
-        Self::neigh_nat_reprogram(&mut g)
+        if g.neigh_nats.len() == before {
+            return Ok(false);
+        }
+        Self::neigh_nat_reprogram(&mut g)?;
+        Ok(true)
     }
 
     /// List all neighbor-NAT entries.
