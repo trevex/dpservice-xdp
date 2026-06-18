@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::Context as _;
+use aya::programs::xdp::XdpLink;
 use aya::Ebpf;
 use xdp_dp_common::{
     FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, LbKey, LbValue, Local, MaglevKey, NatKey,
@@ -65,6 +66,8 @@ struct Inner {
     prefixes: HashMap<Vec<u8>, Vec<([u8; 4], u32)>>,
     /// ifindex -> ordered (rule_id, rule) pairs
     fw: HashMap<u32, Vec<(Vec<u8>, FwRule)>>,
+    /// interface_id -> the owned guest_tx XDP link (dropping it detaches the program).
+    links: HashMap<Vec<u8>, XdpLink>,
 }
 
 impl Control {
@@ -126,6 +129,7 @@ impl Control {
                 iface_underlay: HashMap::new(),
                 prefixes: HashMap::new(),
                 fw: HashMap::new(),
+                links: HashMap::new(),
             }),
             conntrack: Mutex::new(Some(conntrack)),
         })

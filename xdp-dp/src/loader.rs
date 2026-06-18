@@ -67,6 +67,24 @@ pub fn attach_xdp_extra(ebpf: &mut Ebpf, prog_name: &str, iface: &str) -> anyhow
     Ok(())
 }
 
+/// Attach an already-loaded XDP program to an interface and RETURN the owned link, so the caller
+/// can later drop it to detach (used for dynamic interface teardown). Falls back to SKB mode.
+pub fn attach_xdp_link(
+    ebpf: &mut Ebpf,
+    prog_name: &str,
+    iface: &str,
+) -> anyhow::Result<aya::programs::xdp::XdpLink> {
+    let prog: &mut Xdp = ebpf
+        .program_mut(prog_name)
+        .with_context(|| format!("{prog_name} program missing"))?
+        .try_into()?;
+    let id = prog
+        .attach(iface, XdpFlags::default())
+        .or_else(|_| prog.attach(iface, XdpFlags::SKB_MODE))
+        .with_context(|| format!("attach {prog_name} to {iface}"))?;
+    prog.take_link(id).context("take xdp link")
+}
+
 /// Load the eBPF object and attach `uplink_rx` to the named uplink interface.
 pub fn attach_uplink(iface: &str) -> anyhow::Result<Ebpf> {
     let mut ebpf = load_ebpf()?;
