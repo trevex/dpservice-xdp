@@ -93,6 +93,22 @@ enum Cmd {
         /// Override the CONNTRACK map capacity (entries). Also settable via XDP_DP_CONNTRACK_MAX.
         #[arg(long)]
         conntrack_max: Option<u32>,
+        /// Overlay IPv4 gateway the datapath answers ARP for (e.g. 169.254.0.1).
+        #[arg(long)]
+        gateway: String,
+        /// Overlay IPv6 gateway the datapath answers ND for (e.g. fe80::1).
+        #[arg(long = "gateway6")]
+        gateway6: Option<String>,
+        /// Pin programs+maps under this dir for HA (control-plane restart re-adopts).
+        #[arg(long = "pin-dir")]
+        pin_dir: Option<String>,
+        /// DHCP options (stored for sub-project 2b; accepted now to keep the ioiab arg list stable).
+        #[arg(long = "dhcp-mtu")]
+        dhcp_mtu: Option<u32>,
+        #[arg(long = "dhcp-dns")]
+        dhcp_dns: Vec<String>,
+        #[arg(long = "dhcpv6-dns")]
+        dhcpv6_dns: Vec<String>,
     },
     /// Attach the trivial xdp_pass program to an interface (redirect-target enabler), then idle.
     Pass {
@@ -212,14 +228,25 @@ async fn main() -> anyhow::Result<()> {
             addr,
             uplink,
             local_underlay,
+            gateway,
+            gateway6,
             gateway_mac,
             conntrack_max,
+            pin_dir: _pin_dir,
+            dhcp_mtu: _dhcp_mtu,
+            dhcp_dns: _dhcp_dns,
+            dhcpv6_dns: _dhcpv6_dns,
         } => {
             if let Some(n) = conntrack_max {
                 // SAFETY: single-threaded CLI startup, before any datapath thread is spawned.
                 std::env::set_var("XDP_DP_CONNTRACK_MAX", n.to_string());
             }
             let underlay = parse_ipv6(&local_underlay)?;
+            let gateway_ipv4 = parse_ipv4(&gateway)?;
+            let gateway_ipv6 = match &gateway6 {
+                Some(s) => parse_ipv6(s)?,
+                None => [0u8; 16],
+            };
             let ctrl = control::Control::bring_up(
                 &uplink,
                 ifindex(&uplink)?,
@@ -234,6 +261,8 @@ async fn main() -> anyhow::Result<()> {
                 state: std::sync::Arc::new(state::State::default()),
                 control: Some(std::sync::Arc::new(ctrl)),
                 underlay,
+                gateway_ipv4,
+                gateway_ipv6,
             };
             let server = crate::pb::dpd_kironcore_server::DpdKironcoreServer::new(svc);
             println!("serving DPDKironcore on {addr}");

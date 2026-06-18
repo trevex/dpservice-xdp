@@ -39,6 +39,10 @@ pub struct Service {
     pub control: Option<Arc<Control>>,
     /// This server's underlay IPv6 address, returned in CreateInterface responses.
     pub underlay: [u8; 16],
+    /// Overlay IPv4 gateway the datapath answers ARP for (server-wide).
+    pub gateway_ipv4: [u8; 4],
+    /// Overlay IPv6 gateway the datapath answers ND for (server-wide; all-zero = disabled).
+    pub gateway_ipv6: [u8; 16],
 }
 
 fn ok() -> Option<DpStatus> {
@@ -347,8 +351,11 @@ impl DpdKironcore for Service {
             .ok_or_else(|| Status::invalid_argument("ipv4_config is required"))?;
         let ipv4 = decode_ipv4(&ipv4_config.primary_address)?;
 
-        // Derive gateway: same /24 prefix but last octet = 1
-        let gateway_ipv4 = [ipv4[0], ipv4[1], ipv4[2], 1];
+        // Server-configured overlay gateways (dpservice uses a fixed gateway, not a per-/24 one).
+        let gateway_ipv4 = self.gateway_ipv4;
+        let gateway_ipv6 = self.gateway_ipv6;
+        // gateway_ipv6 wired into create_interface in Task 3
+        let _ = gateway_ipv6;
 
         let interface_id = r.interface_id;
         let device = r.device_name;
