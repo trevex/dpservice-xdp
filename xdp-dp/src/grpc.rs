@@ -856,18 +856,9 @@ impl DpdKironcore for Service {
         let target_addr = r
             .target_ip
             .ok_or_else(|| Status::invalid_argument("target_ip is required"))?;
-        // The proto target_ip is IPv4; synthesize a backend underlay /128 using the same scheme
-        // as create_interface (hypervisor_prefix[0..8] ++ [0;4] ++ ipv4[4]). The LB entry's own
-        // vni is used for the upper half. This is a best-effort synthesis; backends explicitly
-        // programmed via the CLI (--lb-target underlay) are preferred for production.
-        let ipv4 = decode_ipv4(&target_addr.address)?;
-        let lb_vni = {
-            let g_lbs = control.get_lb(&r.loadbalancer_id);
-            g_lbs.map(|(vni, _, _, _)| vni).unwrap_or(0)
-        };
-        let mut backend_underlay = self.underlay;
-        backend_underlay[8..12].copy_from_slice(&lb_vni.to_be_bytes());
-        backend_underlay[12..16].copy_from_slice(&ipv4);
+        // An LB target IS the backend's underlay route (a /128 IPv6), per the dpservice contract:
+        // `target_ip` carries the 16-byte underlay address directly.
+        let backend_underlay = decode_ipv6(&target_addr.address)?;
         control
             .add_lb_target(&r.loadbalancer_id, backend_underlay)
             .map_err(|e| Status::internal(e.to_string()))?;
