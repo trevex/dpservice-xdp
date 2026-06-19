@@ -20,14 +20,14 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(act);
     }
 
-    // Answer DHCPv4 in-datapath.
-    if let Some(act) = crate::dhcp::try_dhcpv4_reply(ctx, meta) {
-        return Ok(act);
-    }
-
-    // Answer DHCPv6 in-datapath (before the IPv6 ethertype branch).
-    if let Some(act) = crate::dhcp::try_dhcpv6_reply(ctx, meta) {
-        return Ok(act);
+    // DHCP (v4: IPv4/UDP dport 67, v6: IPv6/UDP dport 547) is handled by the separate `guest_dhcp`
+    // program via tail call, so its verifier cost does not stack onto this program's IPv4 forwarding
+    // path. A guest only sends to UDP 67/547 for DHCP, so port-based classification is sufficient;
+    // on a tail-call miss we fall through and PASS (benign — DHCP is never forwarded anyway).
+    if is_dhcp_request(ctx) {
+        let _ = unsafe { crate::maps::GUEST_PROGS.tail_call(ctx, xdp_dp_common::GUEST_PROG_DHCP) };
+        // tail_call only returns here on failure (empty slot / depth limit).
+        return Ok(xdp_action::XDP_PASS);
     }
 
     // IPv6 inner frames take the v6 overlay path.
@@ -141,6 +141,37 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
         inner_len,
         crate::parse::IPPROTO_IPIP,
     )
+}
+
+/// True if the frame is a DHCP request a guest would send: IPv4/UDP to dport 67, or IPv6/UDP to
+/// dport 547. Pure reads, constant offsets, no packet mutation — cheap to run on every frame.
+#[inline(always)]
+fn is_dhcp_request(ctx: &XdpContext) -> bool {
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + ETH_LEN + 44 > data_end {
+        return false;
+    }
+    let p = data as *const u8;
+    let ethertype = u16::from_be(unsafe { core::ptr::read_unaligned(p.add(12) as *const u16) });
+    if ethertype == ETH_P_IP {
+        if unsafe { *p.add(ETH_LEN + 9) } != crate::parse::IPPROTO_UDP {
+            return false;
+        }
+        let dport =
+            u16::from_be(unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 22) as *const u16) });
+        return dport == 67;
+    }
+    if ethertype == crate::parse::ETH_P_IPV6 {
+        if unsafe { *p.add(ETH_LEN + 6) } != crate::parse::IPPROTO_UDP {
+            return false;
+        }
+        let dport = u16::from_be(unsafe {
+            core::ptr::read_unaligned(p.add(ETH_LEN + 40 + 2) as *const u16)
+        });
+        return dport == 547;
+    }
+    false
 }
 
 /// Tail-call target: run the in-datapath DHCPv4 + DHCPv6 responders. Re-looks-up the port by its
