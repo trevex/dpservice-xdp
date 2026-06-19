@@ -23,5 +23,5 @@ CLI="$(command -v dpservice-cli)"
 cd "$ROOT/test/conformance"
 TESTS="${CONF_TESTS:-test_vf_to_vf.py test_vf_to_pf.py test_pf_to_vf.py test_encap.py \
   test_arp.py test_ipv6_nd.py test_flows.py test_lb.py test_nat.py test_vni.py test_zzz_grpc.py \
-  test_dhcpv4.py}"
+  test_dhcpv4.py test_dhcpv6.py}"
 sudo "DPSERVICE_CLI=$CLI" "$PYBIN" -m pytest -q $TESTS --build-path="$ROOT" "$@"
