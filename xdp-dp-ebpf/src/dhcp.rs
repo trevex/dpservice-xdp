@@ -118,18 +118,9 @@ pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
                 sm_state = 2;
             }
         } else {
-            // sm_state == 2: reading value bytes
+            // sm_state == 2: reading value bytes. MESSAGE_TYPE always has len=1, so the single
+            // value byte (sm_remain==1, before the decrement below) is the message type.
             if sm_is_msgtype && sm_remain == 1 {
-                // This is the last byte of MESSAGE_TYPE option (and the only value byte)
-                // Note: sm_remain counts DOWN from len. sm_remain=1 means we're on the FIRST
-                // (and for len=1, only) value byte.
-                // Wait: we decrement sm_remain AFTER this block, so sm_remain is still the
-                // original count (not yet decremented). For len=1: sm_remain starts at 1,
-                // this block executes once (boff is valid), we set msg_type = b, then
-                // sm_remain becomes 0 and we go back to state 0.
-                // Actually we need to check if this IS the first byte for msg_type (len=1 case).
-                // Since MESSAGE_TYPE always has len=1 in valid DHCP, we can just capture any
-                // byte while sm_is_msgtype is true (they'll all be the same byte for len=1).
                 msg_type = b;
             }
             sm_remain -= 1;
@@ -189,10 +180,18 @@ pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
     }
     let p = data as *mut u8;
 
+    // BOOTP header. Mirror dpservice's dhcp_node.c byte-for-byte: op=BOOTREPLY(2), yiaddr=assigned
+    // IP, siaddr+giaddr=the virtual gateway (server identity), chaddr=the client's L2 address (the
+    // original Ethernet source, still intact here — adjust_tail preserves the existing bytes and the
+    // Ethernet header is not rewritten until below). sname/file/options (from +44) are zeroed.
+    let client_mac = unsafe { core::ptr::read_unaligned(p.add(6) as *const [u8; 6]) };
+    let gw4 = meta.gateway_ipv4;
     unsafe {
         *p.add(F_BOOTP) = 2;
-        core::ptr::write_unaligned(p.add(F_BOOTP + 16) as *mut [u8; 4], meta.guest_ipv4);
-        core::ptr::write_unaligned(p.add(F_BOOTP + 20) as *mut [u8; 4], [0u8; 4]);
+        core::ptr::write_unaligned(p.add(F_BOOTP + 16) as *mut [u8; 4], meta.guest_ipv4); // yiaddr
+        core::ptr::write_unaligned(p.add(F_BOOTP + 20) as *mut [u8; 4], gw4); // siaddr
+        core::ptr::write_unaligned(p.add(F_BOOTP + 24) as *mut [u8; 4], gw4); // giaddr
+        write6(p.add(F_BOOTP + 28), &client_mac); // chaddr
         core::ptr::write_bytes(p.add(F_BOOTP + 44), 0, 192);
     }
 
@@ -244,6 +243,9 @@ pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
         *p.add(F_OPTS + O_MTU) = OPT_MTU;
         *p.add(F_OPTS + O_MTU + 1) = 2;
         core::ptr::write_unaligned(p.add(F_OPTS + O_MTU + 2) as *mut u16, mtu.to_be());
+        // dpservice emits the ROUTER(3) option only in PXE setups; the v4 path here has no PXE
+        // support (unlike the v6 path), so this slot is intentionally left as PAD. Reserved for a
+        // future v4-PXE branch.
         core::ptr::write_bytes(p.add(F_OPTS + O_ROUTER), OPT_PAD, 6);
     }
 
@@ -294,6 +296,9 @@ pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
         *p.add(F_OPTS + OPT_BLOCK_MAX - 1) = OPT_END;
     }
 
+    // Ethernet: dst = requester, src = the virtual gateway MAC. dpservice uses the port's own_mac
+    // here; this reimplementation deliberately uses the single synthetic GW_MAC that the ARP/ND
+    // responders also advertise, so the guest's neighbor table for the gateway stays coherent.
     let req_eth_src = unsafe { core::ptr::read_unaligned(p.add(6) as *const [u8; 6]) };
     unsafe {
         write6(p, &req_eth_src);

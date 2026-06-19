@@ -22,11 +22,17 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
 
     // DHCP (v4: IPv4/UDP dport 67, v6: IPv6/UDP dport 547) is handled by the separate `guest_dhcp`
     // program via tail call, so its verifier cost does not stack onto this program's IPv4 forwarding
-    // path. A guest only sends to UDP 67/547 for DHCP, so port-based classification is sufficient;
-    // on a tail-call miss we fall through and PASS (benign — DHCP is never forwarded anyway).
+    // path. Classification is port-only; `guest_dhcp` re-validates and answers DISCOVER/REQUEST (v4)
+    // and SOLICIT/REQUEST/CONFIRM (v6), returning XDP_PASS otherwise.
+    //
+    // NOTE: this changes one corner case versus the old inline path. Previously a 67/547 frame the
+    // responders did NOT answer (e.g. a v6 RENEW/RELEASE, or a v4 INFORM) fell through to the
+    // forwarder. Now such frames PASS. This is behaviour-neutral in practice — unanswered DHCP is
+    // broadcast/multicast (255.255.255.255, ff02::1:2), which misses the route lookup and PASSes
+    // there too — and arguably more correct (guest-originated DHCP is never overlay-forwarded). A
+    // genuine tail-call miss (slot unpopulated / depth limit) also falls through to PASS here.
     if is_dhcp_request(ctx) {
         let _ = unsafe { crate::maps::GUEST_PROGS.tail_call(ctx, xdp_dp_common::GUEST_PROG_DHCP) };
-        // tail_call only returns here on failure (empty slot / depth limit).
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -155,6 +161,8 @@ fn is_dhcp_request(ctx: &XdpContext) -> bool {
     let p = data as *const u8;
     let ethertype = u16::from_be(unsafe { core::ptr::read_unaligned(p.add(12) as *const u16) });
     if ethertype == ETH_P_IP {
+        // Assumes IHL==5 (UDP dport at ETH+22). DHCP requests carry no IP options; an IHL>5 frame
+        // that happens to read 67 here is harmless — `try_dhcpv4_reply` re-checks IHL==5 and PASSes.
         if unsafe { *p.add(ETH_LEN + 9) } != crate::parse::IPPROTO_UDP {
             return false;
         }
