@@ -142,3 +142,21 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
         crate::parse::IPPROTO_IPIP,
     )
 }
+
+/// Tail-call target: run the in-datapath DHCPv4 + DHCPv6 responders. Re-looks-up the port by its
+/// ingress ifindex (tail calls invalidate the previous program's pointers/locals). Returns
+/// `XDP_PASS` when the frame is not actually a DHCP request we answer.
+pub fn dhcp_handle(ctx: &XdpContext) -> u32 {
+    let ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
+    let meta = match unsafe { PORT_META.get(&ifindex) } {
+        Some(m) => m,
+        None => return xdp_action::XDP_PASS,
+    };
+    if let Some(act) = crate::dhcp::try_dhcpv4_reply(ctx, meta) {
+        return act;
+    }
+    if let Some(act) = crate::dhcp::try_dhcpv6_reply(ctx, meta) {
+        return act;
+    }
+    xdp_action::XDP_PASS
+}

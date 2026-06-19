@@ -37,6 +37,11 @@ pub fn guest_tx(ctx: XdpContext) -> u32 {
 }
 
 #[xdp]
+pub fn guest_dhcp(ctx: XdpContext) -> u32 {
+    egress::dhcp_handle(&ctx)
+}
+
+#[xdp]
 pub fn uplink_rx(ctx: XdpContext) -> u32 {
     match ingress::try_uplink_rx(&ctx) {
         Ok(act) => act,
