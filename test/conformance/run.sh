@@ -8,8 +8,11 @@ cd "$ROOT"
 
 cargo build -p xdp-dp
 
-trap './test/conformance/setup-net.sh down' EXIT INT TERM
-./test/conformance/setup-net.sh up
+# Absolute path: the trap fires at EXIT from whatever cwd we ended in (we cd into test/conformance
+# before pytest), so a relative path would not resolve.
+SETUP_NET="$ROOT/test/conformance/setup-net.sh"
+trap '"$SETUP_NET" down' EXIT INT TERM
+"$SETUP_NET" up
 
 # scapy needs CAP_NET_RAW, so pytest runs as root. Use the flake python by absolute path (it is
 # self-contained, so it resolves scapy/pytest even under sudo, which resets PATH). The genuine

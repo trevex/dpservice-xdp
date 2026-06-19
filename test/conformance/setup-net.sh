@@ -19,6 +19,18 @@ up() {
     x="$(xside "$dev")"
     sudo ip link add "$dev" type veth peer name "$x" 2>/dev/null || true
     sudo ip link set "$x" address "${MAC[$dev]}"   # xdp side carries the dpservice MAC (guest_mac)
+    for end in "$dev" "$x"; do
+      # Disable IPv6 on every veth end. Otherwise the kernel runs IPv6 link-local autoconf and emits
+      # mDNS/LLMNR/MLD multicast packets (eth dst 33:33:..), which are UDP and get caught by the
+      # tests' broad `is_udp_pkt` sniff instead of the datapath's reply — a flaky failure. The
+      # vendored harness does this per-interface in interface_init(), but misses VM4's tap (added
+      # only inside test_l2_addr_once), so do it here for all devices. scapy works at L2 (AF_PACKET),
+      # so the IPv6 datapath tests are unaffected.
+      sudo sysctl -qw "net.ipv6.conf.$end.disable_ipv6=1" 2>/dev/null || true
+      # Disable checksum/segmentation/GRO offloads: veth defaults them on, which mangles XDP_TX'd
+      # checksums (our RFC-legal UDP checksum of 0 in DHCP replies) and coalesces frames.
+      sudo ethtool -K "$end" rx off tx off gro off gso off tso off 2>/dev/null || true
+    done
     sudo ip link set "$dev" up; sudo ip link set "$x" up
     sudo "$BIN" pass --iface "$dev" & echo $! >> "$PIDFILE"   # enabler on the scapy side
   done
