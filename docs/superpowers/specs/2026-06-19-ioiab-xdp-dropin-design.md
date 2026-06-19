@@ -87,3 +87,20 @@ Multi-node underlay/encap across real hosts, the full BATS suite, VPC/multi-VNI/
 ## Suggested sequencing
 
 Because R1 (macvtap-over-XDP-tap) can invalidate the whole approach, validate it **first** as a standalone prototype, then build the image, then the manifests, then `make up` and the VM test. The plan should front-load R1.
+
+---
+
+## Resolved (2026-06-19) — execution decisions
+
+**R1 outcome — option 1 (plain tap) chosen.** macvtap is structurally incompatible with an XDP dataplane: macvtap turns guest *egress* into a TX on the lower device, and XDP is an RX-only hook, so `guest_tx` would never see guest traffic. A plain tap (qemu owns the fd → guest egress = RX on the tap) is the natural, already-proven model (our conformance + netns harness inject exactly this way). dpservice only needs macvtap because it's a userspace DPDK dataplane that reads the tap fd directly.
+
+**libvirt-provider change is SELECTABLE, not a replacement.** Add a plain-tap NIC binding (`<interface type='ethernet'><target dev='dtapvf_N' managed='no'/>`) to libvirt-provider as an opt-in mode, **defaulting to the existing macvtap (`type='direct'`)** so the fork still works unmodified for the DPDK dpservice. Mechanism: a CLI flag (e.g. `--network-interface-direct-mode=macvtap|tap`, default `macvtap`) threaded to the `nic.Direct` branch of `providerNetworkInterfaceToLibvirt` (`internal/controllers/machine_controller_nics.go`), plus the matching inverse parser. No CRD/plugin-interface changes.
+
+**Forks & registry (all under github.com/trevex):**
+- `xdp-dp` datapath → repo `trevex/dpservice-xdp`, local `/home/nik/Development/ironcore-net-xdp` (origin already `trevex/dpservice-xdp`). Image: **`ghcr.io/trevex/dpservice-xdp`** (new `Dockerfile`).
+- libvirt-provider fork → repo `trevex/libvirt-provider-tap`, local `/home/nik/Development/libvirt-provider-tap` (has `Dockerfile` + `Makefile` `docker-build`/`docker-push`). Image: **`ghcr.io/trevex/libvirt-provider-tap`**.
+- ioiab fork → repo `trevex/ironcore-in-a-box-xdp`, local `/home/nik/Development/ironcore-in-a-box-xdp` (`base/dpservice/`, `base/libvirt-provider/` kustomize dirs to modify).
+
+**Deliverables:** publish both images to ghcr.io/trevex, then wire `ironcore-in-a-box-xdp` (`base/dpservice` → xdp-dp DaemonSet + init-container tap pool; `base/libvirt-provider` → our image + `--network-interface-direct-mode=tap`) and get `make up` → one VM boots/DHCPs/pings.
+
+**R1 is validated empirically first**, the cheap way: `xdp-dp serve` on a plain tap + a raw qemu VM bound to that tap (no libvirt-provider, no cluster) → guest DHCPs from our responder and pings the gateway. This de-risks the one thing the existing tests don't cover (qemu's tap-fd I/O behaving like our injection) before building images / wiring the fork.
