@@ -363,6 +363,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            // Load guest_dhcp and register it in GUEST_PROGS so guest_tx's DHCP tail call resolves
+            // (same wiring serve's bring_up does). Without this the lab bringup path attaches
+            // guest_tx but the DHCP tail call misses → XDP_PASS → no DHCP reply. Held in scope below
+            // (the arm parks on ctrl_c) so the userspace map fd lives for the datapath's lifetime.
+            let _guest_progs = loader::register_guest_dhcp(&mut ebpf)?;
 
             // Pass 2: open map wrappers (each calls take_map, consuming the map slot).
             let mut local_map = maps::LocalMap::open(&mut ebpf)?;
