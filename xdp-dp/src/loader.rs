@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use anyhow::Context;
-use aya::programs::{Xdp, XdpFlags};
+use aya::maps::{MapData, ProgramArray};
+use aya::programs::{ProgramFd, Xdp, XdpFlags};
 use aya::Ebpf;
 
 /// Load the eBPF object that aya-build compiled to bpfel and placed in OUT_DIR.
@@ -52,6 +53,34 @@ pub fn load_program(ebpf: &mut Ebpf, prog_name: &str) -> anyhow::Result<()> {
         .try_into()?;
     prog.load().with_context(|| format!("verify {prog_name}"))?;
     Ok(())
+}
+
+/// Load (verify) `guest_dhcp` and register its fd in the `GUEST_PROGS` program array at
+/// `GUEST_PROG_DHCP`, so `guest_tx`'s DHCP tail call resolves at runtime. Returns the owned
+/// `ProgramArray` handle; the caller MUST keep it alive (dropping it closes the userspace map fd —
+/// the kernel map itself survives because guest_tx references it, but holding the handle is the
+/// clean, explicit lifetime). Call once at startup after `load_ebpf`, before attaching guest_tx.
+pub fn register_guest_dhcp(ebpf: &mut Ebpf) -> anyhow::Result<ProgramArray<MapData>> {
+    {
+        let prog: &mut Xdp = ebpf
+            .program_mut("guest_dhcp")
+            .context("guest_dhcp program missing")?
+            .try_into()?;
+        prog.load().context("verify guest_dhcp")?;
+    }
+    let mut progs: ProgramArray<_> = ebpf
+        .take_map("GUEST_PROGS")
+        .context("GUEST_PROGS map missing")?
+        .try_into()?;
+    let prog: &Xdp = ebpf
+        .program("guest_dhcp")
+        .context("guest_dhcp program missing")?
+        .try_into()?;
+    let fd: &ProgramFd = prog.fd()?;
+    progs
+        .set(xdp_dp_common::GUEST_PROG_DHCP, fd, 0)
+        .context("register guest_dhcp in GUEST_PROGS")?;
+    Ok(progs)
 }
 
 /// Load (verify) and attach a named XDP program to one interface. Call this for the first

@@ -86,6 +86,10 @@ pub struct Control {
 
 struct Inner {
     ebpf: Ebpf,
+    /// Owned `GUEST_PROGS` program array handle. Holds `GUEST_PROGS[GUEST_PROG_DHCP] = guest_dhcp`
+    /// so guest_tx's DHCP tail call resolves. Kept alive here for the datapath's lifetime;
+    /// dropping it would close the userspace map fd (the kernel map survives via guest_tx).
+    _guest_progs: aya::maps::ProgramArray<aya::maps::MapData>,
     _locals: LocalMap,
     ports: PortMetaMap,
     ifaces: Interfaces,
@@ -148,6 +152,8 @@ impl Control {
         // not load() + attach(). This ensures the first interface's link is always retained and
         // can be dropped on detach (no "XDP program stays attached after delete" ghost).
         loader::load_program(&mut ebpf, "guest_tx")?;
+        // Load guest_dhcp and wire it into GUEST_PROGS so guest_tx's DHCP tail call resolves.
+        let guest_progs = loader::register_guest_dhcp(&mut ebpf)?;
         let mut locals = LocalMap::open(&mut ebpf)?;
         locals.set(&Local {
             uplink_ifindex,
@@ -176,6 +182,7 @@ impl Control {
         Ok(Self {
             inner: Mutex::new(Inner {
                 ebpf,
+                _guest_progs: guest_progs,
                 _locals: locals,
                 ports,
                 ifaces,
