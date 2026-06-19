@@ -302,6 +302,12 @@ pub struct FwMeta {
 /// the in-map array — 8 covers the conformance set + headroom).
 pub const DHCP_MAX_DNS: usize = 8;
 
+/// Tail-call indices into the `GUEST_PROGS` program array (egress datapath split).
+/// `GUEST_PROG_DHCP` is used in Phase 1; IPV4/IPV6 are reserved for the Phase 2 split.
+pub const GUEST_PROG_DHCP: u32 = 0;
+pub const GUEST_PROG_IPV4: u32 = 1;
+pub const GUEST_PROG_IPV6: u32 = 2;
+
 /// Server-wide DHCP config (DHCP_CONFIG[0]). Mirrors dpservice's --dhcp-mtu/--dhcp-dns/--dhcpv6-dns.
 #[repr(C)]
 #[derive(Copy, Clone)]

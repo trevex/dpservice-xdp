@@ -1,6 +1,6 @@
 use aya_ebpf::{
     macros::map,
-    maps::{lpm_trie::LpmTrie, Array, HashMap, LruHashMap},
+    maps::{lpm_trie::LpmTrie, Array, HashMap, LruHashMap, ProgramArray},
 };
 use xdp_dp_common::{
     Config, CtEntry, CtKey, DhcpConfig, DhcpMeta, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue,
@@ -62,3 +62,8 @@ pub static METER: HashMap<u32, MeterState> = HashMap::with_max_entries(1024, 0);
 pub static DHCP_CONFIG: Array<DhcpConfig> = Array::with_max_entries(1, 0);
 #[map]
 pub static DHCP_META: HashMap<u32, DhcpMeta> = HashMap::with_max_entries(1024, 0);
+/// Tail-call targets for the egress datapath split. Index with `GUEST_PROG_*` from xdp-dp-common.
+/// Populated by the loader at startup (guest_dhcp at GUEST_PROG_DHCP). 8 slots leaves room for the
+/// Phase 2 IPv4/IPv6 split without resizing.
+#[map]
+pub static GUEST_PROGS: ProgramArray = ProgramArray::with_max_entries(8, 0);
