@@ -211,7 +211,7 @@ mod tests {
             .verifier_log_level(VerifierLogLevel::VERBOSE | VerifierLogLevel::STATS)
             .load(bytes)
             .expect("load ebpf object");
-        for name in ["uplink_rx", "guest_tx"] {
+        for name in ["uplink_rx", "guest_tx", "guest_dhcp"] {
             let prog: &mut Xdp = ebpf
                 .program_mut(name)
                 .unwrap_or_else(|| panic!("program {name} missing"))
