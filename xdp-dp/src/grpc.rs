@@ -592,27 +592,18 @@ impl DpdKironcore for Service {
         }
 
         // Write DHCP_META for this interface: hostname and optional PXE config.
+        // pxe_host is stored as a printable string (e.g. "2001:dede::1") so the eBPF responder
+        // can embed it verbatim in the DHCPv6 BootFileUrl option ("tftp://[<pxe_host>]/<file>").
         let hostname = r.hostname.as_bytes().to_vec();
-        let (pxe_ip, boot_file) = match &r.pxe_config {
-            Some(p) if !p.next_server.is_empty() => {
-                let ip = p
-                    .next_server
-                    .parse::<std::net::Ipv6Addr>()
-                    .map(|a| a.octets())
-                    .or_else(|_| {
-                        p.next_server.parse::<std::net::Ipv4Addr>().map(|a| {
-                            let mut b = [0u8; 16];
-                            b[12..].copy_from_slice(&a.octets());
-                            b
-                        })
-                    })
-                    .unwrap_or([0u8; 16]);
-                (ip, p.boot_filename.clone().into_bytes())
-            }
-            _ => ([0u8; 16], Vec::new()),
+        let (pxe_host, boot_file) = match &r.pxe_config {
+            Some(p) if !p.next_server.is_empty() => (
+                p.next_server.as_bytes().to_vec(),
+                p.boot_filename.clone().into_bytes(),
+            ),
+            _ => (Vec::new(), Vec::new()),
         };
         control
-            .set_dhcp_meta(&interface_id, &hostname, pxe_ip, &boot_file)
+            .set_dhcp_meta(&interface_id, &hostname, &pxe_host, &boot_file)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(CreateInterfaceResponse {

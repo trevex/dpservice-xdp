@@ -321,8 +321,12 @@ pub struct DhcpMeta {
     pub hostname_len: u8,
     pub boot_filename: [u8; 64],
     pub boot_filename_len: u8,
-    pub _pad: [u8; 2],
-    pub pxe_ip: [u8; 16], // pxe_config.next_server (v6 string -> 16 bytes); all-zero = no PXE
+    /// Printable PXE server string for DHCPv6 BootFileUrl option, e.g. "2001:dede::1"
+    /// (without brackets; the eBPF responder wraps it with "[" and "]" in the URL).
+    /// All-zero / pxe_host_len==0 means no PXE. Max 46 bytes (IPv6 INET6_ADDRSTRLEN).
+    pub pxe_host: [u8; 46],
+    pub pxe_host_len: u8,
+    pub _pad: [u8; 1],
 }
 
 pub const FW_DIR_INGRESS: u8 = 0;
@@ -547,7 +551,12 @@ mod tests {
             core::mem::size_of::<DhcpConfig>(),
             2 + 1 + 1 + 4 * DHCP_MAX_DNS + 16 * DHCP_MAX_DNS
         );
-        assert_eq!(core::mem::size_of::<DhcpMeta>(), 64 + 1 + 64 + 1 + 2 + 16);
+        // hostname(64) + hostname_len(1) + boot_filename(64) + boot_filename_len(1)
+        // + pxe_host(46) + pxe_host_len(1) + _pad(1) = 178
+        assert_eq!(
+            core::mem::size_of::<DhcpMeta>(),
+            64 + 1 + 64 + 1 + 46 + 1 + 1
+        );
     }
 
     #[test]

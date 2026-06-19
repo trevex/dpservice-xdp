@@ -62,8 +62,11 @@ const ND_NS: u8 = 135;
 const ND_NA: u8 = 136;
 
 /// One's-complement checksum over `len` bytes at `ptr`, plus an initial `sum` (pseudo-header).
+///
+/// The carry-propagation is done with exactly 2 fixed iterations (not a while loop) because
+/// the BPF verifier requires bounded loops and one's complement fold needs at most 2 steps.
 #[inline(always)]
-unsafe fn csum16(mut sum: u32, ptr: *const u8, len: usize) -> u16 {
+pub(crate) unsafe fn csum16(mut sum: u32, ptr: *const u8, len: usize) -> u16 {
     let mut i = 0;
     while i + 1 < len {
         sum += u16::from_be(core::ptr::read_unaligned(ptr.add(i) as *const u16)) as u32;
@@ -72,9 +75,10 @@ unsafe fn csum16(mut sum: u32, ptr: *const u8, len: usize) -> u16 {
     if i < len {
         sum += (*ptr.add(i) as u32) << 8;
     }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
+    // Fold carries: two rounds suffices for any 32-bit accumulator (BPF verifier requires
+    // bounded loops, so we unroll rather than use `while sum >> 16 != 0`).
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
     !(sum as u16)
 }
 

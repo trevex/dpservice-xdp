@@ -25,6 +25,11 @@ pub fn try_guest_tx(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(act);
     }
 
+    // Answer DHCPv6 in-datapath (before the IPv6 ethertype branch).
+    if let Some(act) = crate::dhcp::try_dhcpv6_reply(ctx, meta) {
+        return Ok(act);
+    }
+
     // IPv6 inner frames take the v6 overlay path.
     {
         let d = ctx.data();

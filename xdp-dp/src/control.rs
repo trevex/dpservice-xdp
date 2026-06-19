@@ -243,7 +243,7 @@ impl Control {
         &self,
         interface_id: &[u8],
         hostname: &[u8],
-        pxe_ip: [u8; 16],
+        pxe_host: &[u8],
         boot_filename: &[u8],
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
@@ -256,8 +256,9 @@ impl Control {
             hostname_len: 0,
             boot_filename: [0; 64],
             boot_filename_len: 0,
-            _pad: [0; 2],
-            pxe_ip,
+            pxe_host: [0; 46],
+            pxe_host_len: 0,
+            _pad: [0; 1],
         };
         let hl = hostname.len().min(64);
         m.hostname[..hl].copy_from_slice(&hostname[..hl]);
@@ -265,6 +266,9 @@ impl Control {
         let bl = boot_filename.len().min(64);
         m.boot_filename[..bl].copy_from_slice(&boot_filename[..bl]);
         m.boot_filename_len = bl as u8;
+        let pl = pxe_host.len().min(46);
+        m.pxe_host[..pl].copy_from_slice(&pxe_host[..pl]);
+        m.pxe_host_len = pl as u8;
         g.dhcp_meta.upsert(ifindex, m)
     }
 

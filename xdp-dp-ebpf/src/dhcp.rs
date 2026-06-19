@@ -1,8 +1,8 @@
 use aya_ebpf::{bindings::xdp_action, helpers::bpf_xdp_adjust_tail, programs::XdpContext};
 use xdp_dp_common::PortMeta;
 
-use crate::arp_nd::GW_MAC;
-use crate::parse::{write6, ETH_LEN, ETH_P_IP, IPPROTO_UDP};
+use crate::arp_nd::{csum16, GW_MAC};
+use crate::parse::{write16, write6, ETH_LEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_UDP};
 
 const DHCP_MAGIC: u32 = 0x6382_5363;
 const OPT_PAD: u8 = 0;
@@ -81,7 +81,7 @@ pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
     // i always increments by 1 (fixed stride = verifier-friendly loop).
     let mut msg_type: u8 = 0;
     let mut sm_state: u8 = 0;
-    let mut sm_code: u8 = 0;
+    let mut _sm_code: u8 = 0;
     let mut sm_remain: usize = 0;
     let mut sm_is_msgtype: bool = false;
 
@@ -101,7 +101,7 @@ pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
             } else if b == OPT_END {
                 break;
             } else {
-                sm_code = b;
+                _sm_code = b;
                 sm_is_msgtype = b == OPT_MESSAGE_TYPE;
                 sm_state = 1;
             }
@@ -345,6 +345,586 @@ pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
         core::ptr::write_unaligned(p.add(ETH_LEN + 22) as *mut u16, 68u16.to_be());
         core::ptr::write_unaligned(p.add(ETH_LEN + 24) as *mut u16, udp_len.to_be());
         core::ptr::write_unaligned(p.add(ETH_LEN + 26) as *mut u16, 0u16);
+    }
+
+    Some(xdp_action::XDP_TX)
+}
+
+// ──────────────────────── DHCPv6 responder ────────────────────────
+
+// DHCPv6 message types (RFC 8415)
+const D6_SOLICIT: u8 = 1;
+const D6_ADVERTISE: u8 = 2;
+const D6_REQUEST: u8 = 3;
+const D6_CONFIRM: u8 = 4;
+const D6_REPLY: u8 = 7;
+
+// DHCPv6 option codes
+const D6_OPT_CLIENTID: u16 = 1;
+const D6_OPT_SERVERID: u16 = 2;
+const D6_OPT_IA_NA: u16 = 3;
+const D6_OPT_IAADDR: u16 = 5;
+const D6_OPT_STATUS_CODE: u16 = 13;
+const D6_OPT_RAPID_COMMIT: u16 = 14;
+const D6_OPT_USER_CLASS: u16 = 15;
+const D6_OPT_VENDOR_CLASS: u16 = 16;
+const D6_OPT_DNS: u16 = 23;
+const D6_OPT_BOOT_FILE: u16 = 59;
+
+// DUID type for server DUID-LL (DP_DHCPV6_HW_ID = 0xabcd)
+const DUID_LL_TYPE: u16 = 3;
+const DP_DHCPV6_HW_ID: u16 = 0xabcd;
+
+// DHCPv6 packet starts at ETH+IPv6+UDP = 14+40+8 = 62
+const F6_DHCP: usize = ETH_LEN + 40 + 8;
+// Options start 4 bytes in (msg_type(1)+tid(3))
+const F6_OPTS: usize = F6_DHCP + 4;
+// Minimum packet we need to peek at: ETH + IPv6 + UDP + DHCPv6 header
+const MIN_D6_LEN: usize = F6_OPTS;
+
+// Vendor class enterprise number for PXE (343)
+const PXE_ENTERPRISE: u32 = 343;
+
+// PXE mode discriminator
+const PXE_NONE: u8 = 0;
+const PXE_TFTP: u8 = 1;
+const PXE_HTTP: u8 = 2;
+
+// TFTP path constant (mirrors dpservice DP_PXE_TFTP_PATH)
+const TFTP_PATH: &[u8] = b"ipxe/x86_64/ipxe.new";
+
+// Maximum DNS entries to include
+const D6_MAX_DNS: usize = xdp_dp_common::DHCP_MAX_DNS; // 8 entries
+
+// Cap DUID to 10 bytes: minimum for DUID-LL with MAC (type(2)+hwtype(2)+mac(6)=10)
+const D6_MAX_DUID: usize = 10;
+
+// Maximum boot file URL length: scheme(7) + "[" + host(46) + "]/" + path(64) = 120
+const D6_MAX_URL: usize = 120;
+
+// Maximum DHCPv6 options total size
+const D6_MAX_OPTS: usize = 14 // ServerId: op(2)+len(2)+DUID_LL(10)=14
+    + (4 + D6_MAX_DUID) // ClientId: op(2)+len(2)+duid_cap(10)=14
+    + 4  // RapidCommit: op(2)+len(2)=4
+    + 50 // IA_NA full with nested IAADDR+STATUS_CODE
+    + (4 + D6_MAX_DNS * 16) // DNS: 4+128=132
+    + (4 + D6_MAX_URL); // BootFileUrl: 4+120=124
+
+/// Compute the URL length for PXE without building it in a buffer.
+/// Returns 0 if PXE is not configured.
+#[inline(always)]
+fn d6_url_len(pxe_mode: u8, dm: &xdp_dp_common::DhcpMeta) -> usize {
+    if pxe_mode == PXE_NONE {
+        return 0;
+    }
+    let host_len = dm.pxe_host_len as usize;
+    if host_len == 0 || host_len > 46 {
+        return 0;
+    }
+    let path_len = if pxe_mode == PXE_TFTP {
+        TFTP_PATH.len()
+    } else {
+        dm.boot_filename_len as usize
+    };
+    // scheme(7) + "[" + host + "]/" + path
+    7 + 1 + host_len + 2 + path_len
+}
+
+/// Write the PXE boot file URL directly to `dst` (already bounds-checked by caller).
+/// Returns the number of bytes written.
+///
+/// All array accesses use raw pointer arithmetic (no Rust bounds checks) so the
+/// function compiles to a single basic block with no panic edges even in debug builds.
+#[inline(always)]
+unsafe fn d6_write_url(dst: *mut u8, pxe_mode: u8, dm: &xdp_dp_common::DhcpMeta) -> usize {
+    let host_len = dm.pxe_host_len as usize;
+    if host_len == 0 || host_len > 46 {
+        return 0;
+    }
+    let mut up = 0usize;
+    // scheme: use raw pointer to avoid bounds-check calls in debug builds
+    let scheme_ptr: *const u8 = if pxe_mode == PXE_TFTP {
+        b"tftp://".as_ptr()
+    } else {
+        b"http://".as_ptr()
+    };
+    let mut si = 0usize;
+    while si < 7 {
+        *dst.add(up) = *scheme_ptr.add(si);
+        up += 1;
+        si += 1;
+    }
+    // [host]/
+    *dst.add(up) = b'[';
+    up += 1;
+    let host_ptr = dm.pxe_host.as_ptr();
+    let mut hi = 0usize;
+    while hi < host_len {
+        *dst.add(up) = *host_ptr.add(hi);
+        up += 1;
+        hi += 1;
+    }
+    *dst.add(up) = b']';
+    up += 1;
+    *dst.add(up) = b'/';
+    up += 1;
+    // path
+    if pxe_mode == PXE_TFTP {
+        let path_ptr = TFTP_PATH.as_ptr();
+        let path_len = TFTP_PATH.len();
+        let mut pi = 0usize;
+        while pi < path_len {
+            *dst.add(up) = *path_ptr.add(pi);
+            up += 1;
+            pi += 1;
+        }
+    } else {
+        let file_len = dm.boot_filename_len as usize;
+        let file_ptr = dm.boot_filename.as_ptr();
+        let mut fi = 0usize;
+        while fi < file_len {
+            *dst.add(up) = *file_ptr.add(fi);
+            up += 1;
+            fi += 1;
+        }
+    }
+    up
+}
+
+/// In-datapath DHCPv6 responder.
+///
+/// Detects DHCPv6 SOLICIT/REQUEST/CONFIRM on UDP dst port 547, builds a reply
+/// with IA_NA/ClientId/ServerId/DNS/BootFileUrl/RapidCommit, and returns XDP_TX.
+///
+/// Stack usage is minimised: no URL buffer (written directly to packet), DUID
+/// capped at 10 bytes. Uses a single byte-by-byte bounded parse loop (stride=1).
+///
+/// NOTE: NOT marked #[inline(never)] — BPF does not support true out-of-line subprograms
+/// within the same ELF section. Inlining is required; stack usage is kept low by writing
+/// the boot-file URL directly to the packet and capping the DUID capture buffer.
+#[inline(always)]
+pub fn try_dhcpv6_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + MIN_D6_LEN > data_end {
+        return None;
+    }
+    let p = data as *const u8;
+
+    // Detect: ETH_P_IPV6
+    let ethertype = u16::from_be(unsafe { core::ptr::read_unaligned(p.add(12) as *const u16) });
+    if ethertype != ETH_P_IPV6 {
+        return None;
+    }
+    // IPv6 next-header = UDP (17) at offset ETH_LEN+6
+    if unsafe { *p.add(ETH_LEN + 6) } != IPPROTO_UDP {
+        return None;
+    }
+    // UDP dst port = 547 (DHCPv6 server)
+    let udp_dst =
+        u16::from_be(unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 40 + 2) as *const u16) });
+    if udp_dst != 547 {
+        return None;
+    }
+
+    // DHCPv6 message type and transaction ID
+    let msg_type = unsafe { *p.add(F6_DHCP) };
+    if msg_type != D6_SOLICIT && msg_type != D6_REQUEST && msg_type != D6_CONFIRM {
+        return None;
+    }
+    let tid0 = unsafe { *p.add(F6_DHCP + 1) };
+    let tid1 = unsafe { *p.add(F6_DHCP + 2) };
+    let tid2 = unsafe { *p.add(F6_DHCP + 3) };
+
+    // IPv6 source (link-local) and Ethernet source of requester
+    let req_src6 = unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 8) as *const [u8; 16]) };
+    let req_eth_src = unsafe { core::ptr::read_unaligned(p.add(6) as *const [u8; 6]) };
+
+    // ─── Parse options — single byte-by-byte loop (stride=1, max 256, verifier-safe) ───
+    // State: 0=op_hi 1=op_lo 2=len_hi 3=len_lo 4+=value. sm_phase tracks where we are.
+    let mut sm_phase: u8 = 0;
+    let mut sm_op: u16 = 0;
+    let mut sm_len: u16 = 0;
+    let mut sm_remain: u16 = 0;
+    let mut sm_idx: u16 = 0; // index within current option value
+
+    let mut got_clientid = false;
+    let mut duid_buf = [0u8; D6_MAX_DUID];
+    let mut duid_len: u16 = 0;
+
+    let mut got_iana = false;
+    let mut iaid: u32 = 0;
+
+    let mut rapid_commit = false;
+
+    // pxe_mode: PXE_NONE=0, PXE_TFTP=1, PXE_HTTP=2
+    // During parsing we also use 3 = "saw 'i'" and 4 = "saw iPX" to detect "iPXE"
+    let mut pxe_mode: u8 = PXE_NONE;
+    // Track enterprise number bytes for VENDOR_CLASS
+    let mut ent_acc: u32 = 0;
+
+    let mut i: usize = 0;
+    while i < 256 {
+        let boff = data + F6_OPTS + i;
+        if boff >= data_end {
+            break;
+        }
+        let b = unsafe { *(boff as *const u8) };
+        i += 1;
+
+        if sm_phase == 0 {
+            sm_op = (b as u16) << 8;
+            sm_phase = 1;
+        } else if sm_phase == 1 {
+            sm_op |= b as u16;
+            sm_phase = 2;
+        } else if sm_phase == 2 {
+            sm_len = (b as u16) << 8;
+            sm_phase = 3;
+        } else if sm_phase == 3 {
+            sm_len |= b as u16;
+            sm_remain = sm_len;
+            sm_idx = 0;
+            if sm_remain == 0 {
+                if sm_op == D6_OPT_RAPID_COMMIT {
+                    rapid_commit = true;
+                }
+                sm_phase = 0;
+            } else {
+                sm_phase = 4;
+                ent_acc = 0; // reset for each new option
+            }
+        } else {
+            // sm_phase == 4: reading value bytes
+            match sm_op {
+                D6_OPT_CLIENTID => {
+                    if sm_idx == 0 {
+                        got_clientid = true;
+                        duid_len = sm_len.min(D6_MAX_DUID as u16);
+                    }
+                    // Use raw pointer write to avoid debug-mode bounds-check panic edges.
+                    if (sm_idx as usize) < D6_MAX_DUID {
+                        unsafe {
+                            *duid_buf.as_mut_ptr().add(sm_idx as usize) = b;
+                        }
+                    }
+                }
+                D6_OPT_IA_NA => {
+                    if sm_idx == 0 {
+                        iaid = (b as u32) << 24;
+                    } else if sm_idx == 1 {
+                        iaid |= (b as u32) << 16;
+                    } else if sm_idx == 2 {
+                        iaid |= (b as u32) << 8;
+                    } else if sm_idx == 3 {
+                        iaid |= b as u32;
+                        got_iana = true;
+                    }
+                }
+                D6_OPT_VENDOR_CLASS => {
+                    // Enterprise number is bytes 0-3 (big-endian)
+                    if sm_idx == 0 {
+                        ent_acc = (b as u32) << 24;
+                    } else if sm_idx == 1 {
+                        ent_acc |= (b as u32) << 16;
+                    } else if sm_idx == 2 {
+                        ent_acc |= (b as u32) << 8;
+                    } else if sm_idx == 3 {
+                        ent_acc |= b as u32;
+                        if ent_acc == PXE_ENTERPRISE && pxe_mode == PXE_NONE {
+                            pxe_mode = PXE_TFTP;
+                        }
+                    }
+                }
+                D6_OPT_USER_CLASS => {
+                    // Structure: sub_opt_len(2) then data. Look for "iPXE" in data.
+                    // sm_idx 0,1 = sub_opt_len; sm_idx 2+ = data bytes.
+                    // We detect "iPXE" using pxe_mode states: 3=saw i, 4=saw iP, 5=saw iPX
+                    if sm_idx >= 2 && pxe_mode != PXE_HTTP && pxe_mode != PXE_TFTP {
+                        let ci = sm_idx - 2; // index within data
+                        if ci == 0 {
+                            pxe_mode = if b == b'i' { 3 } else { PXE_NONE };
+                        } else if ci == 1 {
+                            pxe_mode = if b == b'P' && pxe_mode == 3 {
+                                4
+                            } else {
+                                PXE_NONE
+                            };
+                        } else if ci == 2 {
+                            pxe_mode = if b == b'X' && pxe_mode == 4 {
+                                5
+                            } else {
+                                PXE_NONE
+                            };
+                        } else if ci == 3 {
+                            pxe_mode = if b == b'E' && pxe_mode == 5 {
+                                PXE_HTTP
+                            } else {
+                                PXE_NONE
+                            };
+                        }
+                    }
+                }
+                _ => {}
+            }
+            sm_idx += 1;
+            sm_remain -= 1;
+            if sm_remain == 0 {
+                sm_phase = 0;
+            }
+        }
+    }
+
+    // Determine reply type
+    let reply_type = if msg_type == D6_SOLICIT && rapid_commit {
+        D6_REPLY
+    } else if msg_type == D6_SOLICIT {
+        D6_ADVERTISE
+    } else {
+        D6_REPLY // REQUEST or CONFIRM
+    };
+
+    // Look up DHCP config for DNS and PXE
+    let dhcp_cfg = crate::maps::DHCP_CONFIG.get(0);
+    let ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
+    let dhcp_meta = unsafe { crate::maps::DHCP_META.get(&ifindex) };
+
+    let dns6_count = if let Some(cfg) = dhcp_cfg {
+        (cfg.dns6_len as usize).min(D6_MAX_DNS)
+    } else {
+        0
+    };
+
+    // Compute URL length (no buffer — will write directly to packet)
+    let url_len = if pxe_mode != PXE_NONE {
+        if let Some(dm) = dhcp_meta {
+            let l = d6_url_len(pxe_mode, dm);
+            l.min(D6_MAX_URL)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    // ─── Size the reply ───
+    let duid_len_usize = duid_len as usize;
+    let real_opts_len: usize = 14  // ServerId (always)
+        + if got_clientid && duid_len_usize > 0 { 4 + duid_len_usize } else { 0 }
+        + if got_iana { 50 } else { 0 }
+        + if rapid_commit { 4 } else { 0 }
+        + if dns6_count > 0 { 4 + dns6_count * 16 } else { 0 }
+        + if url_len > 0 { 4 + url_len } else { 0 };
+
+    if real_opts_len > D6_MAX_OPTS {
+        return None;
+    }
+    let real_reply_len = F6_OPTS + real_opts_len;
+
+    // Always adjust the frame to the MAXIMUM possible reply size (F6_OPTS + D6_MAX_OPTS).
+    // This lets us use a single compile-time constant bounds check after the tail adjust,
+    // which is the only way to convince the BPF verifier that all subsequent packet writes
+    // at variable offsets are safe (the verifier cannot propagate data_end-data >= runtime_var).
+    // The UDP/IPv6 length fields carry the ACTUAL payload length so the DHCPv6 client knows
+    // where the valid options end; bytes beyond real_reply_len are zero-padded (harmless).
+    const D6_MAX_TOTAL: usize = F6_OPTS + D6_MAX_OPTS;
+    let cur_len = data_end - data;
+    {
+        let delta: i32 = D6_MAX_TOTAL as i32 - cur_len as i32;
+        if unsafe { bpf_xdp_adjust_tail(ctx.ctx, delta) } != 0 {
+            return None;
+        }
+    }
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    // Single constant-size check: the verifier can now prove any offset < D6_MAX_TOTAL is valid.
+    if data + D6_MAX_TOTAL > data_end {
+        return None;
+    }
+    let p = data as *mut u8;
+
+    // ─── Rewrite Ethernet header ───
+    unsafe {
+        write6(p, &req_eth_src);
+        write6(p.add(6), &GW_MAC);
+        // ETH_P_IPV6 ethertype stays (0x86DD)
+        core::ptr::write_unaligned(p.add(12) as *mut u16, ETH_P_IPV6.to_be());
+    }
+
+    // ─── Rewrite IPv6 header ───
+    let ipv6_payload_len = (real_reply_len - ETH_LEN - 40) as u16;
+    unsafe {
+        // Version+TC+Flow already present; rewrite payload_len + next_hdr + hop_limit + addrs
+        core::ptr::write_unaligned(p.add(ETH_LEN + 4) as *mut u16, ipv6_payload_len.to_be());
+        *p.add(ETH_LEN + 6) = IPPROTO_UDP;
+        *p.add(ETH_LEN + 7) = 64; // hop limit
+        write16(p.add(ETH_LEN + 8), &meta.gateway_ipv6);
+        write16(p.add(ETH_LEN + 24), &req_src6);
+    }
+
+    // ─── Rewrite UDP header ───
+    let udp_len = ipv6_payload_len;
+    unsafe {
+        core::ptr::write_unaligned(p.add(ETH_LEN + 40) as *mut u16, 547u16.to_be()); // src port
+        core::ptr::write_unaligned(p.add(ETH_LEN + 42) as *mut u16, 546u16.to_be()); // dst port
+        core::ptr::write_unaligned(p.add(ETH_LEN + 44) as *mut u16, udp_len.to_be()); // length
+        core::ptr::write_unaligned(p.add(ETH_LEN + 46) as *mut u16, 0u16); // cksum (fill later)
+    }
+
+    // ─── Rewrite DHCPv6 message header ───
+    unsafe {
+        *p.add(F6_DHCP) = reply_type;
+        *p.add(F6_DHCP + 1) = tid0;
+        *p.add(F6_DHCP + 2) = tid1;
+        *p.add(F6_DHCP + 3) = tid2;
+    }
+
+    // ─── Write DHCPv6 options sequentially ───
+    let mut off: usize = 0;
+
+    // ServerId: DUID-LL (always present)
+    unsafe {
+        core::ptr::write_unaligned(p.add(F6_OPTS + off) as *mut u16, D6_OPT_SERVERID.to_be());
+        core::ptr::write_unaligned(p.add(F6_OPTS + off + 2) as *mut u16, 10u16.to_be());
+        core::ptr::write_unaligned(p.add(F6_OPTS + off + 4) as *mut u16, DUID_LL_TYPE.to_be());
+        core::ptr::write_unaligned(
+            p.add(F6_OPTS + off + 6) as *mut u16,
+            DP_DHCPV6_HW_ID.to_be(),
+        );
+        write6(p.add(F6_OPTS + off + 8), &meta.guest_mac);
+    }
+    off += 14;
+
+    // ClientId: echo the client's DUID
+    if got_clientid && duid_len_usize > 0 {
+        unsafe {
+            core::ptr::write_unaligned(p.add(F6_OPTS + off) as *mut u16, D6_OPT_CLIENTID.to_be());
+            core::ptr::write_unaligned(p.add(F6_OPTS + off + 2) as *mut u16, duid_len.to_be());
+        }
+        let duid_ptr = duid_buf.as_ptr();
+        let mut di = 0usize;
+        while di < duid_len_usize && di < D6_MAX_DUID {
+            unsafe {
+                *p.add(F6_OPTS + off + 4 + di) = *duid_ptr.add(di);
+            }
+            di += 1;
+        }
+        off += 4 + duid_len_usize;
+    }
+
+    // IA_NA with nested IAADDR + STATUS_CODE
+    if got_iana {
+        unsafe {
+            // IA_NA header: op_len = iaid(4)+t1(4)+t2(4)+IAADDR_opt(4+30) = 46
+            core::ptr::write_unaligned(p.add(F6_OPTS + off) as *mut u16, D6_OPT_IA_NA.to_be());
+            core::ptr::write_unaligned(p.add(F6_OPTS + off + 2) as *mut u16, 46u16.to_be());
+            core::ptr::write_unaligned(p.add(F6_OPTS + off + 4) as *mut u32, iaid.to_be());
+            core::ptr::write_unaligned(
+                p.add(F6_OPTS + off + 8) as *mut u32,
+                0xffff_ffffu32.to_be(),
+            ); // t1
+            core::ptr::write_unaligned(
+                p.add(F6_OPTS + off + 12) as *mut u32,
+                0xffff_ffffu32.to_be(),
+            ); // t2
+               // IAADDR: op_len = ipv6(16)+preferred(4)+valid(4)+STATUS_CODE_opt(4+2)=30
+            core::ptr::write_unaligned(
+                p.add(F6_OPTS + off + 16) as *mut u16,
+                D6_OPT_IAADDR.to_be(),
+            );
+            core::ptr::write_unaligned(p.add(F6_OPTS + off + 18) as *mut u16, 30u16.to_be());
+            write16(p.add(F6_OPTS + off + 20), &meta.guest_ipv6);
+            core::ptr::write_unaligned(
+                p.add(F6_OPTS + off + 36) as *mut u32,
+                0xffff_ffffu32.to_be(),
+            ); // preferred
+            core::ptr::write_unaligned(
+                p.add(F6_OPTS + off + 40) as *mut u32,
+                0xffff_ffffu32.to_be(),
+            ); // valid
+               // STATUS_CODE nested in IAADDR: op_len = 2, status = SUCCESS (0)
+            core::ptr::write_unaligned(
+                p.add(F6_OPTS + off + 44) as *mut u16,
+                D6_OPT_STATUS_CODE.to_be(),
+            );
+            core::ptr::write_unaligned(p.add(F6_OPTS + off + 46) as *mut u16, 2u16.to_be());
+            core::ptr::write_unaligned(p.add(F6_OPTS + off + 48) as *mut u16, 0u16.to_be());
+            // SUCCESS
+        }
+        off += 50;
+    }
+
+    // RapidCommit (only if client sent it)
+    if rapid_commit {
+        unsafe {
+            core::ptr::write_unaligned(
+                p.add(F6_OPTS + off) as *mut u16,
+                D6_OPT_RAPID_COMMIT.to_be(),
+            );
+            core::ptr::write_unaligned(p.add(F6_OPTS + off + 2) as *mut u16, 0u16.to_be());
+        }
+        off += 4;
+    }
+
+    // DNS servers
+    if dns6_count > 0 {
+        if let Some(cfg) = dhcp_cfg {
+            let dns_data_len = (dns6_count as u16) * 16;
+            unsafe {
+                core::ptr::write_unaligned(p.add(F6_OPTS + off) as *mut u16, D6_OPT_DNS.to_be());
+                core::ptr::write_unaligned(
+                    p.add(F6_OPTS + off + 2) as *mut u16,
+                    dns_data_len.to_be(),
+                );
+            }
+            let dns6_ptr = cfg.dns6.as_ptr();
+            let mut di = 0usize;
+            while di < dns6_count {
+                unsafe {
+                    write16(p.add(F6_OPTS + off + 4 + di * 16), &*dns6_ptr.add(di));
+                }
+                di += 1;
+            }
+            off += 4 + dns6_count * 16;
+        }
+    }
+
+    // Boot File URL (written directly to packet, no intermediate buffer)
+    if url_len > 0 {
+        unsafe {
+            core::ptr::write_unaligned(p.add(F6_OPTS + off) as *mut u16, D6_OPT_BOOT_FILE.to_be());
+            core::ptr::write_unaligned(
+                p.add(F6_OPTS + off + 2) as *mut u16,
+                (url_len as u16).to_be(),
+            );
+            if let Some(dm) = dhcp_meta {
+                let written = d6_write_url(p.add(F6_OPTS + off + 4), pxe_mode, dm);
+                off += 4 + written;
+            }
+        }
+    }
+    let _ = off; // silence "never read" warning
+
+    // ─── UDP checksum over IPv6 pseudo-header ───
+    // pseudo-header: src(16) + dst(16) + length(4 BE) + zeros(3) + next(1=17)
+    let udp_payload_len = udp_len as usize;
+    let mut cs: u32 = 0;
+    let mut k: usize = 0;
+    while k < 16 {
+        cs = cs.wrapping_add(u16::from_be(unsafe {
+            core::ptr::read_unaligned(p.add(ETH_LEN + 8 + k) as *const u16)
+        }) as u32);
+        cs = cs.wrapping_add(u16::from_be(unsafe {
+            core::ptr::read_unaligned(p.add(ETH_LEN + 24 + k) as *const u16)
+        }) as u32);
+        k += 2;
+    }
+    cs = cs.wrapping_add((udp_payload_len >> 16) as u32);
+    cs = cs.wrapping_add((udp_payload_len & 0xffff) as u32);
+    cs = cs.wrapping_add(IPPROTO_UDP as u32);
+    let cksum = unsafe { csum16(cs, p.add(ETH_LEN + 40) as *const u8, udp_payload_len) };
+    unsafe {
+        core::ptr::write_unaligned(p.add(ETH_LEN + 46) as *mut u16, cksum.to_be());
     }
 
     Some(xdp_action::XDP_TX)

@@ -172,11 +172,16 @@ pub fn pin_map(ebpf: &mut Ebpf, name: &str, pin_dir: &str) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use aya::programs::Xdp;
+    use aya::{EbpfLoader, VerifierLogLevel};
 
     #[test]
     #[ignore = "requires root/CAP_BPF; loads programs through the verifier"]
     fn both_programs_pass_verifier() {
-        let mut ebpf = super::load_ebpf().expect("load ebpf object");
+        let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/xdp-dp-prog"));
+        let mut ebpf = EbpfLoader::new()
+            .verifier_log_level(VerifierLogLevel::VERBOSE | VerifierLogLevel::STATS)
+            .load(bytes)
+            .expect("load ebpf object");
         for name in ["uplink_rx", "guest_tx"] {
             let prog: &mut Xdp = ebpf
                 .program_mut(name)
