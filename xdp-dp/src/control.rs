@@ -17,6 +17,27 @@ use crate::maps::{
     Meter, Nat, NatIps, NeighborNat, NeighborNatCount, PortMetaMap, Routes, Routes6, Vips,
 };
 
+/// Resolve a gRPC `device_name` to an actual kernel netdev name.
+///
+/// If `device` already exists under `/sys/class/net`, it is used verbatim. Otherwise, if it is a
+/// dpservice DPDK vdev name `net_tap<N>` (N >= 2), it is translated to the kernel tap `dtapvf_<N-2>`
+/// — the `--vdev=net_tap{N+2},iface=dtapvf_N` naming dpservice used and that metalnet sends over
+/// gRPC. xdp-dp attaches XDP to the kernel tap directly, so it needs the kernel name.
+fn resolve_iface(device: &str) -> String {
+    if std::path::Path::new(&format!("/sys/class/net/{device}")).exists() {
+        return device.to_string();
+    }
+    if let Some(n) = device
+        .strip_prefix("net_tap")
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        if n >= 2 {
+            return format!("dtapvf_{}", n - 2);
+        }
+    }
+    device.to_string()
+}
+
 /// Full detail record for a registered local interface (shadow of eBPF map state).
 #[derive(Clone)]
 struct IfaceRecord {
@@ -325,6 +346,13 @@ impl Control {
         total_mbps: u64,
         public_mbps: u64,
     ) -> anyhow::Result<()> {
+        // Resolve the device name to a kernel netdev. metalnet (in dpservice tap mode) claims a tap
+        // from its hardcoded pool dtapvf_N but sends the DPDK vdev name net_tap{N+2} over gRPC
+        // (dpservice's --vdev=net_tap{N+2},iface=dtapvf_N convention). We have no DPDK — only the
+        // kernel tap dtapvf_N — so translate net_tapX -> dtapvf_{X-2} when the literal name is
+        // absent. Names that already exist as netdevs (e.g. dtapvf_N sent directly) pass through.
+        let resolved = resolve_iface(device);
+        let device = resolved.as_str();
         let tap = crate::ifindex(device)
             .map_err(|e| anyhow::anyhow!("read ifindex for {device}: {e}"))?;
         let mac = crate::mac_of(device)?;
