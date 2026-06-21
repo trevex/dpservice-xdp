@@ -285,8 +285,16 @@ async fn main() -> anyhow::Result<()> {
                 gateway_ipv6,
             };
             let server = crate::pb::dpd_kironcore_server::DpdKironcoreServer::new(svc);
+            // gRPC health service (grpc.health.v1.Health) so the Kubernetes gRPC liveness probe
+            // passes — the empty service name "" reports Serving (what the probe checks by default).
+            // dpservice implements this; without it the probe SIGKILLs the pod every period.
+            let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+            health_reporter
+                .set_service_status("", tonic_health::ServingStatus::Serving)
+                .await;
             println!("serving DPDKironcore on {addr}");
             tonic::transport::Server::builder()
+                .add_service(health_service)
                 .add_service(server)
                 .serve(addr.parse()?)
                 .await?;
