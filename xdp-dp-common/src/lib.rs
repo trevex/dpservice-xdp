@@ -512,6 +512,11 @@ pub mod arp_nd {
     /// If [data,data_end) is an ICMPv6 Neighbor Solicitation for `gateway_ipv6`, rewrite it in place
     /// into a solicited Neighbor Advertisement from `reply_mac` and return true. Else false. Caller
     /// must have made ETH_LEN+IPV6_LEN+32 bytes writable. Unsafe: raw pointer writes.
+    ///
+    /// `#[inline(always)]`: the XDP `guest_tx` caller is stack-heavy (conntrack/nat/v6); keeping
+    /// this out-of-line makes it a separate BPF subprogram whose frame is summed with the caller's,
+    /// blowing the 512-byte BPF stack limit ("combined stack size of N calls too large").
+    #[inline(always)]
     pub unsafe fn try_write_nd_reply(
         data: usize,
         data_end: usize,
@@ -576,6 +581,10 @@ pub mod arp_nd {
     /// If [data,data_end) is an ARP request for `gateway_ipv4`, rewrite it in place into a reply
     /// from `reply_mac`/`gateway_ipv4` and return true. Else false (unchanged). Caller must have
     /// made the first ETH_LEN+ARP_LEN bytes writable. Unsafe: raw pointer writes.
+    ///
+    /// `#[inline(always)]` for the same BPF-stack reason as `try_write_nd_reply` (the XDP
+    /// `guest_tx` caller is stack-heavy).
+    #[inline(always)]
     pub unsafe fn try_write_arp_reply(
         data: usize,
         data_end: usize,
