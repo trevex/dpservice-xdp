@@ -456,6 +456,100 @@ mod user_impls {
     unsafe impl aya::Pod for DhcpMeta {}
 }
 
+/// Pure, host-tested ARP/ND responder byte-rewrites. The datapath glue (XDP and tc) supplies the
+/// gateway address + reply MAC (from maps) and ensures the header range is writable; these
+/// functions only read/rewrite bytes in [data, data_end). Mirrors the `dhcp` module.
+pub mod arp_nd {
+    pub const ETH_LEN: usize = 14;
+    pub const ETH_P_ARP: u16 = 0x0806;
+    pub const ARP_LEN: usize = 28; // opcode@6 sha@8 spa@14 tha@18 tpa@24
+
+    #[inline(always)]
+    unsafe fn write6(dst: *mut u8, src: &[u8; 6]) {
+        let mut i = 0;
+        while i < 6 {
+            *dst.add(i) = src[i];
+            i += 1;
+        }
+    }
+
+    /// If [data,data_end) is an ARP request for `gateway_ipv4`, rewrite it in place into a reply
+    /// from `reply_mac`/`gateway_ipv4` and return true. Else false (unchanged). Caller must have
+    /// made the first ETH_LEN+ARP_LEN bytes writable. Unsafe: raw pointer writes.
+    pub unsafe fn try_write_arp_reply(
+        data: usize,
+        data_end: usize,
+        gateway_ipv4: [u8; 4],
+        reply_mac: [u8; 6],
+    ) -> bool {
+        if data + ETH_LEN + ARP_LEN > data_end {
+            return false;
+        }
+        let p = data as *mut u8;
+        let ethertype = u16::from_be(core::ptr::read_unaligned(p.add(12) as *const u16));
+        if ethertype != ETH_P_ARP {
+            return false;
+        }
+        let arp = p.add(ETH_LEN);
+        let opcode = u16::from_be(core::ptr::read_unaligned(arp.add(6) as *const u16));
+        if opcode != 1 {
+            return false;
+        }
+        let tpa = core::ptr::read_unaligned(arp.add(24) as *const [u8; 4]);
+        if tpa != gateway_ipv4 {
+            return false;
+        }
+        let sender_mac = core::ptr::read_unaligned(arp.add(8) as *const [u8; 6]);
+        let spa = core::ptr::read_unaligned(arp.add(14) as *const [u8; 4]);
+        write6(p, &sender_mac);
+        write6(p.add(6), &reply_mac);
+        core::ptr::write_unaligned(arp.add(6) as *mut u16, 2u16.to_be());
+        write6(arp.add(8), &reply_mac);
+        core::ptr::write_unaligned(arp.add(14) as *mut [u8; 4], gateway_ipv4);
+        write6(arp.add(18), &sender_mac);
+        core::ptr::write_unaligned(arp.add(24) as *mut [u8; 4], spa);
+        true
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn rewrites_arp_request_to_reply() {
+            let mut f = [0u8; ETH_LEN + ARP_LEN];
+            f[0..6].copy_from_slice(&[0xff; 6]);
+            f[6..12].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 2]);
+            f[12..14].copy_from_slice(&ETH_P_ARP.to_be_bytes());
+            let a = ETH_LEN;
+            f[a + 6..a + 8].copy_from_slice(&1u16.to_be_bytes());
+            f[a + 8..a + 14].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 2]);
+            f[a + 14..a + 18].copy_from_slice(&[10, 0, 0, 2]);
+            f[a + 24..a + 28].copy_from_slice(&[10, 0, 0, 1]);
+            let data = f.as_mut_ptr() as usize;
+            let ok = unsafe {
+                try_write_arp_reply(data, data + f.len(), [10, 0, 0, 1], [0x66, 0, 0, 0, 0, 1])
+            };
+            assert!(ok);
+            assert_eq!(&f[0..6], &[0x52, 0x54, 0, 0, 0, 2]);
+            assert_eq!(&f[6..12], &[0x66, 0, 0, 0, 0, 1]);
+            assert_eq!(&f[a + 6..a + 8], &2u16.to_be_bytes());
+            assert_eq!(&f[a + 8..a + 14], &[0x66, 0, 0, 0, 0, 1]);
+            assert_eq!(&f[a + 14..a + 18], &[10, 0, 0, 1]);
+            assert_eq!(&f[a + 18..a + 24], &[0x52, 0x54, 0, 0, 0, 2]);
+            assert_eq!(&f[a + 24..a + 28], &[10, 0, 0, 2]);
+        }
+        #[test]
+        fn ignores_non_arp() {
+            let mut f = [0u8; ETH_LEN + ARP_LEN];
+            f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            let data = f.as_mut_ptr() as usize;
+            assert!(!unsafe {
+                try_write_arp_reply(data, data + f.len(), [10, 0, 0, 1], [0x66, 0, 0, 0, 0, 1])
+            });
+        }
+    }
+}
+
 /// Pure, host-testable DHCPv4 reply construction. The map-touching glue and the XDP entry stay in
 /// the eBPF crate; this module owns the wire-format constants, the request parse, and the byte
 /// writer so the produced bytes can be unit-tested off-target. Byte-for-byte identical to the
