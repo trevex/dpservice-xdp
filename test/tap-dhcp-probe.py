@@ -18,6 +18,7 @@
 # Run (inside the flake devShell, which provides python3+scapy): `make tap-dhcp-probe`, or
 #   nix develop -c ./test/tap-dhcp-probe.sh
 
+import argparse
 import fcntl
 import os
 import select
@@ -32,6 +33,70 @@ IFF_NO_PI = 0x1000
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = f"{REPO}/target/debug/xdp-dp"
+
+
+def open_tap_queue(name):
+    """Attach a held fd (a queue) to an EXISTING tap netdev. Unlike mk_tap(), this does not
+    create the device or bring it up — the caller (e.g. the tc gate) already did. Writing to this
+    fd injects toward the host RX path (tc clsact ingress fires); reading drains the tap egress
+    (where the responder's bpf_redirect-to-self delivers the OFFER)."""
+    fd = os.open("/dev/net/tun", os.O_RDWR)
+    fcntl.ioctl(fd, TUNSETIFF, struct.pack("16sH", name.encode(), IFF_TAP | IFF_NO_PI))
+    return fd
+
+
+def dhcp_discover_bytes(client_mac, xid=0x1234):
+    """Build a DHCP DISCOVER frame from a client MAC string (aa:bb:..)."""
+    from scapy.all import Ether, IP, UDP, BOOTP, DHCP
+    chaddr = bytes.fromhex(client_mac.replace(":", ""))
+    disc = (Ether(src=client_mac, dst="ff:ff:ff:ff:ff:ff") /
+            IP(src="0.0.0.0", dst="255.255.255.255") /
+            UDP(sport=68, dport=67) /
+            BOOTP(chaddr=chaddr, xid=xid) /
+            DHCP(options=[("message-type", "discover"), "end"]))
+    return bytes(disc)
+
+
+def await_offer(fd, timeout=3.0):
+    """Read frames off a tap fd until a DHCP OFFER (message-type 2) arrives or timeout. Returns
+    (scapy_packet, options_dict) or (None, {})."""
+    from scapy.all import Ether, BOOTP, DHCP
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.3)
+        if not r:
+            continue
+        data = os.read(fd, 2048)
+        p = Ether(data)
+        if BOOTP in p and DHCP in p:
+            o = {x[0]: x[1] for x in p[DHCP].options if isinstance(x, tuple)}
+            if o.get("message-type") == 2:  # OFFER
+                return p, o
+    return None, {}
+
+
+def client_only(tap, client_mac, expect_ip, timeout):
+    """Drive an ALREADY-RUNNING datapath: open a queue on `tap`, send one DISCOVER from
+    `client_mac`, and assert an OFFER for `expect_ip` comes back. Used by test/tc-dhcp-netns.sh."""
+    from scapy.all import BOOTP
+    fd = open_tap_queue(tap)
+    try:
+        disc = dhcp_discover_bytes(client_mac)
+        os.write(fd, disc)
+        print(f"sent DHCP DISCOVER ({len(disc)} bytes) from {client_mac} to tap {tap}")
+        offer, opts = await_offer(fd, timeout=timeout)
+    finally:
+        os.close(fd)
+    if offer is None:
+        print(f"RESULT: NO OFFER received on {tap} within {timeout}s")
+        return 1
+    yiaddr = offer[BOOTP].yiaddr
+    print(f"RESULT: OFFER received — yiaddr={yiaddr} dns={opts.get('name_server')} "
+          f"mtu={opts.get('interface-mtu')} ({len(bytes(offer))} bytes)")
+    if str(yiaddr) != expect_ip:
+        print(f"  but expected yiaddr {expect_ip}, got {yiaddr}")
+        return 1
+    return 0
 
 
 def mk_tap(name):
@@ -51,6 +116,20 @@ def mk_tap(name):
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--client-only", action="store_true",
+                    help="drive an already-running datapath on --tap (no bringup); used by the tc gate")
+    ap.add_argument("--tap", default=None, help="existing tap netdev (client-only mode)")
+    ap.add_argument("--client-mac", default="52:54:00:00:00:01")
+    ap.add_argument("--expect-ip", default="10.0.0.1")
+    ap.add_argument("--timeout", type=float, default=3.0)
+    args = ap.parse_args()
+    if args.client_only:
+        if not args.tap:
+            print("ERROR: --client-only requires --tap", file=sys.stderr)
+            return 2
+        return client_only(args.tap, args.client_mac, args.expect_ip, args.timeout)
+
     if not os.path.exists(BIN):
         print(f"ERROR: {BIN} missing — run: cargo build -p xdp-dp", file=sys.stderr)
         return 2

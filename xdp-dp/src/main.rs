@@ -976,6 +976,12 @@ async fn main() -> anyhow::Result<()> {
             let mut ebpf = loader::load_ebpf()?;
             loader::maybe_install_logger(&mut ebpf);
             let tap_ifindex = ifindex(&tap)?;
+            // Load (verify) + attach the tc programs BEFORE opening any map: the map `open()`
+            // helpers `take_map()` the map out of the loader, after which a later `prog.load()`
+            // can no longer bind the maps the program references ("fd N is not pointing to valid
+            // bpf_map"). This mirrors the XDP `Serve` ordering (attach/register, then open maps).
+            loader::attach_tc_clsact_ingress(&mut ebpf, "tc_guest_tx", &tap)?;
+            let _gpt = loader::register_guest_dhcp_tc(&mut ebpf)?; // hold in scope for the datapath lifetime
             let mut ports = maps::PortMetaMap::open(&mut ebpf)?;
             ports.upsert(
                 tap_ifindex,
@@ -1009,8 +1015,6 @@ async fn main() -> anyhow::Result<()> {
                 }
                 dhcp_config_map.set(&cfg)?;
             }
-            let _gpt = loader::register_guest_dhcp_tc(&mut ebpf)?; // hold in scope for the datapath lifetime
-            loader::attach_tc_clsact_ingress(&mut ebpf, "tc_guest_tx", &tap)?;
             println!("tc-bringup: tc_guest_tx on {tap} (ifindex {tap_ifindex}); ctrl-c to stop");
             let _ = gateway_mac; // reserved for the responder phase; accepted now to keep the arg list stable
             tokio::signal::ctrl_c().await?;

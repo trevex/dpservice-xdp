@@ -11,7 +11,9 @@ use aya_ebpf::{
 
 use crate::dhcp::{gather_dhcpv4_reply, learn_mac};
 use crate::maps::{GUEST_PROGS_TC, PORT_META};
-use xdp_dp_common::dhcp::{looks_like_dhcpv4, parse_dhcpv4_request, write_dhcpv4_reply, REPLY_LEN};
+use xdp_dp_common::dhcp::{
+    looks_like_dhcpv4, parse_dhcpv4_request, write_dhcpv4_reply, MIN_DHCP_LEN, REPLY_LEN,
+};
 
 // `aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_SHOT}` are already `i32` (the verdict type a
 // `#[classifier]` returns), so they're used directly below.
@@ -41,8 +43,12 @@ pub fn tc_guest_dhcp(ctx: TcContext) -> i32 {
         Some(m) => *m,
         None => return TC_ACT_OK,
     };
-    // Make the head writable/linear so parse + in-place build work on direct packet access.
-    if ctx.pull_data(REPLY_LEN as u32).is_err() {
+    // Make the request head writable/linear so the parse works on direct packet access. A DISCOVER
+    // is typically SHORTER than REPLY_LEN (e.g. ~286B vs 428B), so pulling REPLY_LEN here fails
+    // (bpf_skb_pull_data cannot pull past skb->len) and we'd bail before ever growing the skb.
+    // Pull only the fixed DHCP header (MIN_DHCP_LEN), which every valid request carries; the skb is
+    // grown to REPLY_LEN and re-pulled below, before the reply is written.
+    if ctx.pull_data(MIN_DHCP_LEN as u32).is_err() {
         return TC_ACT_OK;
     }
     let req = match parse_dhcpv4_request(ctx.data(), ctx.data_end()) {
