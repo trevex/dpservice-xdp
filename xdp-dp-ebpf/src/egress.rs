@@ -1,8 +1,8 @@
 use aya_ebpf::{bindings::xdp_action, programs::XdpContext};
-use xdp_dp_common::PortMeta;
+use xdp_dp_common::{PortMeta, RouteLpmData6};
 
 use crate::arp_nd::try_arp_reply;
-use crate::maps::{LOCAL, PORT_META, ROUTES, UNDERLAY};
+use crate::maps::{LOCAL, PORT_META, ROUTES, ROUTES6, UNDERLAY};
 use crate::parse::{write6, ETH_LEN, ETH_P_IP, IPV6_LEN};
 
 /// What the per-program glue should do after the in-place egress pipeline runs.
@@ -125,6 +125,54 @@ pub fn forward_decision_v4(
         nexthop_ipv6: route.nexthop_ipv6,
         inner_len,
         inner_proto: crate::parse::IPPROTO_IPIP,
+    })
+}
+
+/// IPv6-inner egress decision (route6 + local/encap). Map-driven; shared by XDP `v6_guest_tx` and
+/// tc. No NAT64 (caller runs that first on XDP), no resize. Caller verified ETH_LEN+IPV6_LEN present
+/// and ethertype==ETH_P_IPV6.
+#[inline(always)]
+pub fn forward_decision_v6(
+    data: usize,
+    data_end: usize,
+    _ifindex: u32,
+    meta: &PortMeta,
+) -> EgressVerdict {
+    let p = data as *const u8;
+    // inner IPv6 dst at ETH_LEN + 24
+    let dst = unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 24) as *const [u8; 16]) };
+    let route = match ROUTES6.get(&aya_ebpf::maps::lpm_trie::Key::new(
+        160,
+        RouteLpmData6 {
+            vni: meta.vni.to_be_bytes(),
+            ipv6: dst,
+        },
+    )) {
+        Some(r) => r,
+        None => return EgressVerdict::Pass,
+    };
+    // Local fast path: if the nexthop underlay is a LOCAL interface, deliver straight to that tap.
+    if let Some(u) = unsafe { UNDERLAY.get(&route.nexthop_ipv6) } {
+        if u.tap_ifindex != 0 {
+            return EgressVerdict::Local {
+                tap_ifindex: u.tap_ifindex,
+                guest_mac: u.guest_mac,
+            };
+        }
+    }
+    let inner_len = (data_end - data - ETH_LEN) as u16;
+    let local = match LOCAL.get(0) {
+        Some(l) => l,
+        None => return EgressVerdict::Pass,
+    };
+    EgressVerdict::Encap(EncapParams {
+        gateway_mac: local.gateway_mac,
+        uplink_mac: local.uplink_mac,
+        uplink_ifindex: local.uplink_ifindex,
+        src_underlay: meta.underlay_ipv6,
+        nexthop_ipv6: route.nexthop_ipv6,
+        inner_len,
+        inner_proto: crate::parse::IPPROTO_IPV6,
     })
 }
 
