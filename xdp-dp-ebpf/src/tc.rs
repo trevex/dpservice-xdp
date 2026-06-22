@@ -18,19 +18,67 @@ use xdp_dp_common::dhcp::{
 // `aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_SHOT}` are already `i32` (the verdict type a
 // `#[classifier]` returns), so they're used directly below.
 
-/// clsact-ingress on a guest tap: host receives = guest egress. DHCP is tail-called to keep
-/// verifier cost split, mirroring the XDP path. Phase 1 handles ONLY DHCP; forwarding/responders
-/// land in later phases (everything else → TC_ACT_OK passthrough).
+/// clsact-ingress on a guest tap: host receives = guest egress. ARP + IPv6 ND are answered
+/// in place (redirect back to guest); DHCP is tail-called. Everything else → TC_ACT_OK passthrough.
 #[classifier]
 pub fn tc_guest_tx(ctx: TcContext) -> i32 {
-    // `__sk_buff.ifindex` is the receiving device on tc ingress (guest tap).
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
-    if unsafe { PORT_META.get(&ifindex) }.is_none() {
+    let meta = match unsafe { PORT_META.get(&ifindex) } {
+        Some(m) => *m,
+        None => return TC_ACT_OK,
+    };
+    // Bounds-checked ethertype read (classification only).
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + 14 > data_end {
         return TC_ACT_OK;
     }
+    let ethertype = u16::from_be(unsafe {
+        core::ptr::read_unaligned((data as *const u8).add(12) as *const u16)
+    });
+
+    // ARP request for the gateway → reply in place, redirect back to the guest.
+    if ethertype == xdp_dp_common::arp_nd::ETH_P_ARP {
+        if ctx
+            .pull_data((xdp_dp_common::arp_nd::ETH_LEN + xdp_dp_common::arp_nd::ARP_LEN) as u32)
+            .is_ok()
+            && unsafe {
+                xdp_dp_common::arp_nd::try_write_arp_reply(
+                    ctx.data(),
+                    ctx.data_end(),
+                    meta.gateway_ipv4,
+                    meta.guest_mac,
+                )
+            }
+        {
+            return unsafe { bpf_redirect(ifindex, 0) as i32 };
+        }
+        return TC_ACT_OK;
+    }
+
+    // IPv6 → may be an ND Neighbor Solicitation for the gateway.
+    if ethertype == xdp_dp_common::arp_nd::ETH_P_IPV6 {
+        const ND_FRAME: usize =
+            xdp_dp_common::arp_nd::ETH_LEN + xdp_dp_common::arp_nd::IPV6_LEN + 32;
+        if ctx.pull_data(ND_FRAME as u32).is_ok()
+            && unsafe {
+                xdp_dp_common::arp_nd::try_write_nd_reply(
+                    ctx.data(),
+                    ctx.data_end(),
+                    meta.gateway_ipv6,
+                    meta.guest_mac,
+                )
+            }
+        {
+            return unsafe { bpf_redirect(ifindex, 0) as i32 };
+        }
+        // fall through (other IPv6, incl. DHCPv6 — handled in a later phase)
+    }
+
+    // DHCPv4 → tail-call the dedicated responder.
     if looks_like_dhcpv4(ctx.data(), ctx.data_end()) {
         let _ = unsafe { GUEST_PROGS_TC.tail_call(&ctx, xdp_dp_common::GUEST_PROG_DHCP) };
-        return TC_ACT_OK; // tail-call miss → pass (mirrors XDP_PASS)
+        return TC_ACT_OK;
     }
     TC_ACT_OK
 }
