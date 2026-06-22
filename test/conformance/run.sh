@@ -24,4 +24,9 @@ cd "$ROOT/test/conformance"
 TESTS="${CONF_TESTS:-test_vf_to_vf.py test_vf_to_pf.py test_pf_to_vf.py test_encap.py \
   test_arp.py test_ipv6_nd.py test_flows.py test_lb.py test_nat.py test_vni.py test_zzz_grpc.py \
   test_dhcpv4.py test_dhcpv6.py}"
-sudo "DPSERVICE_CLI=$CLI" "$PYBIN" -m pytest -q $TESTS --build-path="$ROOT" "$@"
+# `XDP_DP_GUEST_TC=1 ./run.sh` runs the suite against the tc (clsact) guest datapath instead of XDP
+# guest_tx; default (unset) stays XDP. Forwarded through sudo (which scrubs env) like DPSERVICE_CLI,
+# so the pytest process — and the serve sudo argv it builds (dp_service.py) — see it.
+GUEST_TC=()
+[ -n "${XDP_DP_GUEST_TC:-}" ] && GUEST_TC=("XDP_DP_GUEST_TC=$XDP_DP_GUEST_TC")
+sudo "DPSERVICE_CLI=$CLI" "${GUEST_TC[@]}" "$PYBIN" -m pytest -q $TESTS --build-path="$ROOT" "$@"
