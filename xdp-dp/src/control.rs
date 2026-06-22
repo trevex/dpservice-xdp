@@ -17,8 +17,8 @@ use crate::maps::{
 };
 
 /// The owned link for a guest interface's attached datapath program. Dropping either variant
-/// detaches the program from the device. The Xdp variant is the default (uplink + guest both XDP);
-/// the Tc variant is used for the guest edge when `XDP_DP_GUEST_TC` is set (uplink stays XDP).
+/// detaches the program from the device. The Tc variant (tc clsact on the guest tap) is the
+/// default; the Xdp variant is the legacy fallback (`XDP_DP_GUEST_TC=0`). The uplink is always XDP.
 enum GuestLink {
     Xdp(aya::programs::xdp::XdpLink),
     Tc(aya::programs::tc::SchedClassifierLink),
@@ -154,10 +154,10 @@ struct Inner {
     /// interface_id -> list of LB-prefix records (announce-only).
     lb_prefixes: HashMap<Vec<u8>, Vec<PrefixRecord>>,
     /// interface_id -> the owned guest datapath link (dropping it detaches the program).
-    /// Either an XDP link (default) or a tc clsact link when `guest_tc` is set.
+    /// Either a tc clsact link (default) or an XDP link when `guest_tc` is opted out.
     links: HashMap<Vec<u8>, GuestLink>,
-    /// When set (from `XDP_DP_GUEST_TC`), the guest edge is attached via tc clsact ingress
-    /// (`tc_guest_tx`) instead of XDP (`guest_tx`). The uplink stays XDP either way.
+    /// The guest edge is attached via tc clsact ingress (`tc_guest_tx`) by DEFAULT; set
+    /// `XDP_DP_GUEST_TC=0/false/no/off` to fall back to XDP (`guest_tx`). The uplink stays XDP either way.
     guest_tc: bool,
     /// (vni, prefix_ipv4, prefix_len, nexthop_vni, nexthop_underlay) for list/delete_route.
     routes_shadow: Vec<(u32, [u8; 4], u32, u32, [u8; 16])>,
@@ -182,11 +182,16 @@ impl Control {
         loader::maybe_install_logger(&mut ebpf);
         // The uplink RX path is always XDP, regardless of the guest edge attach mode.
         loader::attach_xdp(&mut ebpf, "uplink_rx", uplink)?;
-        // Guest edge attach mode: tc clsact when XDP_DP_GUEST_TC is set, else XDP. We pre-load the
+        // Guest edge attach mode: tc clsact is the DEFAULT (native XDP can't intercept guest egress
+        // on a vhost-backed tap — see the tc-BPF guest-edge design). Opt out to the legacy XDP
+        // guest_tx with XDP_DP_GUEST_TC=0/false/no/off (kept for regression testing). We pre-load the
         // guest program (and register its DHCP/NAT64 tail-call array) once here so that every
         // per-interface attach only needs attach() — the returned link is then always droppable on
         // teardown (no ghost attachment surviving an interface delete).
-        let guest_tc = std::env::var_os("XDP_DP_GUEST_TC").is_some();
+        let guest_tc = !matches!(
+            std::env::var("XDP_DP_GUEST_TC").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off"),
+        );
         let guest_progs = if guest_tc {
             // tc path: register_guest_dhcp_tc loads tc_guest_dhcp/tc_guest_nat64 into GUEST_PROGS_TC;
             // tc_guest_tx itself still needs a separate pre-load.
@@ -396,8 +401,8 @@ impl Control {
         // the caller explicitly supplies a preferred_underlay_route (see grpc.rs handler).
         // The guest program was pre-loaded in bring_up, so attach always succeeds and we get a
         // droppable link back — dropping it detaches the program on interface teardown. Use tc
-        // clsact ingress when XDP_DP_GUEST_TC is set, else XDP. (guest_tc lives on Inner alongside
-        // ebpf/links, so it's readable here under the same lock.)
+        // clsact ingress by default, or XDP when opted out (XDP_DP_GUEST_TC=0). (guest_tc lives on
+        // Inner alongside ebpf/links, so it's readable here under the same lock.)
         let link = if g.guest_tc {
             GuestLink::Tc(
                 loader::attach_tc_clsact_ingress_link(&mut g.ebpf, "tc_guest_tx", device)
