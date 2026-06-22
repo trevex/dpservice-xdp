@@ -17,6 +17,7 @@ mod meter;
 mod nat;
 mod nat64;
 mod parse;
+mod tc;
 mod v6;
 mod verdict;
 mod vip;

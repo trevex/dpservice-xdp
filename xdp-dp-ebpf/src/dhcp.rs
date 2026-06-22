@@ -18,7 +18,7 @@ use crate::parse::{write16, write6, ETH_LEN, ETH_P_IPV6, IPPROTO_UDP};
 /// immediately. The test suite sends REQUEST with a different Ethernet src than chaddr to verify
 /// that the datapath learns the actual L2 source address used by the VM.
 #[inline(always)]
-fn learn_mac(ifindex: u32, meta: &PortMeta, eth_src: [u8; 6]) {
+pub(crate) fn learn_mac(ifindex: u32, meta: &PortMeta, eth_src: [u8; 6]) {
     if eth_src != meta.guest_mac {
         let mut updated = *meta;
         updated.guest_mac = eth_src;
@@ -42,7 +42,7 @@ fn learn_mac(ifindex: u32, meta: &PortMeta, eth_src: [u8; 6]) {
 /// advertise the same), and the lease is infinite (0xffffffff) — both match the previous inline
 /// builder byte-for-byte. `ifindex` keys the per-interface DHCP_META (hostname) lookup.
 #[inline(always)]
-fn gather_dhcpv4_reply(
+pub(crate) fn gather_dhcpv4_reply(
     req: &xdp_dp_common::dhcp::Dhcpv4Request,
     meta: &PortMeta,
     ifindex: u32,

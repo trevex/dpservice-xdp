@@ -67,3 +67,9 @@ pub static DHCP_META: HashMap<u32, DhcpMeta> = HashMap::with_max_entries(1024, 0
 /// Phase 2 IPv4/IPv6 split without resizing.
 #[map]
 pub static GUEST_PROGS: ProgramArray = ProgramArray::with_max_entries(8, 0);
+
+/// Tail-call targets for the **tc** guest-edge split. Separate from `GUEST_PROGS` because a tc
+/// (classifier) program may only tail-call other tc programs. Populated by the loader with
+/// `tc_guest_dhcp` at `GUEST_PROG_DHCP`.
+#[map]
+pub static GUEST_PROGS_TC: ProgramArray = ProgramArray::with_max_entries(8, 0);
