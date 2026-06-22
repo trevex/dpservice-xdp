@@ -72,7 +72,54 @@ pub fn tc_guest_tx(ctx: TcContext) -> i32 {
         {
             return unsafe { bpf_redirect(ifindex, 0) as i32 };
         }
-        // fall through (other IPv6, incl. DHCPv6 — handled in a later phase)
+        // Not ND → IPv6 inner overlay egress (route6 → local or encap, proto 41).
+        let _ = ctx.pull_data((xdp_dp_common::arp_nd::ETH_LEN + crate::parse::IPV6_LEN) as u32);
+        if ctx.data() + xdp_dp_common::arp_nd::ETH_LEN + crate::parse::IPV6_LEN > ctx.data_end() {
+            return TC_ACT_OK;
+        }
+        match crate::egress::forward_decision_v6(ctx.data(), ctx.data_end(), ifindex, &meta) {
+            crate::egress::EgressVerdict::Pass => return TC_ACT_OK,
+            crate::egress::EgressVerdict::Drop => return TC_ACT_SHOT,
+            crate::egress::EgressVerdict::Local {
+                tap_ifindex,
+                guest_mac,
+            } => {
+                if ctx.data() + xdp_dp_common::arp_nd::ETH_LEN <= ctx.data_end() {
+                    let q = ctx.data() as *mut u8;
+                    unsafe {
+                        let g = guest_mac;
+                        let gw = crate::arp_nd::GW_MAC;
+                        let mut i = 0;
+                        while i < 6 {
+                            *q.add(i) = g[i];
+                            *q.add(6 + i) = gw[i];
+                            i += 1;
+                        }
+                        core::ptr::write_unaligned(q.add(12) as *mut u16, 0x86DDu16.to_be());
+                    }
+                    return unsafe { bpf_redirect(tap_ifindex, 0) as i32 };
+                }
+                return TC_ACT_OK;
+            }
+            crate::egress::EgressVerdict::Encap(e) => {
+                if ctx
+                    .adjust_room(crate::parse::IPV6_LEN as i32, BPF_ADJ_ROOM_MAC, 0)
+                    .is_err()
+                {
+                    return TC_ACT_OK;
+                }
+                if ctx
+                    .pull_data((xdp_dp_common::arp_nd::ETH_LEN + crate::parse::IPV6_LEN) as u32)
+                    .is_err()
+                {
+                    return TC_ACT_OK;
+                }
+                if unsafe { crate::encap::write_outer_v6(ctx.data(), ctx.data_end(), &e) } {
+                    return unsafe { bpf_redirect(e.uplink_ifindex, 0) as i32 };
+                }
+                return TC_ACT_SHOT;
+            }
+        }
     }
 
     // DHCPv4 → tail-call the dedicated responder.
