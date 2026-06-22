@@ -48,8 +48,14 @@ class DpService:
 		# XDP_DP_SKB_MODE=1: force generic XDP so the DHCP responder's bpf_xdp_adjust_tail growth
 		# works on the veth substrate (native veth XDP cannot grow frames). Passed inside the sudo
 		# arg list because sudo resets the environment. Production taps use native mode (default).
+		# The guest edge runs on tc/clsact by DEFAULT (so the suite exercises the tc datapath
+		# out of the box). Forward XDP_DP_GUEST_TC verbatim from the pytest env (sudo accepts
+		# VAR=val before the command) so XDP_DP_GUEST_TC=0 ./run.sh falls back to the legacy XDP
+		# guest_tx for regression testing.
+		_gtc = os.environ.get("XDP_DP_GUEST_TC")
+		guest_tc = f"XDP_DP_GUEST_TC={_gtc} " if _gtc is not None else ""
 		self.cmd = (
-			f"sudo XDP_DP_SKB_MODE=1 {self.build_path}/target/debug/xdp-dp serve"
+			f"sudo XDP_DP_SKB_MODE=1 {guest_tc}{self.build_path}/target/debug/xdp-dp serve"
 			f" --addr=127.0.0.1:{grpc_port}"
 			f" --uplink=xdtap0"
 			f" --local-underlay={local_ul_ipv6}"

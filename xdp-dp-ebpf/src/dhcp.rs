@@ -6,150 +6,23 @@ use aya_ebpf::{
 use xdp_dp_common::PortMeta;
 
 use crate::arp_nd::GW_MAC;
-use crate::parse::{write16, write6, ETH_LEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_UDP};
+use crate::parse::{write16, write6, ETH_LEN, ETH_P_IPV6, IPPROTO_UDP};
 
-const DHCP_MAGIC: u32 = 0x6382_5363;
-const OPT_PAD: u8 = 0;
-const OPT_END: u8 = 255;
-const OPT_MESSAGE_TYPE: u8 = 53;
-const OPT_LEASE_TIME: u8 = 51;
-const OPT_SERVER_ID: u8 = 54;
-const OPT_CLASSLESS_ROUTE: u8 = 121;
-const OPT_SUBNET_MASK: u8 = 1;
-const OPT_DNS: u8 = 6;
-const OPT_HOSTNAME: u8 = 12;
-const OPT_MTU: u8 = 26;
-const DHCP_MSG_DISCOVER: u8 = 1;
-const DHCP_MSG_REQUEST: u8 = 3;
-const DHCP_MSG_OFFER: u8 = 2;
-const DHCP_MSG_ACK: u8 = 5;
+// The DHCPv4 wire-format constants and the pure byte writer/parser now live in
+// `xdp_dp_common::dhcp` (host-testable). The glue below reads maps, learns MACs, and resizes the
+// frame; the byte construction is `xdp_dp_common::dhcp::write_dhcpv4_reply`.
 
-const F_BOOTP: usize = ETH_LEN + 20 + 8;
-const BOOTP_MAGIC_OFF: usize = 236;
-const BOOTP_OPTIONS_OFF: usize = 240;
-const F_OPTS: usize = F_BOOTP + BOOTP_OPTIONS_OFF;
-const MIN_DHCP_LEN: usize = F_OPTS;
-
-// Byte-by-byte scan: scan at most this many bytes (fixed stride of 1, verifier-safe)
-const OPTS_SCAN_BYTES: usize = 128;
-
-const O_MSGTYPE: usize = 0;
-const O_LEASE: usize = 3;
-const O_SERVERID: usize = 9;
-const O_CLASSLESS: usize = 15;
-const O_SUBNET: usize = 29;
-const O_MTU: usize = 35;
-const O_ROUTER: usize = 39;
-const O_DNS: usize = 45;
-const O_HOSTNAME: usize = 79;
-const OPT_BLOCK_MAX: usize = 146;
-const REPLY_LEN: usize = F_OPTS + OPT_BLOCK_MAX;
-
-/// In-datapath DHCPv4 responder.
-///
-/// Uses a byte-by-byte state machine (i always += 1) to parse options.
-/// This gives the BPF verifier a simple fixed-stride loop it can analyze correctly.
+/// MAC learning for the egress edge: if the request's Ethernet source differs from the cached
+/// `meta.guest_mac`, update PORT_META (keyed by ifindex), UNDERLAY (keyed by underlay IPv6), and
+/// INTERFACES (keyed by vni+ipv4) so the local fast path and ingress delivery use the new MAC
+/// immediately. The test suite sends REQUEST with a different Ethernet src than chaddr to verify
+/// that the datapath learns the actual L2 source address used by the VM.
 #[inline(always)]
-pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
-    let data = ctx.data();
-    let data_end = ctx.data_end();
-    if data + MIN_DHCP_LEN > data_end {
-        return None;
-    }
-    let p = data as *const u8;
-
-    let ethertype = u16::from_be(unsafe { core::ptr::read_unaligned(p.add(12) as *const u16) });
-    if ethertype != ETH_P_IP {
-        return None;
-    }
-    if unsafe { *p.add(ETH_LEN) } & 0x0f != 5 {
-        return None;
-    }
-    if unsafe { *p.add(ETH_LEN + 9) } != IPPROTO_UDP {
-        return None;
-    }
-    let udp_dst =
-        u16::from_be(unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 22) as *const u16) });
-    if udp_dst != 67 {
-        return None;
-    }
-    let magic = u32::from_be(unsafe {
-        core::ptr::read_unaligned(p.add(F_BOOTP + BOOTP_MAGIC_OFF) as *const u32)
-    });
-    if magic != DHCP_MAGIC {
-        return None;
-    }
-
-    // Byte-by-byte option state machine.
-    // sm_state: 0 = expect code, 1 = expect length, 2 = reading value bytes (counting down sm_remain)
-    // i always increments by 1 (fixed stride = verifier-friendly loop).
-    let mut msg_type: u8 = 0;
-    let mut sm_state: u8 = 0;
-    let mut _sm_code: u8 = 0;
-    let mut sm_remain: usize = 0;
-    let mut sm_is_msgtype: bool = false;
-
-    let mut i: usize = 0;
-    while i < OPTS_SCAN_BYTES {
-        let boff = data + F_OPTS + i;
-        if boff >= data_end {
-            break;
-        }
-        let b = unsafe { *(boff as *const u8) };
-        i += 1;
-
-        if sm_state == 0 {
-            // Expecting option code
-            if b == OPT_PAD {
-                // no-op
-            } else if b == OPT_END {
-                break;
-            } else {
-                _sm_code = b;
-                sm_is_msgtype = b == OPT_MESSAGE_TYPE;
-                sm_state = 1;
-            }
-        } else if sm_state == 1 {
-            // Expecting option length
-            sm_remain = b as usize;
-            if sm_remain == 0 {
-                sm_state = 0;
-            } else {
-                sm_state = 2;
-            }
-        } else {
-            // sm_state == 2: reading value bytes. MESSAGE_TYPE always has len=1, so the single
-            // value byte (sm_remain==1, before the decrement below) is the message type.
-            if sm_is_msgtype && sm_remain == 1 {
-                msg_type = b;
-            }
-            sm_remain -= 1;
-            if sm_remain == 0 {
-                sm_state = 0;
-            }
-        }
-    }
-
-    if msg_type != DHCP_MSG_DISCOVER && msg_type != DHCP_MSG_REQUEST {
-        return None;
-    }
-    let reply_type = if msg_type == DHCP_MSG_DISCOVER {
-        DHCP_MSG_OFFER
-    } else {
-        DHCP_MSG_ACK
-    };
-
-    let ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
-    // MAC learning: use the Ethernet source (bytes 6-11), not BOOTP chaddr.
-    // The test suite sends REQUEST with a different Ethernet src than chaddr to verify
-    // that the datapath learns the actual L2 source address used by the VM.
-    let eth_src = unsafe { core::ptr::read_unaligned(p.add(6) as *const [u8; 6]) };
+pub(crate) fn learn_mac(ifindex: u32, meta: &PortMeta, eth_src: [u8; 6]) {
     if eth_src != meta.guest_mac {
         let mut updated = *meta;
         updated.guest_mac = eth_src;
         let _ = crate::maps::PORT_META.insert(&ifindex, &updated, 0);
-        // Also update UNDERLAY (keyed by underlay IPv6) and INTERFACES (keyed by vni+ipv4)
-        // so the local fast path and ingress delivery use the new MAC immediately.
         if let Some(u) = unsafe { crate::maps::UNDERLAY.get(&meta.underlay_ipv6) } {
             let mut u2 = *u;
             u2.guest_mac = eth_src;
@@ -162,201 +35,74 @@ pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
             let _ = crate::maps::INTERFACES.insert(&ikey, &iv2, 0);
         }
     }
+}
 
-    let dhcp_cfg = crate::maps::DHCP_CONFIG.get(0);
-    let dhcp_meta = unsafe { crate::maps::DHCP_META.get(&ifindex) };
+/// Read DHCP_CONFIG/DHCP_META and assemble the resolved `Dhcpv4Reply` from the parsed request and
+/// the port's `meta`. The reply's Ethernet source is the synthetic GW_MAC (the ARP/ND responders
+/// advertise the same), and the lease is infinite (0xffffffff) — both match the previous inline
+/// builder byte-for-byte. `ifindex` keys the per-interface DHCP_META (hostname) lookup.
+#[inline(always)]
+pub(crate) fn gather_dhcpv4_reply(
+    req: &xdp_dp_common::dhcp::Dhcpv4Request,
+    meta: &PortMeta,
+    ifindex: u32,
+) -> xdp_dp_common::dhcp::Dhcpv4Reply {
+    let mut r = xdp_dp_common::dhcp::Dhcpv4Reply {
+        reply_type: req.reply_type,
+        client_mac: req.client_mac,
+        yiaddr: meta.guest_ipv4,
+        gateway_ipv4: meta.gateway_ipv4,
+        server_mac: GW_MAC,
+        xid_secs_flags: req.xid_secs_flags,
+        mtu: 1500,
+        dns: [[0u8; 4]; xdp_dp_common::DHCP_MAX_DNS],
+        dns_len: 0,
+        lease_secs: 0xffff_ffff,
+        hostname: [0u8; xdp_dp_common::dhcp::MAX_HOSTNAME],
+        hostname_len: 0,
+    };
 
-    let cur_len = data_end - data;
-    if cur_len != REPLY_LEN {
-        let delta: i32 = REPLY_LEN as i32 - cur_len as i32;
+    if let Some(cfg) = crate::maps::DHCP_CONFIG.get(0) {
+        r.mtu = cfg.mtu;
+        let dns_len = (cfg.dns4_len as usize).min(xdp_dp_common::DHCP_MAX_DNS);
+        let mut j = 0usize;
+        while j < dns_len {
+            r.dns[j] = cfg.dns4[j];
+            j += 1;
+        }
+        r.dns_len = dns_len as u8;
+    }
+
+    if let Some(dm) = unsafe { crate::maps::DHCP_META.get(&ifindex) } {
+        let hn_len = (dm.hostname_len as usize).min(xdp_dp_common::dhcp::MAX_HOSTNAME);
+        let mut k = 0usize;
+        while k < hn_len {
+            r.hostname[k] = dm.hostname[k];
+            k += 1;
+        }
+        r.hostname_len = hn_len as u8;
+    }
+    r
+}
+
+/// In-datapath DHCPv4 responder (XDP glue). Parses the DISCOVER/REQUEST (pure), learns the source
+/// MAC, gathers the reply from maps, resizes the frame to REPLY_LEN, then writes the reply bytes
+/// via the pure `write_dhcpv4_reply`. Returns `Some(XDP_TX)` on reply.
+#[inline(always)]
+pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
+    let req = xdp_dp_common::dhcp::parse_dhcpv4_request(ctx.data(), ctx.data_end())?;
+    let ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
+    learn_mac(ifindex, meta, req.client_mac);
+    let r = gather_dhcpv4_reply(&req, meta, ifindex);
+    let cur_len = ctx.data_end() - ctx.data();
+    if cur_len != xdp_dp_common::dhcp::REPLY_LEN {
+        let delta = xdp_dp_common::dhcp::REPLY_LEN as i32 - cur_len as i32;
         if unsafe { bpf_xdp_adjust_tail(ctx.ctx, delta) } != 0 {
             return None;
         }
     }
-    let data = ctx.data();
-    let data_end = ctx.data_end();
-    if data + REPLY_LEN > data_end {
-        return None;
-    }
-    let p = data as *mut u8;
-
-    // BOOTP header. Mirror dpservice's dhcp_node.c byte-for-byte: op=BOOTREPLY(2), yiaddr=assigned
-    // IP, siaddr+giaddr=the virtual gateway (server identity), chaddr=the client's L2 address (the
-    // original Ethernet source, still intact here — adjust_tail preserves the existing bytes and the
-    // Ethernet header is not rewritten until below). sname/file/options (from +44) are zeroed.
-    let client_mac = unsafe { core::ptr::read_unaligned(p.add(6) as *const [u8; 6]) };
-    let gw4 = meta.gateway_ipv4;
-    unsafe {
-        *p.add(F_BOOTP) = 2;
-        core::ptr::write_unaligned(p.add(F_BOOTP + 16) as *mut [u8; 4], meta.guest_ipv4); // yiaddr
-        core::ptr::write_unaligned(p.add(F_BOOTP + 20) as *mut [u8; 4], gw4); // siaddr
-        core::ptr::write_unaligned(p.add(F_BOOTP + 24) as *mut [u8; 4], gw4); // giaddr
-        write6(p.add(F_BOOTP + 28), &client_mac); // chaddr
-        core::ptr::write_bytes(p.add(F_BOOTP + 44), 0, 192);
-    }
-
-    let gw = meta.gateway_ipv4;
-    unsafe {
-        *p.add(F_OPTS + O_MSGTYPE) = OPT_MESSAGE_TYPE;
-        *p.add(F_OPTS + O_MSGTYPE + 1) = 1;
-        *p.add(F_OPTS + O_MSGTYPE + 2) = reply_type;
-        *p.add(F_OPTS + O_LEASE) = OPT_LEASE_TIME;
-        *p.add(F_OPTS + O_LEASE + 1) = 4;
-        *p.add(F_OPTS + O_LEASE + 2) = 0xff;
-        *p.add(F_OPTS + O_LEASE + 3) = 0xff;
-        *p.add(F_OPTS + O_LEASE + 4) = 0xff;
-        *p.add(F_OPTS + O_LEASE + 5) = 0xff;
-        *p.add(F_OPTS + O_SERVERID) = OPT_SERVER_ID;
-        *p.add(F_OPTS + O_SERVERID + 1) = 4;
-        *p.add(F_OPTS + O_SERVERID + 2) = gw[0];
-        *p.add(F_OPTS + O_SERVERID + 3) = gw[1];
-        *p.add(F_OPTS + O_SERVERID + 4) = gw[2];
-        *p.add(F_OPTS + O_SERVERID + 5) = gw[3];
-        *p.add(F_OPTS + O_CLASSLESS) = OPT_CLASSLESS_ROUTE;
-        *p.add(F_OPTS + O_CLASSLESS + 1) = 12;
-        *p.add(F_OPTS + O_CLASSLESS + 2) = 16;
-        *p.add(F_OPTS + O_CLASSLESS + 3) = 169;
-        *p.add(F_OPTS + O_CLASSLESS + 4) = 254;
-        *p.add(F_OPTS + O_CLASSLESS + 5) = 0;
-        *p.add(F_OPTS + O_CLASSLESS + 6) = 0;
-        *p.add(F_OPTS + O_CLASSLESS + 7) = 0;
-        *p.add(F_OPTS + O_CLASSLESS + 8) = 0;
-        *p.add(F_OPTS + O_CLASSLESS + 9) = 0;
-        *p.add(F_OPTS + O_CLASSLESS + 10) = gw[0];
-        *p.add(F_OPTS + O_CLASSLESS + 11) = gw[1];
-        *p.add(F_OPTS + O_CLASSLESS + 12) = gw[2];
-        *p.add(F_OPTS + O_CLASSLESS + 13) = gw[3];
-        *p.add(F_OPTS + O_SUBNET) = OPT_SUBNET_MASK;
-        *p.add(F_OPTS + O_SUBNET + 1) = 4;
-        *p.add(F_OPTS + O_SUBNET + 2) = 0xff;
-        *p.add(F_OPTS + O_SUBNET + 3) = 0xff;
-        *p.add(F_OPTS + O_SUBNET + 4) = 0xff;
-        *p.add(F_OPTS + O_SUBNET + 5) = 0xff;
-    }
-
-    let mtu: u16 = if let Some(cfg) = dhcp_cfg {
-        cfg.mtu
-    } else {
-        1500
-    };
-    unsafe {
-        *p.add(F_OPTS + O_MTU) = OPT_MTU;
-        *p.add(F_OPTS + O_MTU + 1) = 2;
-        core::ptr::write_unaligned(p.add(F_OPTS + O_MTU + 2) as *mut u16, mtu.to_be());
-        // dpservice emits the ROUTER(3) option only in PXE setups; the v4 path here has no PXE
-        // support (unlike the v6 path), so this slot is intentionally left as PAD. Reserved for a
-        // future v4-PXE branch.
-        core::ptr::write_bytes(p.add(F_OPTS + O_ROUTER), OPT_PAD, 6);
-    }
-
-    unsafe {
-        core::ptr::write_bytes(p.add(F_OPTS + O_DNS), OPT_PAD, 34);
-    }
-    if let Some(cfg) = dhcp_cfg {
-        let dns_len = (cfg.dns4_len as usize).min(xdp_dp_common::DHCP_MAX_DNS);
-        if dns_len > 0 {
-            unsafe {
-                *p.add(F_OPTS + O_DNS) = OPT_DNS;
-                *p.add(F_OPTS + O_DNS + 1) = (dns_len * 4) as u8;
-            }
-            let mut j = 0usize;
-            while j < dns_len {
-                let off = F_OPTS + O_DNS + 2 + j * 4;
-                unsafe {
-                    *p.add(off) = cfg.dns4[j][0];
-                    *p.add(off + 1) = cfg.dns4[j][1];
-                    *p.add(off + 2) = cfg.dns4[j][2];
-                    *p.add(off + 3) = cfg.dns4[j][3];
-                }
-                j += 1;
-            }
-        }
-    }
-
-    unsafe {
-        core::ptr::write_bytes(p.add(F_OPTS + O_HOSTNAME), OPT_PAD, 66);
-    }
-    if let Some(dm) = dhcp_meta {
-        let hn_len = (dm.hostname_len as usize).min(64);
-        if hn_len > 0 {
-            unsafe {
-                *p.add(F_OPTS + O_HOSTNAME) = OPT_HOSTNAME;
-                *p.add(F_OPTS + O_HOSTNAME + 1) = hn_len as u8;
-            }
-            let mut k = 0usize;
-            while k < hn_len {
-                unsafe {
-                    *p.add(F_OPTS + O_HOSTNAME + 2 + k) = dm.hostname[k];
-                }
-                k += 1;
-            }
-        }
-    }
-    unsafe {
-        *p.add(F_OPTS + OPT_BLOCK_MAX - 1) = OPT_END;
-    }
-
-    // Ethernet: dst = requester, src = the virtual gateway MAC. dpservice uses the port's own_mac
-    // here; this reimplementation deliberately uses the single synthetic GW_MAC that the ARP/ND
-    // responders also advertise, so the guest's neighbor table for the gateway stays coherent.
-    let req_eth_src = unsafe { core::ptr::read_unaligned(p.add(6) as *const [u8; 6]) };
-    unsafe {
-        write6(p, &req_eth_src);
-        write6(p.add(6), &GW_MAC);
-    }
-
-    let ip_total = (REPLY_LEN - ETH_LEN) as u16;
-    let vihl = unsafe { *p.add(ETH_LEN) };
-    let tos = unsafe { *p.add(ETH_LEN + 1) };
-    let ip_hdr: [u8; 20] = [
-        vihl,
-        tos,
-        (ip_total >> 8) as u8,
-        (ip_total & 0xff) as u8,
-        0,
-        0,
-        0,
-        0,
-        64,
-        IPPROTO_UDP,
-        0,
-        0,
-        meta.gateway_ipv4[0],
-        meta.gateway_ipv4[1],
-        meta.gateway_ipv4[2],
-        meta.gateway_ipv4[3],
-        255,
-        255,
-        255,
-        255,
-    ];
-    let mut s: u32 = 0;
-    s = s.wrapping_add(((ip_hdr[0] as u32) << 8) | ip_hdr[1] as u32);
-    s = s.wrapping_add(((ip_hdr[2] as u32) << 8) | ip_hdr[3] as u32);
-    s = s.wrapping_add(((ip_hdr[4] as u32) << 8) | ip_hdr[5] as u32);
-    s = s.wrapping_add(((ip_hdr[6] as u32) << 8) | ip_hdr[7] as u32);
-    s = s.wrapping_add(((ip_hdr[8] as u32) << 8) | ip_hdr[9] as u32);
-    s = s.wrapping_add(((ip_hdr[12] as u32) << 8) | ip_hdr[13] as u32);
-    s = s.wrapping_add(((ip_hdr[14] as u32) << 8) | ip_hdr[15] as u32);
-    s = s.wrapping_add(((ip_hdr[16] as u32) << 8) | ip_hdr[17] as u32);
-    s = s.wrapping_add(((ip_hdr[18] as u32) << 8) | ip_hdr[19] as u32);
-    s = (s & 0xffff) + (s >> 16);
-    s = (s & 0xffff) + (s >> 16);
-    let ip_csum = !(s as u16);
-    unsafe {
-        core::ptr::copy_nonoverlapping(ip_hdr.as_ptr(), p.add(ETH_LEN), 20);
-        core::ptr::write_unaligned(p.add(ETH_LEN + 10) as *mut u16, ip_csum.to_be());
-    }
-
-    let udp_len = (REPLY_LEN - ETH_LEN - 20) as u16;
-    unsafe {
-        core::ptr::write_unaligned(p.add(ETH_LEN + 20) as *mut u16, 67u16.to_be());
-        core::ptr::write_unaligned(p.add(ETH_LEN + 22) as *mut u16, 68u16.to_be());
-        core::ptr::write_unaligned(p.add(ETH_LEN + 24) as *mut u16, udp_len.to_be());
-        core::ptr::write_unaligned(p.add(ETH_LEN + 26) as *mut u16, 0u16);
-    }
-
-    Some(xdp_action::XDP_TX)
+    unsafe { xdp_dp_common::dhcp::write_dhcpv4_reply(ctx.data(), ctx.data_end(), &r) }?;
+    Some(crate::arp_nd::reflect(ctx))
 }
 
 // ──────────────────────── DHCPv6 responder ────────────────────────
@@ -1046,5 +792,458 @@ pub fn try_dhcpv6_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
     let udp_len = (real_opts_len + F6_OPTS - ETH_LEN - 40) as u16;
     let _ = d6_checksum(data, data_end, udp_len);
 
-    Some(xdp_action::XDP_TX)
+    Some(crate::arp_nd::reflect(ctx))
+}
+
+// ──────────────────────── DHCPv6 responder (tc / skb) ────────────────────────
+//
+// FALLBACK design (see task notes): the XDP responder above is left 100% untouched so the
+// conformance datapath is zero-risk. The functions below mirror its byte logic exactly, but use
+// the skb helpers (bpf_skb_load_bytes / bpf_skb_store_bytes / bpf_skb_change_tail) instead of the
+// xdp_md ones, because tc operates on a `__sk_buff`. The variable-offset reads/writes go through
+// the helpers for the same verifier reason as XDP (load/store_bytes bounds-check a runtime
+// (offset,len) in-kernel); fixed-offset access uses direct packet pointers.
+
+/// skb variant of `store`: copy `len` bytes from `buf` into the skb at byte `offset`.
+#[inline(always)]
+unsafe fn tc_store(
+    skb: *mut aya_ebpf::bindings::__sk_buff,
+    offset: usize,
+    buf: *const u8,
+    len: usize,
+) -> bool {
+    aya_ebpf::helpers::bpf_skb_store_bytes(
+        skb,
+        offset as u32,
+        buf as *const core::ffi::c_void,
+        len as u32,
+        0,
+    ) == 0
+}
+
+/// skb variant of `d6_store_url` (URL pieces, one small store_bytes each).
+/// skb variant of `d6_store_url`. Separate subprogram (mirrors XDP's `d6_store_url`) so the early
+/// `return 0` on a zero/oversized host length keeps each variable-length store's length bound
+/// provable to the verifier without spilling it across the emit path's many prior stores.
+#[inline(never)]
+fn tc_d6_store_url(
+    skb: *mut aya_ebpf::bindings::__sk_buff,
+    base: usize,
+    pxe_mode: u8,
+    dm: &xdp_dp_common::DhcpMeta,
+) -> usize {
+    let host_len = dm.pxe_host_len as usize;
+    if host_len == 0 || host_len > 46 {
+        return 0;
+    }
+    let scheme_ptr = if pxe_mode == PXE_TFTP {
+        TFTP_SCHEME.as_ptr()
+    } else {
+        HTTP_SCHEME.as_ptr()
+    };
+    let mut up = 0usize;
+    unsafe {
+        tc_store(skb, base + up, scheme_ptr, 7);
+        up += 7;
+        tc_store(skb, base + up, URL_LBRACKET.as_ptr(), 1);
+        up += 1;
+        tc_store(skb, base + up, dm.pxe_host.as_ptr(), host_len);
+        up += host_len;
+        tc_store(skb, base + up, URL_RBRACKET.as_ptr(), 2);
+        up += 2;
+        if pxe_mode == PXE_TFTP {
+            let path_len = TFTP_PATH.len();
+            tc_store(skb, base + up, TFTP_PATH.as_ptr(), path_len);
+            up += path_len;
+        } else {
+            let file_len = (dm.boot_filename_len as usize).min(64);
+            if file_len > 0 {
+                tc_store(skb, base + up, dm.boot_filename.as_ptr(), file_len);
+                up += file_len;
+            }
+        }
+    }
+    up
+}
+
+/// skb variant of `d6_parse`. Identical option walk; reads via bpf_skb_load_bytes.
+#[inline(never)]
+fn tc_d6_parse(skb: *mut aya_ebpf::bindings::__sk_buff, r: &mut D6Reply, n: usize) -> u32 {
+    let mut i: usize = 0;
+    let mut guard: u32 = 0;
+    while i + 4 <= n && i + 4 <= D6_SCAN && guard < 12 {
+        guard += 1;
+        let mut hb = [0u8; 4];
+        if unsafe {
+            aya_ebpf::helpers::bpf_skb_load_bytes(
+                skb as *const core::ffi::c_void,
+                (F6_OPTS + i) as u32,
+                hb.as_mut_ptr() as *mut core::ffi::c_void,
+                4,
+            )
+        } != 0
+        {
+            break;
+        }
+        let code = ((hb[0] as u16) << 8) | hb[1] as u16;
+        let olen = (((hb[2] as u16) << 8) | hb[3] as u16).min(D6_SCAN as u16);
+        let v = i + 4;
+
+        match code {
+            D6_OPT_RAPID_COMMIT => r.rapid_commit = true,
+            D6_OPT_USER_CLASS => {
+                if r.pxe_mode == PXE_NONE {
+                    r.pxe_mode = PXE_HTTP;
+                }
+            }
+            D6_OPT_IA_NA => {
+                let mut vb = [0u8; 4];
+                if unsafe {
+                    aya_ebpf::helpers::bpf_skb_load_bytes(
+                        skb as *const core::ffi::c_void,
+                        (F6_OPTS + v) as u32,
+                        vb.as_mut_ptr() as *mut core::ffi::c_void,
+                        4,
+                    )
+                } == 0
+                {
+                    r.iaid = u32::from_be_bytes(vb);
+                    r.got_iana = true;
+                }
+            }
+            D6_OPT_VENDOR_CLASS => {
+                let mut vb = [0u8; 4];
+                if unsafe {
+                    aya_ebpf::helpers::bpf_skb_load_bytes(
+                        skb as *const core::ffi::c_void,
+                        (F6_OPTS + v) as u32,
+                        vb.as_mut_ptr() as *mut core::ffi::c_void,
+                        4,
+                    )
+                } == 0
+                    && u32::from_be_bytes(vb) == PXE_ENTERPRISE
+                    && r.pxe_mode == PXE_NONE
+                {
+                    r.pxe_mode = PXE_TFTP;
+                }
+            }
+            D6_OPT_CLIENTID => {
+                r.got_clientid = true;
+                let dl = (olen as usize).min(D6_MAX_DUID);
+                r.duid_len = dl as u16;
+                let _ = unsafe {
+                    aya_ebpf::helpers::bpf_skb_load_bytes(
+                        skb as *const core::ffi::c_void,
+                        (F6_OPTS + v) as u32,
+                        r.duid.as_mut_ptr() as *mut core::ffi::c_void,
+                        D6_MAX_DUID as u32,
+                    )
+                };
+            }
+            _ => {}
+        }
+        i = v + olen as usize;
+    }
+    r.pxe_mode as u32
+}
+
+/// skb variant of `d6_emit`. Identical bytes; variable-offset writes via bpf_skb_store_bytes,
+/// fixed-offset writes via direct packet pointers (data/data_end passed in, post change_tail).
+#[inline(never)]
+fn tc_d6_emit(
+    skb: *mut aya_ebpf::bindings::__sk_buff,
+    data: usize,
+    data_end: usize,
+    meta: &PortMeta,
+    r: &D6Reply,
+) {
+    if data + D6_MAX_TOTAL > data_end {
+        return;
+    }
+    let ifindex = unsafe { (*skb).ifindex };
+    let dhcp_cfg = crate::maps::DHCP_CONFIG.get(0);
+    let dhcp_meta = unsafe { crate::maps::DHCP_META.get(&ifindex) };
+    let p = data as *mut u8;
+    let real_reply_len = r.real_reply_len as usize;
+
+    // ─── Ethernet ───
+    unsafe {
+        write6(p, &r.req_eth_src);
+        write6(p.add(6), &GW_MAC);
+        core::ptr::write_unaligned(p.add(12) as *mut u16, ETH_P_IPV6.to_be());
+    }
+
+    // ─── IPv6 ───
+    let ipv6_payload_len = (real_reply_len - ETH_LEN - 40) as u16;
+    unsafe {
+        core::ptr::write_unaligned(p.add(ETH_LEN + 4) as *mut u16, ipv6_payload_len.to_be());
+        *p.add(ETH_LEN + 6) = IPPROTO_UDP;
+        *p.add(ETH_LEN + 7) = 64;
+        write16(p.add(ETH_LEN + 8), &meta.gateway_ipv6);
+        write16(p.add(ETH_LEN + 24), &r.req_src6);
+    }
+
+    // ─── UDP ───
+    let udp_len = ipv6_payload_len;
+    unsafe {
+        core::ptr::write_unaligned(p.add(ETH_LEN + 40) as *mut u16, 547u16.to_be());
+        core::ptr::write_unaligned(p.add(ETH_LEN + 42) as *mut u16, 546u16.to_be());
+        core::ptr::write_unaligned(p.add(ETH_LEN + 44) as *mut u16, udp_len.to_be());
+        core::ptr::write_unaligned(p.add(ETH_LEN + 46) as *mut u16, 0u16);
+    }
+
+    // ─── DHCPv6 message header ───
+    unsafe {
+        *p.add(F6_DHCP) = r.reply_type;
+        *p.add(F6_DHCP + 1) = r.tid[0];
+        *p.add(F6_DHCP + 2) = r.tid[1];
+        *p.add(F6_DHCP + 3) = r.tid[2];
+    }
+
+    let duid_len_usize = (r.duid_len as usize).min(D6_MAX_DUID);
+    let mut off: usize = 0;
+
+    // ServerId: DUID-LL — constant offset, direct packet write.
+    unsafe {
+        core::ptr::write_unaligned(p.add(F6_OPTS + off) as *mut u16, D6_OPT_SERVERID.to_be());
+        core::ptr::write_unaligned(p.add(F6_OPTS + off + 2) as *mut u16, 10u16.to_be());
+        core::ptr::write_unaligned(p.add(F6_OPTS + off + 4) as *mut u16, DUID_LL_TYPE.to_be());
+        core::ptr::write_unaligned(
+            p.add(F6_OPTS + off + 6) as *mut u16,
+            DP_DHCPV6_HW_ID.to_be(),
+        );
+        write6(p.add(F6_OPTS + off + 8), &meta.guest_mac);
+    }
+    off += 14;
+
+    // ClientId: echo the client's DUID (off still constant 14 here).
+    if r.got_clientid && duid_len_usize > 0 {
+        unsafe {
+            core::ptr::write_unaligned(p.add(F6_OPTS + off) as *mut u16, D6_OPT_CLIENTID.to_be());
+            core::ptr::write_unaligned(
+                p.add(F6_OPTS + off + 2) as *mut u16,
+                (duid_len_usize as u16).to_be(),
+            );
+        }
+        let duid_ptr = r.duid.as_ptr();
+        let mut di = 0usize;
+        while di < duid_len_usize && di < D6_MAX_DUID {
+            unsafe {
+                *p.add(F6_OPTS + off + 4 + di) = *duid_ptr.add(di);
+            }
+            di += 1;
+        }
+        off += 4 + duid_len_usize;
+    }
+
+    // From here `off` is runtime-variable → store_bytes.
+    let mut hdr = [0u8; 4];
+
+    if r.got_iana {
+        let iaid_be = r.iaid.to_be_bytes();
+        unsafe {
+            tc_store(skb, F6_OPTS + off, IA_TEMPLATE.as_ptr(), 50);
+            tc_store(skb, F6_OPTS + off + 4, iaid_be.as_ptr(), 4);
+            tc_store(skb, F6_OPTS + off + 20, meta.guest_ipv6.as_ptr(), 16);
+        }
+        off += 50;
+    }
+
+    if r.rapid_commit {
+        unsafe {
+            tc_store(skb, F6_OPTS + off, RC_OPT.as_ptr(), 4);
+        }
+        off += 4;
+    }
+
+    let dns6_count = (r.dns6_count as usize).min(D6_MAX_DNS);
+    if dns6_count > 0 {
+        if let Some(cfg) = dhcp_cfg {
+            let dns_data_len = (dns6_count as u16) * 16;
+            hdr[0..2].copy_from_slice(&D6_OPT_DNS.to_be_bytes());
+            hdr[2..4].copy_from_slice(&dns_data_len.to_be_bytes());
+            unsafe {
+                tc_store(skb, F6_OPTS + off, hdr.as_ptr(), 4);
+            }
+            let dns6_ptr = cfg.dns6.as_ptr();
+            let mut di = 0usize;
+            while di < dns6_count {
+                unsafe {
+                    tc_store(
+                        skb,
+                        F6_OPTS + off + 4 + di * 16,
+                        dns6_ptr.add(di) as *const u8,
+                        16,
+                    );
+                }
+                di += 1;
+            }
+            off += 4 + dns6_count * 16;
+        }
+    }
+
+    if r.url_len as usize > 0 {
+        if let Some(dm) = dhcp_meta {
+            hdr[0..2].copy_from_slice(&D6_OPT_BOOT_FILE.to_be_bytes());
+            hdr[2..4].copy_from_slice(&r.url_len.to_be_bytes());
+            unsafe {
+                tc_store(skb, F6_OPTS + off, hdr.as_ptr(), 4);
+                // Separate #[inline(never)] subprogram: its tight `return 0` on a zero/oversized
+                // host_len keeps each variable-length store_bytes' length bound provable locally
+                // (inlining lost the bound across the many preceding stores → "zero-sized read").
+                let written = tc_d6_store_url(skb, F6_OPTS + off + 4, r.pxe_mode, dm);
+                off += 4 + written;
+            }
+        }
+    }
+    let _ = off;
+
+    // Zero the single odd-length pad byte (see d6_emit).
+    unsafe {
+        tc_store(skb, real_reply_len, ZERO1.as_ptr(), 1);
+    }
+}
+
+/// In-datapath DHCPv6 responder for tc. Mirrors `try_dhcpv6_reply` but resizes the skb with
+/// `bpf_skb_change_tail` (absolute length) + `pull_data` to make the head writable, and reads
+/// `ifindex` from the `__sk_buff`. Returns `true` if a reply was built into the skb.
+#[inline(always)]
+pub fn tc_dhcpv6_respond(ctx: &aya_ebpf::programs::TcContext, meta: &PortMeta) -> bool {
+    let skb = ctx.skb.skb;
+    // Pull the fixed DHCPv6 header so the detection + initial fields are on direct packet access.
+    if ctx.pull_data(MIN_D6_LEN as u32).is_err() {
+        return false;
+    }
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + MIN_D6_LEN > data_end {
+        return false;
+    }
+    let p = data as *const u8;
+
+    let ethertype = u16::from_be(unsafe { core::ptr::read_unaligned(p.add(12) as *const u16) });
+    if ethertype != ETH_P_IPV6 {
+        return false;
+    }
+    if unsafe { *p.add(ETH_LEN + 6) } != IPPROTO_UDP {
+        return false;
+    }
+    let udp_dst =
+        u16::from_be(unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 40 + 2) as *const u16) });
+    if udp_dst != 547 {
+        return false;
+    }
+
+    let msg_type = unsafe { *p.add(F6_DHCP) };
+    if msg_type != D6_SOLICIT && msg_type != D6_REQUEST && msg_type != D6_CONFIRM {
+        return false;
+    }
+
+    let mut r = D6Reply {
+        got_clientid: false,
+        duid: [0u8; D6_MAX_DUID],
+        duid_len: 0,
+        got_iana: false,
+        iaid: 0,
+        rapid_commit: false,
+        pxe_mode: PXE_NONE,
+        reply_type: D6_REPLY,
+        tid: [
+            unsafe { *p.add(F6_DHCP + 1) },
+            unsafe { *p.add(F6_DHCP + 2) },
+            unsafe { *p.add(F6_DHCP + 3) },
+        ],
+        dns6_count: 0,
+        url_len: 0,
+        real_reply_len: 0,
+        req_src6: unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 8) as *const [u8; 16]) },
+        req_eth_src: unsafe { core::ptr::read_unaligned(p.add(6) as *const [u8; 6]) },
+    };
+
+    // Real option-byte count from the skb's total length, captured before the grow.
+    let cur_len = (data_end - data) as usize;
+    let skb_len = unsafe { (*skb).len } as usize;
+    let opts_avail = if skb_len > F6_OPTS {
+        skb_len - F6_OPTS
+    } else {
+        0
+    };
+    let n = if opts_avail < D6_SCAN {
+        opts_avail
+    } else {
+        D6_SCAN
+    };
+
+    // Parse options (reads via skb load_bytes, which can read the whole skb regardless of how much
+    // is currently in the linear head).
+    r.pxe_mode = tc_d6_parse(skb, &mut r, n) as u8;
+
+    r.reply_type = if msg_type == D6_SOLICIT && !r.rapid_commit {
+        D6_ADVERTISE
+    } else {
+        D6_REPLY
+    };
+
+    // Config-derived option sizes.
+    let ifindex = unsafe { (*skb).ifindex };
+    let dhcp_cfg = crate::maps::DHCP_CONFIG.get(0);
+    let dhcp_meta = unsafe { crate::maps::DHCP_META.get(&ifindex) };
+
+    let dns6_count = if let Some(cfg) = dhcp_cfg {
+        (cfg.dns6_len as usize).min(D6_MAX_DNS)
+    } else {
+        0
+    };
+    r.dns6_count = dns6_count as u16;
+
+    let url_len = if r.pxe_mode != PXE_NONE {
+        if let Some(dm) = dhcp_meta {
+            d6_url_len(r.pxe_mode, dm).min(D6_MAX_URL)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    r.url_len = url_len as u16;
+
+    let duid_len_usize = (r.duid_len as usize).min(D6_MAX_DUID);
+    let real_opts_len: usize =
+        (14 + if r.got_clientid && duid_len_usize > 0 {
+            4 + duid_len_usize
+        } else {
+            0
+        } + if r.got_iana { 50 } else { 0 }
+            + if r.rapid_commit { 4 } else { 0 }
+            + if dns6_count > 0 {
+                4 + dns6_count * 16
+            } else {
+                0
+            }
+            + if url_len > 0 { 4 + url_len } else { 0 })
+        .min(D6_MAX_OPTS);
+    r.real_reply_len = (F6_OPTS + real_opts_len) as u16;
+
+    // Grow (or shrink) the skb to the MAX reply size so all emit/checksum accesses use one constant
+    // bounds check, then re-pull to make the head writable. change_tail takes an ABSOLUTE length.
+    if cur_len != D6_MAX_TOTAL
+        && unsafe { aya_ebpf::helpers::bpf_skb_change_tail(skb, D6_MAX_TOTAL as u32, 0) } != 0
+    {
+        return false;
+    }
+    if ctx.pull_data(D6_MAX_TOTAL as u32).is_err() {
+        return false;
+    }
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+
+    tc_d6_emit(skb, data, data_end, meta, &r);
+    // Re-derive the packet bounds: across the tc_d6_emit call the verifier spills/reloads `data` and
+    // `data_end` as plain scalars, so passing them on to d6_checksum trips "invalid mem access
+    // 'scalar'". Fresh ctx.data()/data_end() restore them as packet pointers.
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    let udp_len = (real_opts_len + F6_OPTS - ETH_LEN - 40) as u16;
+    let _ = d6_checksum(data, data_end, udp_len);
+    true
 }

@@ -12,9 +12,17 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
+tonic-health = "0.12"
 prost = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
+env_logger = "0.11"
+
+[features]
+# Build a debug image: compiles the eBPF crate with its `debug` feature (dlog!/aya-log) via
+# build.rs. At runtime, set XDP_DP_DEBUG=1 so the loader installs the EbpfLogger drain; without
+# that env the EbpfLogger is not started (the AYA_LOGS map is also absent in non-debug images).
+debug = []
 
 [build-dependencies]
 anyhow = { workspace = true }

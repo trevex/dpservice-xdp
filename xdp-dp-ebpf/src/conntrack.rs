@@ -1,4 +1,4 @@
-use aya_ebpf::{helpers::bpf_ktime_get_ns, programs::XdpContext};
+use aya_ebpf::helpers::bpf_ktime_get_ns;
 use xdp_dp_common::{
     CtEntry, CtKey, CT_REWRITE_SRC, TCP_ESTABLISHED, TCP_FINWAIT, TCP_NEW_SYN, TCP_NEW_SYNACK,
     TCP_RST_FIN,
@@ -55,15 +55,13 @@ pub fn ct_key(data: usize, data_end: usize, ip_off: usize, vni: u32) -> Option<C
 /// mid-function. All L4 offsets are constants (ip_off + 20 = ETH_LEN + 20 = 34 is fixed), so
 /// the verifier can check every access against known bounds without variable-offset pkt pointers.
 #[inline(always)]
-pub fn ct_apply(ctx: &XdpContext, ip_off: usize, e: &CtEntry) {
+pub fn ct_apply(data: usize, data_end: usize, ip_off: usize, e: &CtEntry) {
     // DEFAULT (flag-less) entries carry no translation — never rewrite, or we'd null the address.
     if e.flags & (xdp_dp_common::CT_REWRITE_SRC | xdp_dp_common::CT_REWRITE_DST) == 0 {
         return;
     }
-    // Re-fetch bounds: after CONNTRACK.get() (a helper call) the verifier resets pkt-range
-    // tracking, so we must re-establish it here.
-    let data = ctx.data();
-    let data_end = ctx.data_end();
+    // data/data_end are passed by the caller after any preceding helper calls so the verifier's
+    // pkt-range tracking is already re-established at the call site.
     let p = data as *mut u8;
 
     // Only handle standard 20-byte IP headers (IHL == 5).
@@ -216,9 +214,9 @@ pub fn tcp_advance(state: u8, flags: u8) -> u8 {
 
 /// Refresh last_seen (and TCP state for TCP) on a matched entry, writing it back.
 #[inline(always)]
-pub fn ct_touch(ctx: &XdpContext, ip_off: usize, key: &CtKey, e: &mut CtEntry) {
+pub fn ct_touch(data: usize, data_end: usize, ip_off: usize, key: &CtKey, e: &mut CtEntry) {
     e.last_seen = now();
-    if let Some(fl) = crate::parse::tcp_flags(ctx.data(), ctx.data_end(), ip_off) {
+    if let Some(fl) = crate::parse::tcp_flags(data, data_end, ip_off) {
         e.tcp_state = tcp_advance(e.tcp_state, fl);
     }
     let _ = crate::maps::CONNTRACK.insert(key, e, 0);
@@ -242,8 +240,8 @@ pub fn invert_key(k: &CtKey) -> CtKey {
 /// tracked (firewall + aging see it). Records last_seen + initial TCP state. Also pre-seeds the
 /// reverse-direction entry so return traffic is immediately recognised as established.
 #[inline(always)]
-pub fn ct_ensure_default(ctx: &XdpContext, ip_off: usize, key: &CtKey) {
-    let tcp = crate::parse::tcp_flags(ctx.data(), ctx.data_end(), ip_off)
+pub fn ct_ensure_default(data: usize, data_end: usize, ip_off: usize, key: &CtKey) {
+    let tcp = crate::parse::tcp_flags(data, data_end, ip_off)
         .map(|fl| tcp_advance(0, fl))
         .unwrap_or(0);
     let e = CtEntry {

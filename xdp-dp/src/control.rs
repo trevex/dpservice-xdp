@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
-use aya::programs::xdp::XdpLink;
 use aya::Ebpf;
 use xdp_dp_common::{
     CtKey, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue, LbKey, LbValue, Local, MaglevKey,
@@ -16,6 +15,35 @@ use crate::maps::{
     Conntrack, DhcpConfigMap, DhcpMetaMap, FwMetaMap, FwRules, Interfaces, Lb, LocalMap, Maglev,
     Meter, Nat, NatIps, NeighborNat, NeighborNatCount, PortMetaMap, Routes, Routes6, Vips,
 };
+
+/// The owned link for a guest interface's attached datapath program. Dropping either variant
+/// detaches the program from the device. The Tc variant (tc clsact on the guest tap) is the
+/// default; the Xdp variant is the legacy fallback (`XDP_DP_GUEST_TC=0`). The uplink is always XDP.
+enum GuestLink {
+    Xdp(aya::programs::xdp::XdpLink),
+    Tc(aya::programs::tc::SchedClassifierLink),
+}
+
+/// Resolve a gRPC `device_name` to an actual kernel netdev name.
+///
+/// If `device` already exists under `/sys/class/net`, it is used verbatim. Otherwise, if it is a
+/// dpservice DPDK vdev name `net_tap<N>` (N >= 2), it is translated to the kernel tap `dtapvf_<N-2>`
+/// — the `--vdev=net_tap{N+2},iface=dtapvf_N` naming dpservice used and that metalnet sends over
+/// gRPC. xdp-dp attaches XDP to the kernel tap directly, so it needs the kernel name.
+fn resolve_iface(device: &str) -> String {
+    if std::path::Path::new(&format!("/sys/class/net/{device}")).exists() {
+        return device.to_string();
+    }
+    if let Some(n) = device
+        .strip_prefix("net_tap")
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        if n >= 2 {
+            return format!("dtapvf_{}", n - 2);
+        }
+    }
+    device.to_string()
+}
 
 /// Full detail record for a registered local interface (shadow of eBPF map state).
 #[derive(Clone)]
@@ -125,8 +153,12 @@ struct Inner {
     fw: HashMap<u32, Vec<(Vec<u8>, FwRule)>>,
     /// interface_id -> list of LB-prefix records (announce-only).
     lb_prefixes: HashMap<Vec<u8>, Vec<PrefixRecord>>,
-    /// interface_id -> the owned guest_tx XDP link (dropping it detaches the program).
-    links: HashMap<Vec<u8>, XdpLink>,
+    /// interface_id -> the owned guest datapath link (dropping it detaches the program).
+    /// Either a tc clsact link (default) or an XDP link when `guest_tc` is opted out.
+    links: HashMap<Vec<u8>, GuestLink>,
+    /// The guest edge is attached via tc clsact ingress (`tc_guest_tx`) by DEFAULT; set
+    /// `XDP_DP_GUEST_TC=0/false/no/off` to fall back to XDP (`guest_tx`). The uplink stays XDP either way.
+    guest_tc: bool,
     /// (vni, prefix_ipv4, prefix_len, nexthop_vni, nexthop_underlay) for list/delete_route.
     routes_shadow: Vec<(u32, [u8; 4], u32, u32, [u8; 16])>,
     /// IPv6 routes shadow (vni, prefix_ipv6, prefix_len, nexthop_vni, nexthop_underlay).
@@ -147,13 +179,30 @@ impl Control {
         underlay_ipv6: [u8; 16],
     ) -> anyhow::Result<Self> {
         let mut ebpf = loader::load_ebpf()?;
+        loader::maybe_install_logger(&mut ebpf);
+        // The uplink RX path is always XDP, regardless of the guest edge attach mode.
         loader::attach_xdp(&mut ebpf, "uplink_rx", uplink)?;
-        // Pre-load guest_tx so that every subsequent attach_xdp_link call only needs attach(),
-        // not load() + attach(). This ensures the first interface's link is always retained and
-        // can be dropped on detach (no "XDP program stays attached after delete" ghost).
-        loader::load_program(&mut ebpf, "guest_tx")?;
-        // Load guest_dhcp and wire it into GUEST_PROGS so guest_tx's DHCP tail call resolves.
-        let guest_progs = loader::register_guest_dhcp(&mut ebpf)?;
+        // Guest edge attach mode: tc clsact is the DEFAULT (native XDP can't intercept guest egress
+        // on a vhost-backed tap — see the tc-BPF guest-edge design). Opt out to the legacy XDP
+        // guest_tx with XDP_DP_GUEST_TC=0/false/no/off (kept for regression testing). We pre-load the
+        // guest program (and register its DHCP/NAT64 tail-call array) once here so that every
+        // per-interface attach only needs attach() — the returned link is then always droppable on
+        // teardown (no ghost attachment surviving an interface delete).
+        let guest_tc = !matches!(
+            std::env::var("XDP_DP_GUEST_TC").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off"),
+        );
+        let guest_progs = if guest_tc {
+            // tc path: register_guest_dhcp_tc loads tc_guest_dhcp/tc_guest_nat64 into GUEST_PROGS_TC;
+            // tc_guest_tx itself still needs a separate pre-load.
+            let progs = loader::register_guest_dhcp_tc(&mut ebpf)?;
+            loader::load_program_tc(&mut ebpf, "tc_guest_tx")?;
+            progs
+        } else {
+            // XDP path: pre-load guest_tx, then wire guest_dhcp into GUEST_PROGS for its tail call.
+            loader::load_program(&mut ebpf, "guest_tx")?;
+            loader::register_guest_dhcp(&mut ebpf)?
+        };
         let mut locals = LocalMap::open(&mut ebpf)?;
         locals.set(&Local {
             uplink_ifindex,
@@ -211,6 +260,7 @@ impl Control {
                 fw: HashMap::new(),
                 lb_prefixes: HashMap::new(),
                 links: HashMap::new(),
+                guest_tc,
                 routes_shadow: Vec::new(),
                 routes6_shadow: Vec::new(),
                 learned_macs: HashMap::new(),
@@ -325,6 +375,13 @@ impl Control {
         total_mbps: u64,
         public_mbps: u64,
     ) -> anyhow::Result<()> {
+        // Resolve the device name to a kernel netdev. metalnet (in dpservice tap mode) claims a tap
+        // from its hardcoded pool dtapvf_N but sends the DPDK vdev name net_tap{N+2} over gRPC
+        // (dpservice's --vdev=net_tap{N+2},iface=dtapvf_N convention). We have no DPDK — only the
+        // kernel tap dtapvf_N — so translate net_tapX -> dtapvf_{X-2} when the literal name is
+        // absent. Names that already exist as netdevs (e.g. dtapvf_N sent directly) pass through.
+        let resolved = resolve_iface(device);
+        let device = resolved.as_str();
         let tap = crate::ifindex(device)
             .map_err(|e| anyhow::anyhow!("read ifindex for {device}: {e}"))?;
         let mac = crate::mac_of(device)?;
@@ -342,10 +399,21 @@ impl Control {
         }
         // NOTE: preferred underlay collision is NOT checked here; it is checked only when
         // the caller explicitly supplies a preferred_underlay_route (see grpc.rs handler).
-        // guest_tx was pre-loaded in bring_up, so attach_xdp_link always succeeds and we always
-        // get a droppable link back — dropping it detaches the program on interface teardown.
-        let link = loader::attach_xdp_link(&mut g.ebpf, "guest_tx", device)
-            .with_context(|| format!("load+attach guest_tx to {device}"))?;
+        // The guest program was pre-loaded in bring_up, so attach always succeeds and we get a
+        // droppable link back — dropping it detaches the program on interface teardown. Use tc
+        // clsact ingress by default, or XDP when opted out (XDP_DP_GUEST_TC=0). (guest_tc lives on
+        // Inner alongside ebpf/links, so it's readable here under the same lock.)
+        let link = if g.guest_tc {
+            GuestLink::Tc(
+                loader::attach_tc_clsact_ingress_link(&mut g.ebpf, "tc_guest_tx", device)
+                    .with_context(|| format!("attach tc_guest_tx to {device}"))?,
+            )
+        } else {
+            GuestLink::Xdp(
+                loader::attach_xdp_link(&mut g.ebpf, "guest_tx", device)
+                    .with_context(|| format!("load+attach guest_tx to {device}"))?,
+            )
+        };
         g.links.insert(interface_id.to_vec(), link);
         g.by_id.insert(
             interface_id.to_vec(),

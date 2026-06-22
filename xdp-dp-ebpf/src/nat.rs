@@ -1,4 +1,3 @@
-use aya_ebpf::programs::XdpContext;
 use xdp_dp_common::{CtEntry, CtKey, NatKey, NeighborNatEntry, NB_MAX_ENTRIES};
 
 use crate::csum::csum_replace4;
@@ -24,12 +23,16 @@ fn csum_replace2(check: u16, old: u16, new: u16) -> u16 {
 /// src IP -> nat_ip and the L4 src port / ICMP id -> nat_port (+checksums), and pin forward +
 /// reverse conntrack. Returns true if the packet was NAT'd.
 #[inline(always)]
-pub fn nat_snat_egress(ctx: &XdpContext, ip_off: usize, vni: u32, is_external: bool) -> bool {
+pub fn nat_snat_egress(
+    data: usize,
+    data_end: usize,
+    ip_off: usize,
+    vni: u32,
+    is_external: bool,
+) -> bool {
     if !is_external {
         return false;
     }
-    let data = ctx.data();
-    let data_end = ctx.data_end();
     if data + ip_off + 20 > data_end {
         return false;
     }

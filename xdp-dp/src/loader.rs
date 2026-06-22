@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use aya::maps::{MapData, ProgramArray};
-use aya::programs::{ProgramFd, Xdp, XdpFlags};
+use aya::programs::{tc, ProgramFd, SchedClassifier, TcAttachType, Xdp, XdpFlags};
 use aya::Ebpf;
 
 /// Load the eBPF object that aya-build compiled to bpfel and placed in OUT_DIR.
@@ -44,12 +44,42 @@ pub fn load_ebpf() -> anyhow::Result<Ebpf> {
     loader.load(bytes).context("load ebpf object")
 }
 
+/// Install the aya-log `EbpfLogger` that drains the datapath's `dlog!` messages to the `log`
+/// facade (env_logger backend → dpservice stdout), but ONLY when `XDP_DP_DEBUG` is set. On a
+/// non-debug image the `AYA_LOGS` map is absent, so this is a graceful no-op with a one-line
+/// note. Call once right after `load_ebpf()`; the logger self-drives via per-CPU tokio tasks,
+/// so it must be called from within the tokio runtime.
+pub fn maybe_install_logger(ebpf: &mut Ebpf) {
+    if std::env::var_os("XDP_DP_DEBUG").is_none() {
+        return;
+    }
+    match aya_log::EbpfLogger::init(ebpf) {
+        Ok(_) => eprintln!("XDP_DP_DEBUG: eBPF datapath logger installed"),
+        Err(e) => eprintln!(
+            "XDP_DP_DEBUG set but eBPF logger not installed ({e}); \
+             is this a `--features debug` image?"
+        ),
+    }
+}
+
 /// Load (verify) a named XDP program without attaching it. Call this once at startup so that
 /// subsequent `attach_xdp_link` calls only need to attach (not load).
 pub fn load_program(ebpf: &mut Ebpf, prog_name: &str) -> anyhow::Result<()> {
     let prog: &mut Xdp = ebpf
         .program_mut(prog_name)
         .with_context(|| format!("{prog_name} program missing"))?
+        .try_into()?;
+    prog.load().with_context(|| format!("verify {prog_name}"))?;
+    Ok(())
+}
+
+/// Load (verify) a named tc (classifier) program without attaching it. The tc analogue of
+/// `load_program`: `load_program` casts to `Xdp`, which fails for SchedClassifier programs, so
+/// the guest tc edge needs its own pre-load. Call once at startup before `attach_tc_clsact_ingress_link`.
+pub fn load_program_tc(ebpf: &mut Ebpf, prog_name: &str) -> anyhow::Result<()> {
+    let prog: &mut SchedClassifier = ebpf
+        .program_mut(prog_name)
+        .with_context(|| format!("tc program {prog_name} missing"))?
         .try_into()?;
     prog.load().with_context(|| format!("verify {prog_name}"))?;
     Ok(())
@@ -80,6 +110,70 @@ pub fn register_guest_dhcp(ebpf: &mut Ebpf) -> anyhow::Result<ProgramArray<MapDa
     progs
         .set(xdp_dp_common::GUEST_PROG_DHCP, fd, 0)
         .context("register guest_dhcp in GUEST_PROGS")?;
+    Ok(progs)
+}
+
+/// Ensure a clsact qdisc exists on `iface`, then load+attach a tc (classifier) program to its
+/// INGRESS hook (host receives = guest egress). The qdisc add is idempotent — an "already exists"
+/// error is fine.
+pub fn attach_tc_clsact_ingress(
+    ebpf: &mut Ebpf,
+    prog_name: &str,
+    iface: &str,
+) -> anyhow::Result<()> {
+    // Adding clsact when it already exists returns an error; ignore that case only.
+    let _ = tc::qdisc_add_clsact(iface);
+    let prog: &mut SchedClassifier = ebpf
+        .program_mut(prog_name)
+        .with_context(|| format!("tc program {prog_name} missing"))?
+        .try_into()?;
+    prog.load().with_context(|| format!("verify {prog_name}"))?;
+    prog.attach(iface, TcAttachType::Ingress)
+        .with_context(|| format!("attach {prog_name} to {iface} (clsact ingress)"))?;
+    Ok(())
+}
+
+/// Load `tc_guest_dhcp` and register it in `GUEST_PROGS_TC[GUEST_PROG_DHCP]` so `tc_guest_tx`'s
+/// DHCP tail-call resolves. Mirrors `register_guest_dhcp` but for the tc program array. The
+/// returned `ProgramArray` MUST be held in scope by the caller for the datapath's lifetime.
+pub fn register_guest_dhcp_tc(ebpf: &mut Ebpf) -> anyhow::Result<ProgramArray<MapData>> {
+    {
+        let prog: &mut SchedClassifier = ebpf
+            .program_mut("tc_guest_dhcp")
+            .context("tc_guest_dhcp program missing")?
+            .try_into()?;
+        prog.load().context("verify tc_guest_dhcp")?;
+    }
+    let mut progs: ProgramArray<_> = ebpf
+        .take_map("GUEST_PROGS_TC")
+        .context("GUEST_PROGS_TC map missing")?
+        .try_into()?;
+    let prog: &SchedClassifier = ebpf
+        .program("tc_guest_dhcp")
+        .context("tc_guest_dhcp program missing")?
+        .try_into()?;
+    let fd: &ProgramFd = prog.fd()?;
+    progs
+        .set(xdp_dp_common::GUEST_PROG_DHCP, fd, 0)
+        .context("register tc_guest_dhcp in GUEST_PROGS_TC")?;
+
+    // NAT64 egress tail-call target (slot GUEST_PROG_IPV6): tc_guest_tx tail-calls this when the
+    // inner IPv6 dst is in 64:ff9b::/96, giving the translate+SNAT+encap path its own stack budget.
+    {
+        let prog: &mut SchedClassifier = ebpf
+            .program_mut("tc_guest_nat64")
+            .context("tc_guest_nat64 program missing")?
+            .try_into()?;
+        prog.load().context("verify tc_guest_nat64")?;
+    }
+    let prog: &SchedClassifier = ebpf
+        .program("tc_guest_nat64")
+        .context("tc_guest_nat64 program missing")?
+        .try_into()?;
+    let fd: &ProgramFd = prog.fd()?;
+    progs
+        .set(xdp_dp_common::GUEST_PROG_IPV6, fd, 0)
+        .context("register tc_guest_nat64 in GUEST_PROGS_TC")?;
     Ok(progs)
 }
 
@@ -132,6 +226,26 @@ pub fn attach_xdp_link(
             .with_context(|| format!("attach {prog_name} to {iface}"))?
     };
     prog.take_link(id).context("take xdp link")
+}
+
+/// Ensure a clsact qdisc exists on `iface`, then attach an already-loaded tc (classifier) program
+/// to its INGRESS hook and RETURN the owned link, so the caller can later drop it to detach (the
+/// tc analogue of `attach_xdp_link`, used for dynamic guest interface teardown). The program must
+/// be pre-loaded once via `load_program_tc`; this only attaches. The qdisc add is idempotent.
+pub fn attach_tc_clsact_ingress_link(
+    ebpf: &mut Ebpf,
+    prog_name: &str,
+    iface: &str,
+) -> anyhow::Result<aya::programs::tc::SchedClassifierLink> {
+    let _ = tc::qdisc_add_clsact(iface);
+    let prog: &mut SchedClassifier = ebpf
+        .program_mut(prog_name)
+        .with_context(|| format!("tc program {prog_name} missing"))?
+        .try_into()?;
+    let link_id = prog
+        .attach(iface, TcAttachType::Ingress)
+        .with_context(|| format!("attach {prog_name} to {iface} (clsact ingress)"))?;
+    prog.take_link(link_id).context("take tc link")
 }
 
 /// Load the eBPF object and attach `uplink_rx` to the named uplink interface.

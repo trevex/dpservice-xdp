@@ -10,6 +10,11 @@ aya-ebpf = "0.1"
 aya-log-ebpf = "0.1"
 network-types = "0.0.7"
 
+[features]
+# Compile in `dlog!` datapath tracing (aya-log). Off by default → zero runtime/verifier cost.
+# A debug image must ALSO run with XDP_DP_DEBUG=1 so the loader installs the EbpfLogger drain.
+debug = []
+
 [build-dependencies]
 which = "6"
 

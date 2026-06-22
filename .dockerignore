@@ -1,0 +1,10 @@
+# Keep the build context small: the self-building Dockerfile needs the Rust workspace
+# (crates, Cargo.toml/lock, build.rs, proto/, rust-toolchain.toml) but NONE of these.
+target/
+result
+.git/
+docs/
+test/
+.claude/
+NOTES.md
+*.md

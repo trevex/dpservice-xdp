@@ -27,6 +27,16 @@ release: ## Build the xdp-dp binary in release mode
 cli: ## Build the genuine dpservice-cli (flake package) into ./result
 	nix build .#dpservice-cli
 
+IMAGE ?= ghcr.io/trevex/dpservice-xdp
+TAG   ?= dev
+.PHONY: image
+image: ## Build the dpservice-xdp container image (self-building Dockerfile; IMAGE/TAG overridable)
+	docker build -t $(IMAGE):$(TAG) .
+
+.PHONY: image-push
+image-push: ## Push the dpservice-xdp image (needs `docker login ghcr.io`)
+	docker push $(IMAGE):$(TAG)
+
 # --- quality ---------------------------------------------------------------
 .PHONY: fmt
 fmt: ## Format all Rust code
