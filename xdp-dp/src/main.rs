@@ -231,6 +231,10 @@ enum Cmd {
         guest_ipv4: String,
         #[arg(long)]
         gateway_ipv4: String,
+        /// Overlay IPv6 gateway, programmed into PortMeta.gateway_ipv6 so the ND responder has a
+        /// target to match (dpservice presents the gateway at the VF's own MAC).
+        #[arg(long = "gateway6", default_value = "fe80::1")]
+        gateway6: String,
         #[arg(long)]
         guest_mac: String,
         #[arg(long)]
@@ -968,6 +972,7 @@ async fn main() -> anyhow::Result<()> {
             tap,
             guest_ipv4,
             gateway_ipv4,
+            gateway6,
             guest_mac,
             gateway_mac,
             dhcp_mtu,
@@ -992,7 +997,7 @@ async fn main() -> anyhow::Result<()> {
                     guest_mac: parse_mac(&guest_mac)?,
                     _pad: [0; 2],
                     underlay_ipv6: [0u8; 16],
-                    gateway_ipv6: [0u8; 16],
+                    gateway_ipv6: parse_ipv6(&gateway6)?,
                     guest_ipv6: [0u8; 16],
                 },
             )?;

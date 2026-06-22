@@ -61,6 +61,7 @@ sudo ip netns exec "$NS" env XDP_DP_DEBUG=1 "$BIN" tc-bringup \
     --gateway-ipv4 "$GUEST_IP" \
     --guest-mac "$GUEST_MAC" \
     --gateway-mac "$GW_MAC" \
+    --gateway6 fe80::1 \
     --dhcp-dns 8.8.8.8 \
     > "$DP_LOG" 2>&1 &
 DP_PID=$!
@@ -86,13 +87,44 @@ sudo ip netns exec "$NS" "$PYBIN" "$ROOT/test/tap-dhcp-probe.py" \
 RC=$?
 set -e
 
-if [[ $RC -eq 0 ]]; then
-    echo "PASS: tc DHCP OFFER received"
-    exit 0
+if [[ $RC -ne 0 ]]; then
+    echo "FAIL: no valid OFFER for $GUEST_IP (probe rc=$RC). Datapath log tail:"
+    echo "------------------------------------------------------------------------"
+    tail -n 40 "$DP_LOG" || true
+    echo "------------------------------------------------------------------------"
+    exit 1
+fi
+echo "DHCP OFFER OK"
+
+echo "== send ARP who-has $GUEST_IP on $TAP, expect reply from $GUEST_MAC =="
+set +e
+sudo ip netns exec "$NS" "$PYBIN" "$ROOT/test/tap-dhcp-probe.py" \
+    --client-only --probe arp --tap "$TAP" --client-mac "$GUEST_MAC" \
+    --expect-ip "$GUEST_IP" --timeout 4
+RC=$?
+set -e
+if [[ $RC -ne 0 ]]; then
+    echo "FAIL: no valid ARP reply for $GUEST_IP (probe rc=$RC). Datapath log tail:"
+    echo "------------------------------------------------------------------------"
+    tail -n 40 "$DP_LOG" || true
+    echo "------------------------------------------------------------------------"
+    exit 1
 fi
 
-echo "FAIL: no valid OFFER for $GUEST_IP (probe rc=$RC). Datapath log tail:"
-echo "------------------------------------------------------------------------"
-tail -n 40 "$DP_LOG" || true
-echo "------------------------------------------------------------------------"
-exit 1
+echo "== send ICMPv6 NS for fe80::1 on $TAP, expect NA with target-LL $GUEST_MAC =="
+set +e
+sudo ip netns exec "$NS" "$PYBIN" "$ROOT/test/tap-dhcp-probe.py" \
+    --client-only --probe nd --tap "$TAP" --client-mac "$GUEST_MAC" \
+    --gateway6 fe80::1 --timeout 4
+RC=$?
+set -e
+if [[ $RC -ne 0 ]]; then
+    echo "FAIL: no valid ND NA for fe80::1 (probe rc=$RC). Datapath log tail:"
+    echo "------------------------------------------------------------------------"
+    tail -n 40 "$DP_LOG" || true
+    echo "------------------------------------------------------------------------"
+    exit 1
+fi
+
+echo "PASS: tc DHCP + ARP + ND OK"
+exit 0

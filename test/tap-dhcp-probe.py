@@ -99,6 +99,88 @@ def client_only(tap, client_mac, expect_ip, timeout):
     return 0
 
 
+def guest_link_local(client_mac):
+    """Derive the guest's link-local (fe80::/64) address from its MAC via EUI-64. Used as the
+    NS source so the in-place NA rewrite (which swaps src<->dst) has a sane destination."""
+    b = bytearray(bytes.fromhex(client_mac.replace(":", "")))
+    b[0] ^= 0x02  # flip the universal/local bit
+    eui = bytes(b[0:3]) + b"\xff\xfe" + bytes(b[3:6])
+    suffix = ":".join(f"{eui[i]:02x}{eui[i+1]:02x}" for i in range(0, 16 - 8, 2))
+    return f"fe80::{suffix}"
+
+
+def arp_probe(tap, client_mac, gateway_ip, timeout):
+    """Send an ARP request who-has <gateway_ip> tell 10.0.0.2 from client_mac on `tap`, expect an
+    ARP reply (op=2) for gateway_ip whose hwsrc is the guest's own MAC. Returns 0 on success."""
+    from scapy.all import Ether, ARP
+    fd = open_tap_queue(tap)
+    try:
+        req = (Ether(src=client_mac, dst="ff:ff:ff:ff:ff:ff") /
+               ARP(op=1, hwsrc=client_mac, psrc="10.0.0.2",
+                   hwdst="00:00:00:00:00:00", pdst=gateway_ip))
+        frame = bytes(req)
+        # Pad to 60 bytes so the datapath's pull_data(ETH_LEN+ARP_LEN=42) always succeeds.
+        if len(frame) < 60:
+            frame += b"\x00" * (60 - len(frame))
+        os.write(fd, frame)
+        print(f"sent ARP who-has {gateway_ip} ({len(frame)} bytes) from {client_mac} on {tap}")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            r, _, _ = select.select([fd], [], [], 0.3)
+            if not r:
+                continue
+            p = Ether(os.read(fd, 2048))
+            if ARP in p and p[ARP].op == 2:
+                a = p[ARP]
+                print(f"got ARP reply: op={a.op} psrc={a.psrc} hwsrc={a.hwsrc}")
+                if str(a.psrc) == gateway_ip and a.hwsrc.lower() == client_mac.lower():
+                    print("ARP reply OK")
+                    return 0
+                print(f"  but expected psrc={gateway_ip} hwsrc={client_mac}")
+                return 1
+    finally:
+        os.close(fd)
+    print(f"RESULT: NO ARP reply on {tap} within {timeout}s")
+    return 1
+
+
+def nd_probe(tap, client_mac, gateway6, timeout):
+    """Send an ICMPv6 Neighbor Solicitation for `gateway6` from client_mac on `tap`, expect a
+    Neighbor Advertisement whose target-LL-addr option == the guest's own MAC. Returns 0 on ok."""
+    from scapy.all import (Ether, IPv6, ICMPv6ND_NS, ICMPv6ND_NA,
+                           ICMPv6NDOptSrcLLAddr, ICMPv6NDOptDstLLAddr)
+    fd = open_tap_queue(tap)
+    try:
+        src6 = guest_link_local(client_mac)
+        ns = (Ether(src=client_mac, dst="33:33:00:00:00:01") /
+              IPv6(src=src6, dst=gateway6) /
+              ICMPv6ND_NS(tgt=gateway6) /
+              ICMPv6NDOptSrcLLAddr(lladdr=client_mac))
+        frame = bytes(ns)
+        os.write(fd, frame)
+        print(f"sent ICMPv6 NS for {gateway6} ({len(frame)} bytes) from {client_mac} on {tap}")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            r, _, _ = select.select([fd], [], [], 0.3)
+            if not r:
+                continue
+            p = Ether(os.read(fd, 2048))
+            if ICMPv6ND_NA in p:
+                lladdr = None
+                if ICMPv6NDOptDstLLAddr in p:
+                    lladdr = p[ICMPv6NDOptDstLLAddr].lladdr
+                print(f"got ICMPv6 NA: tgt={p[ICMPv6ND_NA].tgt} dst-lladdr={lladdr}")
+                if lladdr is not None and lladdr.lower() == client_mac.lower():
+                    print("ND NA OK")
+                    return 0
+                print(f"  but expected dst-lladdr={client_mac}")
+                return 1
+    finally:
+        os.close(fd)
+    print(f"RESULT: NO ICMPv6 NA on {tap} within {timeout}s")
+    return 1
+
+
 def mk_tap(name):
     """Create a tap netdev with a held fd (IFF_NO_PI = raw ethernet frames), bring it up,
     disable offloads so the kernel doesn't coalesce/segment and confuse XDP."""
@@ -119,15 +201,22 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--client-only", action="store_true",
                     help="drive an already-running datapath on --tap (no bringup); used by the tc gate")
+    ap.add_argument("--probe", choices=["dhcp", "arp", "nd"], default="dhcp",
+                    help="which probe to run in --client-only mode (default: dhcp)")
     ap.add_argument("--tap", default=None, help="existing tap netdev (client-only mode)")
     ap.add_argument("--client-mac", default="52:54:00:00:00:01")
     ap.add_argument("--expect-ip", default="10.0.0.1")
+    ap.add_argument("--gateway6", default="fe80::1", help="ND gateway target (nd probe)")
     ap.add_argument("--timeout", type=float, default=3.0)
     args = ap.parse_args()
     if args.client_only:
         if not args.tap:
             print("ERROR: --client-only requires --tap", file=sys.stderr)
             return 2
+        if args.probe == "arp":
+            return arp_probe(args.tap, args.client_mac, args.expect_ip, args.timeout)
+        if args.probe == "nd":
+            return nd_probe(args.tap, args.client_mac, args.gateway6, args.timeout)
         return client_only(args.tap, args.client_mac, args.expect_ip, args.timeout)
 
     if not os.path.exists(BIN):
