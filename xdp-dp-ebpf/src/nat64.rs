@@ -752,33 +752,32 @@ pub fn tc_nat64_egress(
         _ => tc_nat64_alloc_port(&fwd_key, nat.nat_ipv4, nat.port_min, range),
     };
 
-    // Save Ethernet header + IPv6 hop-limit before the resize.
-    let eth_dst: [u8; 6] = unsafe { core::ptr::read_unaligned(p as *const [u8; 6]) };
-    let eth_src: [u8; 6] = unsafe { core::ptr::read_unaligned(p.add(6) as *const [u8; 6]) };
+    // IPv6 hop-limit (becomes the inner IPv4 TTL) — read before the resize.
     let hop_limit = unsafe { *p.add(ETH_LEN + 7) };
 
-    // ── Shrink IPv6(40) → IPv4(20): remove 20 bytes after the MAC header. ──
-    if ctx.adjust_room(-20, BPF_ADJ_ROOM_MAC, 0).is_err() {
+    // ── Single +20 grow (no minimal-frame shrink). ──
+    // NAT64 egress net size change is -20 (v6→v4 inner) + 40 (outer encap) = +20. Growing has no
+    // minimal-frame restriction (unlike the in-place -20 MAC-mode shrink, which returns -ENOTSUPP
+    // on a near-minimum 62-byte ICMPv6 echo frame). Insert 20 bytes right after the MAC header:
+    //   Before: [Eth 0..14][inner IPv6 14..54][L4 54..(54+l4_len)]
+    //   After:  [Eth 0..14][NEW 14..34][inner-IPv6(shifted) 34..74][L4(shifted) 74..]
+    // Then overwrite [0..74] with the final outer Eth + outer IPv6 + inner IPv4, leaving L4 in place
+    // at offset 74 (= ETH_LEN + IPV6_LEN + 20).
+    if ctx.adjust_room(20, BPF_ADJ_ROOM_MAC, 0).is_err() {
         return Err(());
     }
-    if ctx.pull_data((ETH_LEN + 20 + 8) as u32).is_err() {
+    // inner IPv4 at ETH_LEN+IPV6_LEN, L4 at ETH_LEN+IPV6_LEN+20.
+    if ctx.pull_data((ETH_LEN + IPV6_LEN + 20 + 8) as u32).is_err() {
         return Err(());
     }
     let data = ctx.data();
     let data_end = ctx.data_end();
-    if data + ETH_LEN + 20 + 8 > data_end {
+    if data + ETH_LEN + IPV6_LEN + 20 + 8 > data_end {
         return Err(());
     }
     let q = data as *mut u8;
 
-    // New layout: [Eth(14)][IPv4(20)][L4(l4_len)] with L4 at data+34. Ethertype → IPv4.
-    unsafe {
-        core::ptr::write_unaligned(q as *mut [u8; 6], eth_dst);
-        core::ptr::write_unaligned(q.add(6) as *mut [u8; 6], eth_src);
-        core::ptr::write_unaligned(q.add(12) as *mut u16, crate::parse::ETH_P_IP.to_be());
-    }
-
-    // Build + write the IPv4 header.
+    // ── Build + write the inner IPv4 header into [54..74]. ──
     let total_len = (20u16).wrapping_add(l4_len as u16);
     let mut ip4hdr = [0u8; 20];
     ip4hdr[0] = 0x45;
@@ -799,11 +798,11 @@ pub fn tc_nat64_egress(
     ip4hdr[10] = (ip4_chk >> 8) as u8;
     ip4hdr[11] = (ip4_chk & 0xff) as u8;
     unsafe {
-        core::ptr::copy_nonoverlapping(ip4hdr.as_ptr(), q.add(ETH_LEN), 20);
+        core::ptr::copy_nonoverlapping(ip4hdr.as_ptr(), q.add(ETH_LEN + IPV6_LEN), 20);
     }
 
-    // Fix L4 header (at data + ETH_LEN + 20).
-    let l4_off = ETH_LEN + 20;
+    // ── Translate the L4 header in place at [74..] (= ETH_LEN + IPV6_LEN + 20). ──
+    let l4_off = ETH_LEN + IPV6_LEN + 20;
     if data + l4_off + 8 > data_end {
         return Err(());
     }
@@ -872,11 +871,13 @@ pub fn tc_nat64_egress(
         _ => return Ok(None),
     }
 
-    // ── Encap: insert IPV6_LEN bytes after the MAC header, write outer Eth+IPv6, redirect. ──
-    // Build EncapParams HERE (after the L4 translation), once ip6_src/ip6_dst are dead — this keeps
-    // the simultaneous live-stack set small enough for the 512-byte BPF limit. The route/local map
-    // reads are valid at any time (no packet access). inner_len = frame len - inner ETH_LEN,
-    // captured BEFORE the encap resize.
+    // ── Write outer Eth + outer IPv6 into [0..54], inline + straight-line. ──
+    // Written HERE (after the L4 translation), once ip6_src/ip6_dst are dead, keeping the live-stack
+    // set small. Folded inline (no EncapParams struct, no write_outer_v6 call): passing a stack
+    // pointer into a helper this close to the return made the verifier track R0 as a frame pointer
+    // ("cannot return stack pointer to the caller"). Straight-line packet writes avoid that.
+    // The route/local map reads are valid at any time (no packet access).
+    // outer IPv6 payload (inner_len) = inner IPv4(20) + L4(l4_len).
     let nexthop_ipv6 = match crate::maps::ROUTES.get(&aya_ebpf::maps::lpm_trie::Key::new(
         64,
         xdp_dp_common::RouteLpmData {
@@ -888,30 +889,34 @@ pub fn tc_nat64_egress(
         None => return Ok(None),
     };
     let local = LOCAL.get(0).ok_or(())?;
-    let encap = crate::egress::EncapParams {
-        gateway_mac: local.gateway_mac,
-        uplink_mac: local.uplink_mac,
-        uplink_ifindex: local.uplink_ifindex,
-        src_underlay: *meta_underlay_ipv6,
-        nexthop_ipv6,
-        inner_len: (ctx.data_end() - ctx.data() - ETH_LEN) as u16,
-        inner_proto: crate::parse::IPPROTO_IPIP,
-    };
-    let uplink_ifindex = encap.uplink_ifindex;
-    if ctx
-        .adjust_room(IPV6_LEN as i32, BPF_ADJ_ROOM_MAC, 0)
-        .is_err()
-    {
+    let gateway_mac = local.gateway_mac;
+    let uplink_mac = local.uplink_mac;
+    let uplink_ifindex = local.uplink_ifindex;
+    let inner_len = (20u16).wrapping_add(l4_len as u16);
+    // Re-check the [0..54] write window is in-bounds (verifier needs this against data_end).
+    if data + ETH_LEN + IPV6_LEN > data_end {
         return Err(());
     }
-    if ctx.pull_data((ETH_LEN + IPV6_LEN) as u32).is_err() {
-        return Err(());
+    unsafe {
+        // Outer Ethernet: dst=gateway_mac, src=uplink_mac, ethertype IPv6.
+        write6(q, &gateway_mac);
+        write6(q.add(6), &uplink_mac);
+        core::ptr::write_unaligned(q.add(12) as *mut u16, ETH_P_IPV6.to_be());
+        // Outer IPv6: version 6, plen=inner_len, next-header IPIP, hops 64.
+        let ip = q.add(ETH_LEN);
+        *ip.add(0) = 0x60;
+        *ip.add(1) = 0;
+        *ip.add(2) = 0;
+        *ip.add(3) = 0;
+        core::ptr::write_unaligned(ip.add(4) as *mut u16, inner_len.to_be());
+        *ip.add(6) = crate::parse::IPPROTO_IPIP;
+        *ip.add(7) = 64;
+        write16(ip.add(8), meta_underlay_ipv6);
+        write16(ip.add(24), &nexthop_ipv6);
     }
-    if unsafe { crate::encap::write_outer_v6(ctx.data(), ctx.data_end(), &encap) } {
-        Ok(Some(unsafe { bpf_redirect(uplink_ifindex, 0) } as i32))
-    } else {
-        Err(())
-    }
+
+    // Outer Eth+IPv6, inner IPv4, and L4 are all written. Redirect out the uplink.
+    Ok(Some(unsafe { bpf_redirect(uplink_ifindex, 0) } as i32))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
