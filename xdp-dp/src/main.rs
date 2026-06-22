@@ -243,6 +243,23 @@ enum Cmd {
         dhcp_mtu: u32,
         #[arg(long = "dhcp-dns")]
         dhcp_dns: Vec<String>,
+        /// Uplink device. When set, programs LOCAL (uplink_ifindex/uplink_mac from this dev,
+        /// gateway_mac from --gateway-mac, underlay from --local-underlay) so the egress encap
+        /// path can build outer frames and redirect them out this dev.
+        #[arg(long)]
+        uplink: Option<String>,
+        /// This hypervisor's underlay IPv6 (outer src on encap). Programmed into LOCAL.
+        #[arg(long = "local-underlay", default_value = "fc00:1::1")]
+        local_underlay: String,
+        /// The guest's own underlay IPv6 (PortMeta.underlay_ipv6 = outer src identity), also
+        /// programmed into UNDERLAY -> (vni, tap_ifindex, guest_mac) so the local fast-path can
+        /// find it. Defaults to the local-underlay.
+        #[arg(long = "guest-underlay", default_value = "fc00:1::1")]
+        guest_underlay: String,
+        /// Remote guest route, repeatable: "<overlay_ipv4>=<nexthop_underlay_ipv6>=<vni>".
+        /// Programs ROUTES so guest traffic to that overlay IPv4 encaps toward the nexthop.
+        #[arg(long = "remote")]
+        remotes: Vec<String>,
     },
 }
 
@@ -977,10 +994,16 @@ async fn main() -> anyhow::Result<()> {
             gateway_mac,
             dhcp_mtu,
             dhcp_dns,
+            uplink,
+            local_underlay,
+            guest_underlay,
+            remotes,
         } => {
             let mut ebpf = loader::load_ebpf()?;
             loader::maybe_install_logger(&mut ebpf);
             let tap_ifindex = ifindex(&tap)?;
+            let guest_mac = parse_mac(&guest_mac)?;
+            let guest_underlay = parse_ipv6(&guest_underlay)?;
             // Load (verify) + attach the tc programs BEFORE opening any map: the map `open()`
             // helpers `take_map()` the map out of the loader, after which a later `prog.load()`
             // can no longer bind the maps the program references ("fd N is not pointing to valid
@@ -994,13 +1017,62 @@ async fn main() -> anyhow::Result<()> {
                     vni: 100,
                     guest_ipv4: parse_ipv4(&guest_ipv4)?,
                     gateway_ipv4: parse_ipv4(&gateway_ipv4)?,
-                    guest_mac: parse_mac(&guest_mac)?,
+                    guest_mac,
                     _pad: [0; 2],
-                    underlay_ipv6: [0u8; 16],
+                    underlay_ipv6: guest_underlay,
                     gateway_ipv6: parse_ipv6(&gateway6)?,
                     guest_ipv6: [0u8; 16],
                 },
             )?;
+            // Egress encap wiring (optional): program LOCAL (uplink identity) so forward_decision_v4
+            // can build outer frames, a ROUTES entry per --remote, and the guest's own UNDERLAY /128
+            // (so the local fast-path can find same-host peers).
+            if let Some(uplink) = &uplink {
+                let mut local_map = maps::LocalMap::open(&mut ebpf)?;
+                local_map.set(&xdp_dp_common::Local {
+                    uplink_ifindex: ifindex(uplink)?,
+                    uplink_mac: mac_of(uplink)?,
+                    gateway_mac: parse_mac(&gateway_mac)?,
+                    underlay_ipv6: parse_ipv6(&local_underlay)?,
+                })?;
+            }
+            {
+                let mut underlay_map = maps::Underlay::open(&mut ebpf)?;
+                underlay_map.upsert(
+                    guest_underlay,
+                    xdp_dp_common::UnderlayValue {
+                        vni: 100,
+                        tap_ifindex,
+                        guest_mac,
+                        _pad: [0; 2],
+                    },
+                )?;
+            }
+            {
+                let mut routes = maps::Routes::open(&mut ebpf)?;
+                // --remote: "<overlay_ipv4>=<nexthop_underlay_ipv6>=<vni>".
+                for r in &remotes {
+                    let f: Vec<&str> = r.split('=').collect();
+                    anyhow::ensure!(
+                        f.len() == 3,
+                        "--remote must be overlay_ipv4=nexthop_underlay_ipv6=vni, got {r:?}"
+                    );
+                    let ip = parse_ipv4(f[0])?;
+                    let nh = parse_ipv6(f[1])?;
+                    let vni: u32 = f[2].parse().context("--remote: bad vni")?;
+                    routes.upsert(
+                        vni,
+                        ip,
+                        32,
+                        xdp_dp_common::RouteValue {
+                            nexthop_vni: vni,
+                            nexthop_ipv6: nh,
+                            is_external: 0,
+                            _pad: [0; 3],
+                        },
+                    )?;
+                }
+            }
             {
                 let mut dhcp_config_map = maps::DhcpConfigMap::open(&mut ebpf)?;
                 let dns4: Vec<[u8; 4]> = dhcp_dns
@@ -1021,7 +1093,7 @@ async fn main() -> anyhow::Result<()> {
                 dhcp_config_map.set(&cfg)?;
             }
             println!("tc-bringup: tc_guest_tx on {tap} (ifindex {tap_ifindex}); ctrl-c to stop");
-            let _ = gateway_mac; // reserved for the responder phase; accepted now to keep the arg list stable
+            let _ = &gateway_mac; // consumed by the encap LOCAL branch when --uplink is set
             tokio::signal::ctrl_c().await?;
         }
         Cmd::Pass { iface } => {

@@ -181,6 +181,68 @@ def nd_probe(tap, client_mac, gateway6, timeout):
     return 1
 
 
+def egress_probe(tap, peer, timeout):
+    """Egress encap gate: open a queue on `tap`, sniff on the veth `peer`, send one inner IPv4
+    frame on `tap` (guest egress), and assert the datapath redirected an ENCAPPED frame onto the
+    uplink (read on `peer`): outer Ether + IPv6(nh=4 IPIP, src=fc00:1::1, dst=fc00:2::2) carrying
+    the inner IP(src=10.0.0.1, dst=10.0.0.2). Returns 0 on success."""
+    from scapy.all import Ether, IP, IPv6, ICMP, sniff, AsyncSniffer
+
+    fd = open_tap_queue(tap)
+    captured = []
+
+    def stop_when(p):
+        return IPv6 in p
+
+    sniffer = AsyncSniffer(iface=peer, prn=lambda p: captured.append(p),
+                           store=True, lfilter=lambda p: IPv6 in p)
+    sniffer.start()
+    time.sleep(0.5)
+    try:
+        inner = (Ether(src="52:54:00:00:00:01", dst="aa:aa:aa:aa:aa:aa") /
+                 IP(src="10.0.0.1", dst="10.0.0.2") /
+                 ICMP())
+        frame = bytes(inner)
+        os.write(fd, frame)
+        print(f"sent inner IPv4 ICMP ({len(frame)} bytes) 10.0.0.1->10.0.0.2 on {tap}")
+        deadline = time.time() + timeout
+        while time.time() < deadline and not captured:
+            time.sleep(0.2)
+    finally:
+        time.sleep(0.3)
+        try:
+            sniffer.stop()
+        except Exception:
+            pass
+        os.close(fd)
+
+    # Filter to IPv6 frames (drop any stray veth multicast/MLD).
+    cands = [p for p in captured if IPv6 in p]
+    if not cands:
+        print(f"RESULT: NO IPv6 frame captured on {peer} within {timeout}s")
+        return 1
+    for p in cands:
+        raw = bytes(p)
+        print(f"captured {len(raw)} bytes on {peer}: {raw.hex()}")
+        ip6 = p[IPv6]
+        ok_outer = (ip6.nh == 4 and ip6.src == "fc00:1::1" and ip6.dst == "fc00:2::2")
+        ok_inner = False
+        if IP in p:
+            inner_ip = p[IP]
+            ok_inner = (inner_ip.src == "10.0.0.1" and inner_ip.dst == "10.0.0.2")
+        print(f"  outer IPv6: nh={ip6.nh} src={ip6.src} dst={ip6.dst} (want nh=4 "
+              f"src=fc00:1::1 dst=fc00:2::2)")
+        if IP in p:
+            print(f"  inner IP:  src={p[IP].src} dst={p[IP].dst} (want 10.0.0.1->10.0.0.2)")
+        else:
+            print("  inner IP:  <not parsed as IPv4 inside IPv6>")
+        if ok_outer and ok_inner:
+            print("ENCAP OK")
+            return 0
+    print("RESULT: captured frame(s) not correctly encapsulated (see hex above)")
+    return 1
+
+
 def mk_tap(name):
     """Create a tap netdev with a held fd (IFF_NO_PI = raw ethernet frames), bring it up,
     disable offloads so the kernel doesn't coalesce/segment and confuse XDP."""
@@ -203,12 +265,20 @@ def main():
                     help="drive an already-running datapath on --tap (no bringup); used by the tc gate")
     ap.add_argument("--probe", choices=["dhcp", "arp", "nd"], default="dhcp",
                     help="which probe to run in --client-only mode (default: dhcp)")
+    ap.add_argument("--egress", action="store_true",
+                    help="egress encap gate: send inner IPv4 on --tap, capture encapped on --peer")
+    ap.add_argument("--peer", default=None, help="veth peer to capture redirected uplink frames on")
     ap.add_argument("--tap", default=None, help="existing tap netdev (client-only mode)")
     ap.add_argument("--client-mac", default="52:54:00:00:00:01")
     ap.add_argument("--expect-ip", default="10.0.0.1")
     ap.add_argument("--gateway6", default="fe80::1", help="ND gateway target (nd probe)")
     ap.add_argument("--timeout", type=float, default=3.0)
     args = ap.parse_args()
+    if args.egress:
+        if not args.tap or not args.peer:
+            print("ERROR: --egress requires --tap and --peer", file=sys.stderr)
+            return 2
+        return egress_probe(args.tap, args.peer, args.timeout)
     if args.client_only:
         if not args.tap:
             print("ERROR: --client-only requires --tap", file=sys.stderr)

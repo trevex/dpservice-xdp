@@ -87,6 +87,12 @@ pub fn tc_guest_tx(ctx: TcContext) -> i32 {
     if ethertype == 0x0800 {
         // Make the inner IPv4 header range writable for the in-place pipeline (NAT/VIP).
         let _ = ctx.pull_data((xdp_dp_common::arp_nd::ETH_LEN + 40) as u32);
+        // Re-establish a clean lower bound for the verifier after pull_data invalidated the
+        // pkt-range facts: the inner IPv4 base header (ETH_LEN + 20) must be present. This mirrors
+        // the XDP guest_tx guard before forward_decision_v4 and keeps the in-place reads in-bounds.
+        if ctx.data() + xdp_dp_common::arp_nd::ETH_LEN + 20 > ctx.data_end() {
+            return TC_ACT_OK;
+        }
         match crate::egress::forward_decision_v4(ctx.data(), ctx.data_end(), ifindex, &meta) {
             crate::egress::EgressVerdict::Pass => return TC_ACT_OK,
             crate::egress::EgressVerdict::Drop => return TC_ACT_SHOT,
