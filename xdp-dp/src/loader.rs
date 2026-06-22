@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use aya::maps::{MapData, ProgramArray};
-use aya::programs::{ProgramFd, Xdp, XdpFlags};
+use aya::programs::{tc, ProgramFd, SchedClassifier, TcAttachType, Xdp, XdpFlags};
 use aya::Ebpf;
 
 /// Load the eBPF object that aya-build compiled to bpfel and placed in OUT_DIR.
@@ -98,6 +98,52 @@ pub fn register_guest_dhcp(ebpf: &mut Ebpf) -> anyhow::Result<ProgramArray<MapDa
     progs
         .set(xdp_dp_common::GUEST_PROG_DHCP, fd, 0)
         .context("register guest_dhcp in GUEST_PROGS")?;
+    Ok(progs)
+}
+
+/// Ensure a clsact qdisc exists on `iface`, then load+attach a tc (classifier) program to its
+/// INGRESS hook (host receives = guest egress). The qdisc add is idempotent — an "already exists"
+/// error is fine.
+pub fn attach_tc_clsact_ingress(
+    ebpf: &mut Ebpf,
+    prog_name: &str,
+    iface: &str,
+) -> anyhow::Result<()> {
+    // Adding clsact when it already exists returns an error; ignore that case only.
+    let _ = tc::qdisc_add_clsact(iface);
+    let prog: &mut SchedClassifier = ebpf
+        .program_mut(prog_name)
+        .with_context(|| format!("tc program {prog_name} missing"))?
+        .try_into()?;
+    prog.load().with_context(|| format!("verify {prog_name}"))?;
+    prog.attach(iface, TcAttachType::Ingress)
+        .with_context(|| format!("attach {prog_name} to {iface} (clsact ingress)"))?;
+    Ok(())
+}
+
+/// Load `tc_guest_dhcp` and register it in `GUEST_PROGS_TC[GUEST_PROG_DHCP]` so `tc_guest_tx`'s
+/// DHCP tail-call resolves. Mirrors `register_guest_dhcp` but for the tc program array. The
+/// returned `ProgramArray` MUST be held in scope by the caller for the datapath's lifetime.
+pub fn register_guest_dhcp_tc(ebpf: &mut Ebpf) -> anyhow::Result<ProgramArray<MapData>> {
+    {
+        let prog: &mut SchedClassifier = ebpf
+            .program_mut("tc_guest_dhcp")
+            .context("tc_guest_dhcp program missing")?
+            .try_into()?;
+        prog.load().context("verify tc_guest_dhcp")?;
+    }
+    let mut progs: ProgramArray<_> = ebpf
+        .take_map("GUEST_PROGS_TC")
+        .context("GUEST_PROGS_TC map missing")?
+        .try_into()?;
+    let prog: &SchedClassifier = ebpf
+        .program("tc_guest_dhcp")
+        .context("tc_guest_dhcp program missing")?
+        .try_into()?;
+    let fd: &ProgramFd = prog.fd()?;
+    progs
+        .set(xdp_dp_common::GUEST_PROG_DHCP, fd, 0)
+        .context("register tc_guest_dhcp in GUEST_PROGS_TC")?;
     Ok(progs)
 }
 
