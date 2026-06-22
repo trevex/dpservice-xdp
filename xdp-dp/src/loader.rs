@@ -73,6 +73,18 @@ pub fn load_program(ebpf: &mut Ebpf, prog_name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Load (verify) a named tc (classifier) program without attaching it. The tc analogue of
+/// `load_program`: `load_program` casts to `Xdp`, which fails for SchedClassifier programs, so
+/// the guest tc edge needs its own pre-load. Call once at startup before `attach_tc_clsact_ingress_link`.
+pub fn load_program_tc(ebpf: &mut Ebpf, prog_name: &str) -> anyhow::Result<()> {
+    let prog: &mut SchedClassifier = ebpf
+        .program_mut(prog_name)
+        .with_context(|| format!("tc program {prog_name} missing"))?
+        .try_into()?;
+    prog.load().with_context(|| format!("verify {prog_name}"))?;
+    Ok(())
+}
+
 /// Load (verify) `guest_dhcp` and register its fd in the `GUEST_PROGS` program array at
 /// `GUEST_PROG_DHCP`, so `guest_tx`'s DHCP tail call resolves at runtime. Returns the owned
 /// `ProgramArray` handle; the caller MUST keep it alive (dropping it closes the userspace map fd —
@@ -214,6 +226,26 @@ pub fn attach_xdp_link(
             .with_context(|| format!("attach {prog_name} to {iface}"))?
     };
     prog.take_link(id).context("take xdp link")
+}
+
+/// Ensure a clsact qdisc exists on `iface`, then attach an already-loaded tc (classifier) program
+/// to its INGRESS hook and RETURN the owned link, so the caller can later drop it to detach (the
+/// tc analogue of `attach_xdp_link`, used for dynamic guest interface teardown). The program must
+/// be pre-loaded once via `load_program_tc`; this only attaches. The qdisc add is idempotent.
+pub fn attach_tc_clsact_ingress_link(
+    ebpf: &mut Ebpf,
+    prog_name: &str,
+    iface: &str,
+) -> anyhow::Result<aya::programs::tc::SchedClassifierLink> {
+    let _ = tc::qdisc_add_clsact(iface);
+    let prog: &mut SchedClassifier = ebpf
+        .program_mut(prog_name)
+        .with_context(|| format!("tc program {prog_name} missing"))?
+        .try_into()?;
+    let link_id = prog
+        .attach(iface, TcAttachType::Ingress)
+        .with_context(|| format!("attach {prog_name} to {iface} (clsact ingress)"))?;
+    prog.take_link(link_id).context("take tc link")
 }
 
 /// Load the eBPF object and attach `uplink_rx` to the named uplink interface.
