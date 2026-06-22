@@ -3,7 +3,7 @@
 //! redirecting back out the tap. The heavy logic lives in the shared pure core (xdp_dp_common::dhcp).
 
 use aya_ebpf::{
-    bindings::{TC_ACT_OK, TC_ACT_SHOT},
+    bindings::{bpf_adj_room_mode::BPF_ADJ_ROOM_MAC, TC_ACT_OK, TC_ACT_SHOT},
     helpers::{bpf_redirect, bpf_skb_change_tail},
     macros::classifier,
     programs::TcContext,
@@ -79,6 +79,64 @@ pub fn tc_guest_tx(ctx: TcContext) -> i32 {
     if looks_like_dhcpv4(ctx.data(), ctx.data_end()) {
         let _ = unsafe { GUEST_PROGS_TC.tail_call(&ctx, xdp_dp_common::GUEST_PROG_DHCP) };
         return TC_ACT_OK;
+    }
+
+    // IPv4 → run the shared in-place egress pipeline and execute the verdict with tc primitives:
+    // PASS/DROP, deliver to a local guest tap (redirect), or encapsulate into the overlay and
+    // redirect out the uplink.
+    if ethertype == 0x0800 {
+        // Make the inner IPv4 header range writable for the in-place pipeline (NAT/VIP).
+        let _ = ctx.pull_data((xdp_dp_common::arp_nd::ETH_LEN + 40) as u32);
+        match crate::egress::forward_decision_v4(ctx.data(), ctx.data_end(), ifindex, &meta) {
+            crate::egress::EgressVerdict::Pass => return TC_ACT_OK,
+            crate::egress::EgressVerdict::Drop => return TC_ACT_SHOT,
+            crate::egress::EgressVerdict::Local {
+                tap_ifindex,
+                guest_mac,
+            } => {
+                if ctx.data() + xdp_dp_common::arp_nd::ETH_LEN <= ctx.data_end() {
+                    let q = ctx.data() as *mut u8;
+                    unsafe {
+                        // dst = local guest MAC, src = gateway MAC; ethertype stays IPv4.
+                        let g = guest_mac;
+                        let gw = crate::arp_nd::GW_MAC;
+                        let mut i = 0;
+                        while i < 6 {
+                            *q.add(i) = g[i];
+                            *q.add(6 + i) = gw[i];
+                            i += 1;
+                        }
+                    }
+                    return unsafe { bpf_redirect(tap_ifindex, 0) as i32 };
+                }
+                return TC_ACT_OK;
+            }
+            crate::egress::EgressVerdict::Encap(e) => {
+                // WORKING invocation (validated by test/tc-egress-netns.sh):
+                // bpf_skb_adjust_room(skb, +IPV6_LEN, BPF_ADJ_ROOM_MAC, 0) inserts IPV6_LEN bytes
+                // immediately AFTER the L2 (MAC) header, i.e. between the inner Ethernet and the
+                // inner IPv4 header: [inner_eth(14)][+40 new][inner_ip]. write_outer_v6 then writes
+                // [outer_eth(14)][outer_ipv6(40)] starting at data, overwriting the inner eth (14)
+                // plus the 40 inserted bytes — yielding [outer_eth][outer_ipv6][inner_ip], exactly
+                // the wire layout the XDP adjust_head(-40) path produces (inner eth consumed).
+                if ctx
+                    .adjust_room(crate::parse::IPV6_LEN as i32, BPF_ADJ_ROOM_MAC, 0)
+                    .is_err()
+                {
+                    return TC_ACT_OK;
+                }
+                if ctx
+                    .pull_data((xdp_dp_common::arp_nd::ETH_LEN + crate::parse::IPV6_LEN) as u32)
+                    .is_err()
+                {
+                    return TC_ACT_OK;
+                }
+                if unsafe { crate::encap::write_outer_v6(ctx.data(), ctx.data_end(), &e) } {
+                    return unsafe { bpf_redirect(e.uplink_ifindex, 0) as i32 };
+                }
+                return TC_ACT_SHOT;
+            }
+        }
     }
     TC_ACT_OK
 }
