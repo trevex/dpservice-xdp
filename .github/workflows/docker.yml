@@ -39,8 +39,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            # main pushes: the bare short SHA (only on the default branch)
+            # main pushes: the bare short SHA, plus the moving `main` tag
             type=sha,prefix=,format=short,enable={{is_default_branch}}
+            type=ref,event=branch,enable={{is_default_branch}}
             # tag pushes: the literal git tag name
             type=ref,event=tag
 
