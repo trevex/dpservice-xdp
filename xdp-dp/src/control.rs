@@ -168,6 +168,7 @@ impl Control {
         underlay_ipv6: [u8; 16],
     ) -> anyhow::Result<Self> {
         let mut ebpf = loader::load_ebpf()?;
+        loader::maybe_install_logger(&mut ebpf);
         loader::attach_xdp(&mut ebpf, "uplink_rx", uplink)?;
         // Pre-load guest_tx so that every subsequent attach_xdp_link call only needs attach(),
         // not load() + attach(). This ensures the first interface's link is always retained and

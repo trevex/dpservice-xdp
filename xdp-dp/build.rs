@@ -17,14 +17,24 @@ fn main() -> anyhow::Result<()> {
         .parent()
         .ok_or_else(|| anyhow!("no parent dir for {}", ebpf.manifest_path))?
         .to_string();
+    // Propagate our `debug` feature to the eBPF crate so `cargo build -p xdp-dp --features debug`
+    // (or `make image FEATURES=debug`) compiles in the `dlog!` aya-log tracing. cargo sets
+    // CARGO_FEATURE_DEBUG when this crate's `debug` feature is active.
+    let ebpf_features: &[&str] = if std::env::var_os("CARGO_FEATURE_DEBUG").is_some() {
+        &["debug"]
+    } else {
+        &[]
+    };
     aya_build::build_ebpf(
         [Package {
             name: "xdp-dp-ebpf",
             root_dir: root_dir.as_str(),
+            features: ebpf_features,
             ..Default::default()
         }],
         Toolchain::Custom("nightly-2026-01-15"),
     )?;
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DEBUG");
 
     // 2) Generate the DPDKironcore gRPC service (server only).
     tonic_build::configure()

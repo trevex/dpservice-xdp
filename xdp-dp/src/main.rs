@@ -226,6 +226,9 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Logger backend for the eBPF `dlog!` tracing (active only with XDP_DP_DEBUG + a debug image).
+    // Honors RUST_LOG; defaults to `info` so datapath traces show without extra config.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Load { uplink } => {
@@ -344,6 +347,7 @@ async fn main() -> anyhow::Result<()> {
                 std::env::set_var("XDP_DP_CONNTRACK_MAX", n.to_string());
             }
             let mut ebpf = loader::load_ebpf()?;
+            loader::maybe_install_logger(&mut ebpf);
 
             // Pass 1: attach ALL XDP programs while ebpf is still fully intact
             // (take_map consumes map entries, but programs are separate — still need &mut ebpf).

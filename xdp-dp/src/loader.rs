@@ -44,6 +44,24 @@ pub fn load_ebpf() -> anyhow::Result<Ebpf> {
     loader.load(bytes).context("load ebpf object")
 }
 
+/// Install the aya-log `EbpfLogger` that drains the datapath's `dlog!` messages to the `log`
+/// facade (env_logger backend → dpservice stdout), but ONLY when `XDP_DP_DEBUG` is set. On a
+/// non-debug image the `AYA_LOGS` map is absent, so this is a graceful no-op with a one-line
+/// note. Call once right after `load_ebpf()`; the logger self-drives via per-CPU tokio tasks,
+/// so it must be called from within the tokio runtime.
+pub fn maybe_install_logger(ebpf: &mut Ebpf) {
+    if std::env::var_os("XDP_DP_DEBUG").is_none() {
+        return;
+    }
+    match aya_log::EbpfLogger::init(ebpf) {
+        Ok(_) => eprintln!("XDP_DP_DEBUG: eBPF datapath logger installed"),
+        Err(e) => eprintln!(
+            "XDP_DP_DEBUG set but eBPF logger not installed ({e}); \
+             is this a `--features debug` image?"
+        ),
+    }
+}
+
 /// Load (verify) a named XDP program without attaching it. Call this once at startup so that
 /// subsequent `attach_xdp_link` calls only need to attach (not load).
 pub fn load_program(ebpf: &mut Ebpf, prog_name: &str) -> anyhow::Result<()> {
