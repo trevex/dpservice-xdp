@@ -222,6 +222,24 @@ enum Cmd {
         #[arg(long = "dhcpv6-dns")]
         dhcpv6_dns: Vec<String>,
     },
+    /// Minimal tc guest-edge bringup for the Phase-1 DHCP gate: attach tc_guest_tx to one tap's
+    /// clsact ingress, program PORT_META + DHCP config for it, then idle.
+    TcBringup {
+        #[arg(long)]
+        tap: String,
+        #[arg(long)]
+        guest_ipv4: String,
+        #[arg(long)]
+        gateway_ipv4: String,
+        #[arg(long)]
+        guest_mac: String,
+        #[arg(long)]
+        gateway_mac: String,
+        #[arg(long, default_value_t = 1500)]
+        dhcp_mtu: u32,
+        #[arg(long = "dhcp-dns")]
+        dhcp_dns: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -944,6 +962,57 @@ async fn main() -> anyhow::Result<()> {
                 neigh_nats.len(),
                 meters.len()
             );
+            tokio::signal::ctrl_c().await?;
+        }
+        Cmd::TcBringup {
+            tap,
+            guest_ipv4,
+            gateway_ipv4,
+            guest_mac,
+            gateway_mac,
+            dhcp_mtu,
+            dhcp_dns,
+        } => {
+            let mut ebpf = loader::load_ebpf()?;
+            loader::maybe_install_logger(&mut ebpf);
+            let tap_ifindex = ifindex(&tap)?;
+            let mut ports = maps::PortMetaMap::open(&mut ebpf)?;
+            ports.upsert(
+                tap_ifindex,
+                xdp_dp_common::PortMeta {
+                    vni: 100,
+                    guest_ipv4: parse_ipv4(&guest_ipv4)?,
+                    gateway_ipv4: parse_ipv4(&gateway_ipv4)?,
+                    guest_mac: parse_mac(&guest_mac)?,
+                    _pad: [0; 2],
+                    underlay_ipv6: [0u8; 16],
+                    gateway_ipv6: [0u8; 16],
+                    guest_ipv6: [0u8; 16],
+                },
+            )?;
+            {
+                let mut dhcp_config_map = maps::DhcpConfigMap::open(&mut ebpf)?;
+                let dns4: Vec<[u8; 4]> = dhcp_dns
+                    .iter()
+                    .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok().map(|a| a.octets()))
+                    .collect();
+                let dns4_len = dns4.len().min(xdp_dp_common::DHCP_MAX_DNS) as u8;
+                let mut cfg = xdp_dp_common::DhcpConfig {
+                    mtu: dhcp_mtu as u16,
+                    dns4_len,
+                    dns6_len: 0,
+                    dns4: [[0; 4]; xdp_dp_common::DHCP_MAX_DNS],
+                    dns6: [[0; 16]; xdp_dp_common::DHCP_MAX_DNS],
+                };
+                for (i, a) in dns4.iter().take(xdp_dp_common::DHCP_MAX_DNS).enumerate() {
+                    cfg.dns4[i] = *a;
+                }
+                dhcp_config_map.set(&cfg)?;
+            }
+            let _gpt = loader::register_guest_dhcp_tc(&mut ebpf)?; // hold in scope for the datapath lifetime
+            loader::attach_tc_clsact_ingress(&mut ebpf, "tc_guest_tx", &tap)?;
+            println!("tc-bringup: tc_guest_tx on {tap} (ifindex {tap_ifindex}); ctrl-c to stop");
+            let _ = gateway_mac; // reserved for the responder phase; accepted now to keep the arg list stable
             tokio::signal::ctrl_c().await?;
         }
         Cmd::Pass { iface } => {
