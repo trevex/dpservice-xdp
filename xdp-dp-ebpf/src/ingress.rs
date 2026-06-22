@@ -176,8 +176,19 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
                         let mut e = *e;
                         let is_nat64 = e.flags & CT_F_NAT64 != 0;
                         let orig_sport = e.xlate_port;
-                        crate::conntrack::ct_apply(ctx, ETH_LEN + IPV6_LEN, &e);
-                        crate::conntrack::ct_touch(ctx, ETH_LEN + IPV6_LEN, &key, &mut e);
+                        crate::conntrack::ct_apply(
+                            ctx.data(),
+                            ctx.data_end(),
+                            ETH_LEN + IPV6_LEN,
+                            &e,
+                        );
+                        crate::conntrack::ct_touch(
+                            ctx.data(),
+                            ctx.data_end(),
+                            ETH_LEN + IPV6_LEN,
+                            &key,
+                            &mut e,
+                        );
                         Some((e.xlate_ip, orig_sport, is_nat64))
                     }
                     _ => None,
@@ -253,9 +264,20 @@ pub fn try_uplink_rx(ctx: &XdpContext) -> Result<u32, ()> {
             match unsafe { crate::maps::CONNTRACK.get(&key) } {
                 Some(e) => {
                     let mut e = *e;
-                    crate::conntrack::ct_touch(ctx, ETH_LEN + IPV6_LEN, &key, &mut e);
+                    crate::conntrack::ct_touch(
+                        ctx.data(),
+                        ctx.data_end(),
+                        ETH_LEN + IPV6_LEN,
+                        &key,
+                        &mut e,
+                    );
                 }
-                None => crate::conntrack::ct_ensure_default(ctx, ETH_LEN + IPV6_LEN, &key),
+                None => crate::conntrack::ct_ensure_default(
+                    ctx.data(),
+                    ctx.data_end(),
+                    ETH_LEN + IPV6_LEN,
+                    &key,
+                ),
             }
         }
     }

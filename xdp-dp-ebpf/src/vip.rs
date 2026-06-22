@@ -10,27 +10,25 @@ const IPPROTO_UDP: u8 = 17;
 /// Egress SNAT: rewrite the inner IPv4 SOURCE if a VIP exists for it. `ip_off` = offset of the
 /// IPv4 header from packet start. No-op if no VIP. Bounds are re-checked here.
 #[inline(always)]
-pub fn snat_egress(ctx: &XdpContext, ip_off: usize, vni: u32) {
-    rewrite(ctx, ip_off, vni, true);
+pub fn snat_egress(data: usize, data_end: usize, ip_off: usize, vni: u32) {
+    rewrite_raw(data, data_end, ip_off, vni, true);
 }
 
 /// Egress DNAT: rewrite the inner IPv4 DESTINATION if a VIP maps to a guest IP. Used for
 /// same-host VIP traffic where the sender's packet never reaches the ingress (uplink_rx) path.
 #[inline(always)]
-pub fn dnat_egress(ctx: &XdpContext, ip_off: usize, vni: u32) {
-    rewrite(ctx, ip_off, vni, false);
+pub fn dnat_egress(data: usize, data_end: usize, ip_off: usize, vni: u32) {
+    rewrite_raw(data, data_end, ip_off, vni, false);
 }
 
 /// Ingress DNAT: rewrite the inner IPv4 DEST if a VIP maps to an interface IP.
 #[inline(always)]
 pub fn dnat_ingress(ctx: &XdpContext, ip_off: usize, vni: u32) {
-    rewrite(ctx, ip_off, vni, false);
+    rewrite_raw(ctx.data(), ctx.data_end(), ip_off, vni, false);
 }
 
 #[inline(always)]
-fn rewrite(ctx: &XdpContext, ip_off: usize, vni: u32, is_src: bool) {
-    let data = ctx.data();
-    let data_end = ctx.data_end();
+fn rewrite_raw(data: usize, data_end: usize, ip_off: usize, vni: u32, is_src: bool) {
     if data + ip_off + 20 > data_end {
         return;
     }
