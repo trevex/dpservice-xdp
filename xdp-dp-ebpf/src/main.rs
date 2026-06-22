@@ -4,6 +4,7 @@
 mod arp_nd;
 mod conntrack;
 mod csum;
+mod dbg;
 mod dhcp;
 mod egress;
 mod encap;
@@ -17,6 +18,7 @@ mod nat;
 mod nat64;
 mod parse;
 mod v6;
+mod verdict;
 mod vip;
 
 use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
@@ -30,19 +32,31 @@ pub fn xdp_pass(_ctx: XdpContext) -> u32 {
 
 #[xdp]
 pub fn guest_tx(ctx: XdpContext) -> u32 {
+    dbg::dlog!(&ctx, "guest_tx: ingress_ifindex={}", unsafe {
+        (*ctx.ctx).ingress_ifindex
+    });
     match egress::try_guest_tx(&ctx) {
-        Ok(act) => act,
+        Ok(act) => {
+            dbg::dlog!(&ctx, "guest_tx: action={}", act);
+            act
+        }
         Err(()) => xdp_action::XDP_PASS,
     }
 }
 
 #[xdp]
 pub fn guest_dhcp(ctx: XdpContext) -> u32 {
-    egress::dhcp_handle(&ctx)
+    dbg::dlog!(&ctx, "guest_dhcp: tail-call entered");
+    let act = egress::dhcp_handle(&ctx);
+    dbg::dlog!(&ctx, "guest_dhcp: action={}", act);
+    act
 }
 
 #[xdp]
 pub fn uplink_rx(ctx: XdpContext) -> u32 {
+    dbg::dlog!(&ctx, "uplink_rx: ingress_ifindex={}", unsafe {
+        (*ctx.ctx).ingress_ifindex
+    });
     match ingress::try_uplink_rx(&ctx) {
         Ok(act) => act,
         Err(()) => xdp_action::XDP_PASS,
