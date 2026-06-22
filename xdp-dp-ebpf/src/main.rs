@@ -19,7 +19,6 @@ mod nat64;
 mod parse;
 mod tc;
 mod v6;
-mod verdict;
 mod vip;
 
 use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};

@@ -307,6 +307,12 @@ pub fn nat64_egress(
     let ip6_plen =
         u16::from_be(unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 4) as *const u16) });
     let l4_len = ip6_plen as usize;
+    // `ip6_plen` is attacker-controlled. It feeds the translated IPv4 `total_len` and the L4
+    // pseudo-header checksum length, so a frame that overstates it would produce a malformed,
+    // mis-checksummed packet. Reject anything whose claimed payload overruns the actual buffer.
+    if data + ETH_LEN + IPV6_LEN + l4_len > data_end {
+        return Ok(None);
+    }
 
     // Existing L4 checksum (big-endian, from packet) — used for incremental update.
     // For TCP: offset 16 in L4; for UDP: offset 6; for ICMPv6: offset 2.
@@ -693,6 +699,11 @@ pub fn tc_nat64_egress(
     let ip6_plen =
         u16::from_be(unsafe { core::ptr::read_unaligned(p.add(ETH_LEN + 4) as *const u16) });
     let l4_len = ip6_plen as usize;
+    // See the XDP path: `ip6_plen` is attacker-controlled and feeds the translated IPv4
+    // `total_len`/`inner_len` and the L4 checksum length. Reject claimed payloads that overrun.
+    if data + ETH_LEN + IPV6_LEN + l4_len > data_end {
+        return Ok(None);
+    }
 
     let (l4_proto_v4, sport, dport, old_l4_cksum_be): (u8, u16, u16, u16) = match nh {
         IPPROTO_ICMPV6 => {

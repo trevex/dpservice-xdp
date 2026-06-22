@@ -1,0 +1,57 @@
+name: docker
+
+# Build and publish the xdp-dp container image:
+#   * every push to main  -> tagged with the short commit SHA (e.g. d76a033)
+#   * every pushed tag    -> tagged with the tag name (e.g. v1.2.3)
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+
+concurrency:
+  # Cancel an in-flight build for the same ref when a newer commit lands.
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            # main pushes: the bare short SHA (only on the default branch)
+            type=sha,prefix=,format=short,enable={{is_default_branch}}
+            # tag pushes: the literal git tag name
+            type=ref,event=tag
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The image self-builds LLVM 21 + bpf-linker + a release Rust build, so reuse layers
+          # across runs via the GitHub Actions cache.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

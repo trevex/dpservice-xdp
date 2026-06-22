@@ -1,5 +1,4 @@
 use aya_ebpf::{
-    bindings::xdp_action,
     helpers::{bpf_xdp_adjust_tail, bpf_xdp_load_bytes, bpf_xdp_store_bytes},
     programs::XdpContext,
 };
@@ -118,8 +117,6 @@ const D6_REPLY: u8 = 7;
 const D6_OPT_CLIENTID: u16 = 1;
 const D6_OPT_SERVERID: u16 = 2;
 const D6_OPT_IA_NA: u16 = 3;
-const D6_OPT_IAADDR: u16 = 5;
-const D6_OPT_STATUS_CODE: u16 = 13;
 const D6_OPT_RAPID_COMMIT: u16 = 14;
 const D6_OPT_USER_CLASS: u16 = 15;
 const D6_OPT_VENDOR_CLASS: u16 = 16;

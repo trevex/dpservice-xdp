@@ -1,3 +1,8 @@
+// `tonic::Status` is a large type, and it is the error type the generated `DPDKironcore` trait
+// mandates for every handler (and the decode helpers that feed them). Boxing it everywhere to
+// satisfy `result_large_err` would add indirection and noise for no real benefit on a gRPC server.
+#![allow(clippy::result_large_err)]
+
 pub mod pb {
     tonic::include_proto!("dpdkironcore.v1");
 }
@@ -69,6 +74,10 @@ struct Cli {
     cmd: Cmd,
 }
 
+// One `Cmd` is parsed once at startup and lives for the process; the size gap between the tiny
+// subcommands and the flag-heavy `Bringup`/`TcBringup` is irrelevant, and boxing variants fights
+// clap's derive (it expects `#[arg]` fields directly on the variant).
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Load and attach the XDP datapath to an interface, then idle.
@@ -442,7 +451,9 @@ async fn main() -> anyhow::Result<()> {
             let mut ifaces = maps::Interfaces::open(&mut ebpf)?;
             let mut underlay_map = maps::Underlay::open(&mut ebpf)?;
             // Collect v4 guest data keyed by ifname so --guest6 can look up the v4 fields.
-            let mut guest_v4: std::collections::HashMap<String, ([u8; 4], [u8; 6], [u8; 16], u32)> =
+            // Value columns: (overlay_ipv4, guest_mac, underlay_ipv6, vni).
+            type GuestV4 = ([u8; 4], [u8; 6], [u8; 16], u32);
+            let mut guest_v4: std::collections::HashMap<String, GuestV4> =
                 std::collections::HashMap::new();
             // --guest: "<ifname>=<overlay_ipv4>=<guest_mac>=<underlay_ipv6>=<vni>". The per-interface
             // underlay IPv6 is the interface's identity on the underlay; UNDERLAY maps it -> (vni,tap).

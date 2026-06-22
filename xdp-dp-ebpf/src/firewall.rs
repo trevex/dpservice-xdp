@@ -1,6 +1,6 @@
 use xdp_dp_common::{
-    fw_rule_matches, FwMeta, FwRule, FwRuleKey, FW_ACTION_ACCEPT, FW_ACTION_DROP, FW_DIR_EGRESS,
-    FW_MAX_RULES,
+    fw_rule_matches, FwMeta, FwRule, FwRuleKey, PacketSelectors, FW_ACTION_ACCEPT, FW_ACTION_DROP,
+    FW_DIR_EGRESS, FW_MAX_RULES,
 };
 
 use crate::maps::{FW_CONFIG, FW_META, FW_RULES};
@@ -61,13 +61,20 @@ pub fn fw_eval_dir(data: usize, data_end: usize, ip_off: usize, ifindex: u32, di
         None => (unsafe { *p.add(ip_off + 9) }, 0u16, 0u16),
     };
     let (itype, icode) = icmp_type_code(data, data_end, ip_off);
+    let sel = PacketSelectors {
+        src,
+        dst,
+        proto,
+        sport,
+        dport,
+        icmp_type: itype,
+        icmp_code: icode,
+    };
     let mut idx: u32 = 0;
     while idx < FW_MAX_RULES {
         if let Some(r) = unsafe { FW_RULES.get(&FwRuleKey { ifindex, idx }) } {
             let r: FwRule = *r;
-            if r.direction == dir
-                && fw_rule_matches(&r, &src, &dst, proto, sport, dport, itype, icode)
-            {
+            if r.direction == dir && fw_rule_matches(&r, &sel) {
                 return r.action;
             }
         }

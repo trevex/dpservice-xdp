@@ -20,9 +20,47 @@ use crate::maps::{
 /// detaches the program from the device. The Tc variant (tc clsact on the guest tap) is the
 /// default; the Xdp variant is the legacy fallback (`XDP_DP_GUEST_TC=0`). The uplink is always XDP.
 enum GuestLink {
-    Xdp(aya::programs::xdp::XdpLink),
-    Tc(aya::programs::tc::SchedClassifierLink),
+    // The link handles are never read back; they are held solely so that dropping the variant
+    // detaches the program from the device (RAII detach).
+    Xdp(#[allow(dead_code)] aya::programs::xdp::XdpLink),
+    Tc(#[allow(dead_code)] aya::programs::tc::SchedClassifierLink),
 }
+
+/// Per-interface addressing + rate-limit parameters for `create_interface` / `program_iface_maps`.
+/// Bundled into one struct so the programming path doesn't thread ten positional arguments.
+pub struct IfaceParams {
+    pub vni: u32,
+    pub ipv4: [u8; 4],
+    pub ipv6: [u8; 16],
+    pub gateway_ipv4: [u8; 4],
+    pub gateway_ipv6: [u8; 16],
+    pub underlay_ipv6: [u8; 16],
+    pub total_mbps: u64,
+    pub public_mbps: u64,
+}
+
+// Named shapes for the shadow records and gRPC list/get return rows, so the signatures below read
+// as `Vec<RouteRow>` rather than a bare six-tuple (keeps `clippy::type_complexity` quiet and
+// documents each column). Fields are described where each is produced/consumed.
+
+/// `(vni, prefix_ipv4, prefix_len, nexthop_vni, nexthop_underlay)` for list/delete_route.
+pub(crate) type RouteShadowV4 = (u32, [u8; 4], u32, u32, [u8; 16]);
+/// `(vni, prefix_ipv6, prefix_len, nexthop_vni, nexthop_underlay)` IPv6 routes shadow.
+pub(crate) type RouteShadowV6 = (u32, [u8; 16], u32, u32, [u8; 16]);
+/// `(vni, ipv4, ipv6, underlay, device)` for a single interface.
+pub(crate) type InterfaceDetail = (u32, [u8; 4], [u8; 16], [u8; 16], String);
+/// `(interface_id, vni, ipv4, ipv6, underlay, device)` row.
+pub(crate) type InterfaceRow = (Vec<u8>, u32, [u8; 4], [u8; 16], [u8; 16], String);
+/// `(route_vni, ip_bytes_16, prefix_len, nexthop_vni, nexthop_ipv6, is_ipv6)` row.
+pub(crate) type RouteRow = (u32, [u8; 16], u32, u32, [u8; 16], bool);
+/// `(vni, ip_bytes, lb_underlay, ports)` for a single load balancer.
+pub(crate) type LbDetail = (u32, LbIpBytes, [u8; 16], Vec<(u16, u8)>);
+/// `(id, vni, ip_bytes, lb_underlay, ports)` load-balancer row.
+pub(crate) type LbRow = (Vec<u8>, u32, LbIpBytes, [u8; 16], Vec<(u16, u8)>);
+/// `(nat_ip, port_min, port_max, underlay, vni)` for a guest's NAT config.
+pub(crate) type NatDetail = ([u8; 4], u16, u16, [u8; 16], u32);
+/// `(interface_id, guest_ipv4, nat_ip, port_min, port_max, vni, underlay)` local-NAT row.
+pub(crate) type LocalNatRow = (Vec<u8>, [u8; 4], [u8; 4], u16, u16, u32, [u8; 16]);
 
 /// Resolve a gRPC `device_name` to an actual kernel netdev name.
 ///
@@ -159,10 +197,8 @@ struct Inner {
     /// The guest edge is attached via tc clsact ingress (`tc_guest_tx`) by DEFAULT; set
     /// `XDP_DP_GUEST_TC=0/false/no/off` to fall back to XDP (`guest_tx`). The uplink stays XDP either way.
     guest_tc: bool,
-    /// (vni, prefix_ipv4, prefix_len, nexthop_vni, nexthop_underlay) for list/delete_route.
-    routes_shadow: Vec<(u32, [u8; 4], u32, u32, [u8; 16])>,
-    /// IPv6 routes shadow (vni, prefix_ipv6, prefix_len, nexthop_vni, nexthop_underlay).
-    routes6_shadow: Vec<(u32, [u8; 16], u32, u32, [u8; 16])>,
+    routes_shadow: Vec<RouteShadowV4>,
+    routes6_shadow: Vec<RouteShadowV6>,
     /// Shadow cache of learned guest MACs: underlay_ipv6 -> guest_mac.
     /// Persists across interface delete+recreate so that the datapath can continue
     /// delivering to the last-known MAC even when the interface is reprogrammed.
@@ -344,37 +380,16 @@ impl Control {
         }
     }
 
-    pub fn set_meter(
-        &self,
-        interface_id: &[u8],
-        total_mbps: u64,
-        public_mbps: u64,
-    ) -> anyhow::Result<()> {
-        let mut g = self.inner.lock().unwrap();
-        let ifindex = *g
-            .by_ifindex
-            .get(interface_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown interface"))?;
-        g.meter
-            .upsert(ifindex, Self::meter_state(total_mbps, public_mbps))
-    }
-
     /// Program a LOCAL interface: attach guest_tx to its device, set PORT_META + INTERFACES +
     /// UNDERLAY, retain the XDP link for detach, and record shadow detail.
-    #[allow(clippy::too_many_arguments)]
     pub fn create_interface(
         &self,
         interface_id: &[u8],
         device: &str,
-        vni: u32,
-        ipv4: [u8; 4],
-        ipv6: [u8; 16],
-        gateway_ipv4: [u8; 4],
-        gateway_ipv6: [u8; 16],
-        underlay_ipv6: [u8; 16],
-        total_mbps: u64,
-        public_mbps: u64,
+        params: IfaceParams,
     ) -> anyhow::Result<()> {
+        let (vni, ipv4, ipv6, underlay_ipv6) =
+            (params.vni, params.ipv4, params.ipv6, params.underlay_ipv6);
         // Resolve the device name to a kernel netdev. metalnet (in dpservice tap mode) claims a tap
         // from its hardcoded pool dtapvf_N but sends the DPDK vdev name net_tap{N+2} over gRPC
         // (dpservice's --vdev=net_tap{N+2},iface=dtapvf_N convention). We have no DPDK — only the
@@ -428,36 +443,26 @@ impl Control {
         g.by_ifindex.insert(interface_id.to_vec(), tap);
         g.iface_underlay
             .insert(interface_id.to_vec(), underlay_ipv6);
-        Self::program_iface_maps(
-            &mut g,
-            tap,
+        Self::program_iface_maps(&mut g, tap, mac, &params)
+    }
+
+    /// Program PORT_META / INTERFACES / UNDERLAY / METER / local self-route for one interface.
+    fn program_iface_maps(
+        g: &mut Inner,
+        tap: u32,
+        mac: [u8; 6],
+        params: &IfaceParams,
+    ) -> anyhow::Result<()> {
+        let IfaceParams {
             vni,
             ipv4,
             ipv6,
             gateway_ipv4,
             gateway_ipv6,
-            mac,
             underlay_ipv6,
             total_mbps,
             public_mbps,
-        )
-    }
-
-    /// Program PORT_META / INTERFACES / UNDERLAY / METER / local self-route for one interface.
-    #[allow(clippy::too_many_arguments)]
-    fn program_iface_maps(
-        g: &mut Inner,
-        tap: u32,
-        vni: u32,
-        ipv4: [u8; 4],
-        ipv6: [u8; 16],
-        gateway_ipv4: [u8; 4],
-        gateway_ipv6: [u8; 16],
-        mac: [u8; 6],
-        underlay_ipv6: [u8; 16],
-        total_mbps: u64,
-        public_mbps: u64,
-    ) -> anyhow::Result<()> {
+        } = *params;
         // MAC learning persistence: use the shadow cache of learned MACs, which is populated
         // by detach_interface before it removes the UNDERLAY entry. This ensures that a
         // delete+recreate cycle preserves the datapath-learned MAC even though the BPF UNDERLAY
@@ -632,11 +637,8 @@ impl Control {
         Ok(true)
     }
 
-    /// Interface detail for get/list. Returns (vni, ipv4, ipv6, underlay).
-    pub fn get_interface(
-        &self,
-        interface_id: &[u8],
-    ) -> Option<(u32, [u8; 4], [u8; 16], [u8; 16], String)> {
+    /// Interface detail for get/list. Returns (vni, ipv4, ipv6, underlay, device).
+    pub fn get_interface(&self, interface_id: &[u8]) -> Option<InterfaceDetail> {
         let g = self.inner.lock().unwrap();
         g.by_id
             .get(interface_id)
@@ -644,7 +646,7 @@ impl Control {
     }
 
     /// All interface ids with their (vni, ipv4, ipv6, underlay, device).
-    pub fn list_interfaces(&self) -> Vec<(Vec<u8>, u32, [u8; 4], [u8; 16], [u8; 16], String)> {
+    pub fn list_interfaces(&self) -> Vec<InterfaceRow> {
         let g = self.inner.lock().unwrap();
         g.by_id
             .iter()
@@ -755,7 +757,7 @@ impl Control {
 
     /// List routes for a VNI (or all if vni=0).
     /// Returns (route_vni, ip_bytes_16, prefix_len, nexthop_vni, nexthop_ipv6, is_ipv6).
-    pub fn list_routes_all(&self, vni: u32) -> Vec<(u32, [u8; 16], u32, u32, [u8; 16], bool)> {
+    pub fn list_routes_all(&self, vni: u32) -> Vec<RouteRow> {
         let g = self.inner.lock().unwrap();
         let mut result = Vec::new();
         // IPv4 routes.
@@ -937,7 +939,7 @@ impl Control {
     }
 
     /// Return detail for a single LB: (vni, ip_bytes, lb_underlay, ports).
-    pub fn get_lb(&self, id: &[u8]) -> Option<(u32, LbIpBytes, [u8; 16], Vec<(u16, u8)>)> {
+    pub fn get_lb(&self, id: &[u8]) -> Option<LbDetail> {
         let g = self.inner.lock().unwrap();
         g.lbs
             .get(id)
@@ -945,7 +947,7 @@ impl Control {
     }
 
     /// List all LBs: (id, vni, ip_bytes, lb_underlay, ports).
-    pub fn list_lbs(&self) -> Vec<(Vec<u8>, u32, LbIpBytes, [u8; 16], Vec<(u16, u8)>)> {
+    pub fn list_lbs(&self) -> Vec<LbRow> {
         let g = self.inner.lock().unwrap();
         g.lbs
             .iter()
@@ -1097,7 +1099,7 @@ impl Control {
         }
 
         // Check for overlapping port range across all interfaces in this VNI with the same nat_ip.
-        for (_id, r) in &g.by_id {
+        for r in g.by_id.values() {
             if r.vni == vni {
                 if let Some(v) = g.nat.get(&NatKey { vni, ipv4: r.ipv4 }) {
                     if v.nat_ipv4 == nat_ip {
@@ -1133,7 +1135,7 @@ impl Control {
     }
 
     /// Return a guest's NAT config (nat_ip, port_min, port_max, underlay, vni), if set.
-    pub fn get_nat(&self, interface_id: &[u8]) -> Option<([u8; 4], u16, u16, [u8; 16], u32)> {
+    pub fn get_nat(&self, interface_id: &[u8]) -> Option<NatDetail> {
         let g = self.inner.lock().unwrap();
         let rec = g.by_id.get(interface_id)?;
         let (vni, gip) = (rec.vni, rec.ipv4);
@@ -1144,9 +1146,9 @@ impl Control {
     }
 
     /// List all local NAT entries: (interface_id, guest_ipv4, nat_ip, port_min, port_max, vni, underlay).
-    pub fn list_local_nats(&self) -> Vec<(Vec<u8>, [u8; 4], [u8; 4], u16, u16, u32, [u8; 16])> {
+    pub fn list_local_nats(&self) -> Vec<LocalNatRow> {
         let g = self.inner.lock().unwrap();
-        let mut result: Vec<(Vec<u8>, [u8; 4], [u8; 4], u16, u16, u32, [u8; 16])> = g
+        let mut result: Vec<LocalNatRow> = g
             .by_id
             .iter()
             .filter_map(|(id, rec)| {
@@ -1392,13 +1394,12 @@ impl Control {
         for (oid, pv) in &g.prefixes {
             if oid != interface_id {
                 if let Some(orec) = g.by_id.get(oid) {
-                    if orec.vni == vni {
-                        if pv
+                    if orec.vni == vni
+                        && pv
                             .iter()
                             .any(|pr| !pr.is_ipv6 && pr.ip[..4] == prefix && pr.len == prefix_len)
-                        {
-                            anyhow::bail!("ROUTE_EXISTS: prefix already in use in this VNI");
-                        }
+                    {
+                        anyhow::bail!("ROUTE_EXISTS: prefix already in use in this VNI");
                     }
                 }
             }

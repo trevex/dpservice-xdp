@@ -357,19 +357,31 @@ pub struct NeighborNatEntry {
     pub _pad: [u8; 3],
 }
 
+/// The packet fields a firewall rule is matched against. `icmp_type`/`icmp_code` are only
+/// consulted when `proto == 1` (ICMP).
+pub struct PacketSelectors {
+    pub src: [u8; 4],
+    pub dst: [u8; 4],
+    pub proto: u8,
+    pub sport: u16,
+    pub dport: u16,
+    pub icmp_type: u16,
+    pub icmp_code: u16,
+}
+
 /// Pure firewall match (no_std; used by the datapath and host-tested). Returns true if `r` matches
-/// the packet selectors. `icmp_type`/`icmp_code` are ignored unless `proto == 1`.
+/// the packet selectors `s`.
 #[inline]
-pub fn fw_rule_matches(
-    r: &FwRule,
-    src: &[u8; 4],
-    dst: &[u8; 4],
-    proto: u8,
-    sport: u16,
-    dport: u16,
-    icmp_type: u16,
-    icmp_code: u16,
-) -> bool {
+pub fn fw_rule_matches(r: &FwRule, s: &PacketSelectors) -> bool {
+    let PacketSelectors {
+        src,
+        dst,
+        proto,
+        sport,
+        dport,
+        icmp_type,
+        icmp_code,
+    } = *s;
     if r.enabled == 0 {
         return false;
     }
@@ -510,8 +522,13 @@ pub mod arp_nd {
     }
 
     /// If [data,data_end) is an ICMPv6 Neighbor Solicitation for `gateway_ipv6`, rewrite it in place
-    /// into a solicited Neighbor Advertisement from `reply_mac` and return true. Else false. Caller
-    /// must have made ETH_LEN+IPV6_LEN+32 bytes writable. Unsafe: raw pointer writes.
+    /// into a solicited Neighbor Advertisement from `reply_mac` and return true. Else false.
+    ///
+    /// # Safety
+    /// `data`/`data_end` must be the bounds of a single packet buffer (`data <= data_end`), and the
+    /// caller must have made the first `ETH_LEN + IPV6_LEN + 32` bytes from `data` writable (e.g. via
+    /// the XDP/tc direct-packet-access guarantees). The function re-checks the length internally and
+    /// only writes when it fits, but the pointer itself must be valid.
     ///
     /// `#[inline(always)]`: the XDP `guest_tx` caller is stack-heavy (conntrack/nat/v6); keeping
     /// this out-of-line makes it a separate BPF subprogram whose frame is summed with the caller's,
@@ -579,8 +596,12 @@ pub mod arp_nd {
     }
 
     /// If [data,data_end) is an ARP request for `gateway_ipv4`, rewrite it in place into a reply
-    /// from `reply_mac`/`gateway_ipv4` and return true. Else false (unchanged). Caller must have
-    /// made the first ETH_LEN+ARP_LEN bytes writable. Unsafe: raw pointer writes.
+    /// from `reply_mac`/`gateway_ipv4` and return true. Else false (unchanged).
+    ///
+    /// # Safety
+    /// `data`/`data_end` must bound a single packet buffer (`data <= data_end`), and the caller must
+    /// have made the first `ETH_LEN + ARP_LEN` bytes from `data` writable. The length is re-checked
+    /// internally before any write, but the `data` pointer itself must be valid.
     ///
     /// `#[inline(always)]` for the same BPF-stack reason as `try_write_nd_reply` (the XDP
     /// `guest_tx` caller is stack-heavy).
@@ -1204,6 +1225,50 @@ pub mod dhcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// BPF map lookups hash the *raw bytes* of the key, so any implicit padding hole (whose bytes
+    /// the writer may leave as garbage) silently breaks lookups — the dpservice-class trap. This
+    /// pins the field offsets of the hot hashed keys and asserts each one has no padding beyond the
+    /// explicit `_pad` fields, so a field reorder/insert that introduces a hole fails loudly here
+    /// rather than as a heisen-miss in production.
+    #[test]
+    fn hashed_keys_have_no_implicit_padding() {
+        // CtKey: vni(4) src_ip(4) dst_ip(4) src_port(2) dst_port(2) proto(1) _pad(3) = 20.
+        assert_eq!(offset_of!(CtKey, vni), 0);
+        assert_eq!(offset_of!(CtKey, src_ip), 4);
+        assert_eq!(offset_of!(CtKey, dst_ip), 8);
+        assert_eq!(offset_of!(CtKey, src_port), 12);
+        assert_eq!(offset_of!(CtKey, dst_port), 14);
+        assert_eq!(offset_of!(CtKey, proto), 16);
+        assert_eq!(offset_of!(CtKey, _pad), 17);
+        assert_eq!(size_of::<CtKey>(), 4 + 4 + 4 + 2 + 2 + 1 + 3);
+
+        // LbKey: vni(4) ipv4(4) port(2) proto(1) _pad(1) = 12.
+        assert_eq!(offset_of!(LbKey, vni), 0);
+        assert_eq!(offset_of!(LbKey, ipv4), 4);
+        assert_eq!(offset_of!(LbKey, port), 8);
+        assert_eq!(offset_of!(LbKey, proto), 10);
+        assert_eq!(offset_of!(LbKey, _pad), 11);
+        assert_eq!(size_of::<LbKey>(), 4 + 4 + 2 + 1 + 1);
+
+        // The padding-free word-packed keys: total size == sum of field sizes (no hidden hole),
+        // and natural 4-byte alignment (so an Array/Hash of them is densely packed).
+        assert_eq!(size_of::<IfaceKey>(), 4 + 4);
+        assert_eq!(size_of::<NatKey>(), 4 + 4);
+        assert_eq!(size_of::<VipKey>(), 4 + 4);
+        assert_eq!(size_of::<FwRuleKey>(), 4 + 4);
+        assert_eq!(size_of::<MaglevKey>(), 4 + 4);
+        assert_eq!(size_of::<RouteLpmData>(), 4 + 4);
+        assert_eq!(size_of::<RouteLpmData6>(), 4 + 16);
+        for (a, n) in [
+            (align_of::<CtKey>(), "CtKey"),
+            (align_of::<LbKey>(), "LbKey"),
+            (align_of::<IfaceKey>(), "IfaceKey"),
+        ] {
+            assert_eq!(a, 4, "{n} must stay 4-byte aligned");
+        }
+    }
 
     #[test]
     fn iface_key_is_word_packed() {
@@ -1328,46 +1393,19 @@ mod tests {
             direction: FW_DIR_INGRESS,
             enabled: 1,
         };
-        assert!(fw_rule_matches(
-            &r,
-            &[1, 2, 3, 4],
-            &[10, 0, 0, 5],
-            6,
-            12345,
-            80,
-            0,
-            0
-        ));
-        assert!(!fw_rule_matches(
-            &r,
-            &[1, 2, 3, 4],
-            &[10, 0, 0, 5],
-            6,
-            12345,
-            81,
-            0,
-            0
-        ));
-        assert!(!fw_rule_matches(
-            &r,
-            &[1, 2, 3, 4],
-            &[10, 0, 0, 5],
-            17,
-            12345,
-            80,
-            0,
-            0
-        ));
-        assert!(!fw_rule_matches(
-            &r,
-            &[1, 2, 3, 4],
-            &[10, 0, 0, 6],
-            6,
-            12345,
-            80,
-            0,
-            0
-        ));
+        let sel = |dst: [u8; 4], proto: u8, dport: u16| PacketSelectors {
+            src: [1, 2, 3, 4],
+            dst,
+            proto,
+            sport: 12345,
+            dport,
+            icmp_type: 0,
+            icmp_code: 0,
+        };
+        assert!(fw_rule_matches(&r, &sel([10, 0, 0, 5], 6, 80)));
+        assert!(!fw_rule_matches(&r, &sel([10, 0, 0, 5], 6, 81)));
+        assert!(!fw_rule_matches(&r, &sel([10, 0, 0, 5], 17, 80)));
+        assert!(!fw_rule_matches(&r, &sel([10, 0, 0, 6], 6, 80)));
     }
 
     #[test]
@@ -1388,38 +1426,20 @@ mod tests {
             direction: FW_DIR_INGRESS,
             enabled: 1,
         };
-        assert!(fw_rule_matches(
-            &r,
-            &[1, 1, 1, 1],
-            &[2, 2, 2, 2],
-            1,
-            0,
-            0,
-            8,
-            0
-        ));
-        assert!(!fw_rule_matches(
-            &r,
-            &[1, 1, 1, 1],
-            &[2, 2, 2, 2],
-            1,
-            0,
-            0,
-            0,
-            0
-        ));
+        let icmp = |icmp_type: u16| PacketSelectors {
+            src: [1, 1, 1, 1],
+            dst: [2, 2, 2, 2],
+            proto: 1,
+            sport: 0,
+            dport: 0,
+            icmp_type,
+            icmp_code: 0,
+        };
+        assert!(fw_rule_matches(&r, &icmp(8)));
+        assert!(!fw_rule_matches(&r, &icmp(0)));
         let mut d = r;
         d.enabled = 0;
-        assert!(!fw_rule_matches(
-            &d,
-            &[1, 1, 1, 1],
-            &[2, 2, 2, 2],
-            1,
-            0,
-            0,
-            8,
-            0
-        ));
+        assert!(!fw_rule_matches(&d, &icmp(8)));
     }
 }
 

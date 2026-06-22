@@ -540,14 +540,16 @@ impl DpdKironcore for Service {
         match control.create_interface(
             &interface_id,
             &device,
-            vni,
-            ipv4,
-            ipv6,
-            gateway_ipv4,
-            gateway_ipv6,
-            underlay,
-            total_mbps,
-            public_mbps,
+            crate::control::IfaceParams {
+                vni,
+                ipv4,
+                ipv6,
+                gateway_ipv4,
+                gateway_ipv6,
+                underlay_ipv6: underlay,
+                total_mbps,
+                public_mbps,
+            },
         ) {
             Ok(()) => {}
             Err(e) => {

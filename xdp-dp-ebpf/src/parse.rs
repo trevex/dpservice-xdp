@@ -2,11 +2,13 @@ pub const ETH_LEN: usize = 14;
 pub const IPV6_LEN: usize = 40;
 pub const ETH_P_IP: u16 = 0x0800;
 pub const ETH_P_IPV6: u16 = 0x86DD;
-pub const ETH_P_ARP: u16 = 0x0806;
 pub const IPPROTO_IPIP: u8 = 4; // IPv4 encapsulated in IPv6 (outer next-header)
 pub const IPPROTO_IPV6: u8 = 41; // IPv6 encapsulated in IPv6 (outer next-header)
 pub const IPPROTO_ICMPV6: u8 = 58; // ICMPv6
 
+/// # Safety
+/// `dst` must point to at least 6 writable, in-bounds bytes (the caller is responsible for the
+/// XDP/tc `data_end` bounds check before calling).
 #[inline(always)]
 pub unsafe fn write6(dst: *mut u8, src: &[u8; 6]) {
     let mut i = 0;
@@ -16,6 +18,9 @@ pub unsafe fn write6(dst: *mut u8, src: &[u8; 6]) {
     }
 }
 
+/// # Safety
+/// `dst` must point to at least 16 writable, in-bounds bytes (the caller is responsible for the
+/// XDP/tc `data_end` bounds check before calling).
 #[inline(always)]
 pub unsafe fn write16(dst: *mut u8, src: &[u8; 16]) {
     let mut i = 0;

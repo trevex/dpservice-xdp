@@ -1,6 +1,6 @@
 use xdp_dp_common::{CtEntry, CtKey, NatKey, NeighborNatEntry, NB_MAX_ENTRIES};
 
-use crate::csum::csum_replace4;
+use crate::csum::{csum_replace2, csum_replace4};
 use crate::maps::{NAT, NEIGHBOR_NAT, NEIGHBOR_NAT_COUNT};
 use crate::parse::{hash5, l4_ports};
 
@@ -8,15 +8,6 @@ const IPPROTO_ICMP: u8 = 1;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 pub const PROBE_LIMIT: u16 = 64;
-
-/// Incrementally fold a 16-bit field change (network-order `old`/`new`) into an L4/ICMP checksum
-/// by reusing `csum_replace4` with the upper 2 bytes zeroed in both arguments.
-#[inline(always)]
-fn csum_replace2(check: u16, old: u16, new: u16) -> u16 {
-    let o = old.to_be_bytes();
-    let n = new.to_be_bytes();
-    csum_replace4(check, &[o[0], o[1], 0, 0], &[n[0], n[1], 0, 0])
-}
 
 /// Egress network SNAT. If `is_external` and the guest (vni, src) has a NAT config, allocate a
 /// source port (reusing the forward-conntrack port if the flow is already tracked), rewrite

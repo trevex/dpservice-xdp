@@ -5,19 +5,17 @@ use aya::maps::{
 };
 use aya::Ebpf;
 use xdp_dp_common::{
-    Config, CtEntry, CtKey, DhcpConfig, DhcpMeta, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue,
+    CtEntry, CtKey, DhcpConfig, DhcpMeta, FwMeta, FwRule, FwRuleKey, IfaceKey, IfaceValue,
     InspectEntry, LbKey, LbValue, Local, MaglevKey, MeterState, NatKey, NatValue, NeighborNatEntry,
     PortMeta, RouteLpmData, RouteLpmData6, RouteValue, UnderlayValue, VipKey,
 };
 
 /// Typed handle over the `INTERFACES` BPF map (overlay (VNI, IPv4) -> delivery info).
 // Exercised by the roundtrip test now; wired into the gRPC control plane in Task 12.
-#[allow(dead_code)]
 pub struct Interfaces {
     map: HashMap<MapData, IfaceKey, IfaceValue>,
 }
 
-#[allow(dead_code)]
 impl Interfaces {
     /// Take ownership of the `INTERFACES` map from a loaded eBPF object.
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
@@ -36,18 +34,18 @@ impl Interfaces {
         self.map.remove(&key).context("remove iface")
     }
 
+    /// Read-back accessor exercised by the (root-only) roundtrip test; not used by the daemon.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get(&self, key: &IfaceKey) -> Option<IfaceValue> {
         self.map.get(key, 0).ok()
     }
 }
 
 /// Typed handle over the single-entry `LOCAL` Array map.
-#[allow(dead_code)]
 pub struct LocalMap {
     map: Array<MapData, Local>,
 }
 
-#[allow(dead_code)]
 impl LocalMap {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = Array::try_from(ebpf.take_map("LOCAL").context("LOCAL map missing")?)?;
@@ -59,37 +57,11 @@ impl LocalMap {
     }
 }
 
-/// Typed handle over the single-entry `CONFIG` Array map.
-pub struct ConfigMap {
-    map: Array<MapData, Config>,
-}
-
-#[allow(dead_code)]
-impl ConfigMap {
-    /// Take ownership of the `CONFIG` map from a loaded eBPF object.
-    pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
-        let map = Array::try_from(ebpf.take_map("CONFIG").context("CONFIG map missing")?)?;
-        Ok(Self { map })
-    }
-
-    /// Write a `Config` into entry 0.
-    pub fn set(&mut self, cfg: &Config) -> anyhow::Result<()> {
-        self.map.set(0, cfg, 0).context("write CONFIG[0]")
-    }
-
-    /// Read entry 0.
-    pub fn get(&self) -> anyhow::Result<Config> {
-        self.map.get(&0, 0).context("read CONFIG[0]")
-    }
-}
-
 /// Typed handle over the `PORT_META` BPF map (ifindex -> per-port metadata).
-#[allow(dead_code)]
 pub struct PortMetaMap {
     map: HashMap<MapData, u32, PortMeta>,
 }
 
-#[allow(dead_code)]
 impl PortMetaMap {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(
@@ -107,10 +79,6 @@ impl PortMetaMap {
 
     pub fn remove(&mut self, ifindex: u32) -> anyhow::Result<()> {
         self.map.remove(&ifindex).context("remove port_meta")
-    }
-
-    pub fn get(&self, ifindex: u32) -> Option<PortMeta> {
-        self.map.get(&ifindex, 0).ok()
     }
 }
 
@@ -131,12 +99,10 @@ impl InspectMap {
 }
 
 /// Typed handle over the `ROUTES` BPF LPM trie map.
-#[allow(dead_code)]
 pub struct Routes {
     map: LpmTrie<MapData, RouteLpmData, RouteValue>,
 }
 
-#[allow(dead_code)]
 impl Routes {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = LpmTrie::try_from(ebpf.take_map("ROUTES").context("ROUTES map missing")?)?;
@@ -173,12 +139,10 @@ impl Routes {
 }
 
 /// Typed handle over the `ROUTES6` BPF LPM trie map (IPv6 overlay routes).
-#[allow(dead_code)]
 pub struct Routes6 {
     map: LpmTrie<MapData, RouteLpmData6, RouteValue>,
 }
 
-#[allow(dead_code)]
 impl Routes6 {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = LpmTrie::try_from(ebpf.take_map("ROUTES6").context("ROUTES6 map missing")?)?;
@@ -215,12 +179,10 @@ impl Routes6 {
 }
 
 /// Typed handle over the `VIPS` BPF map.
-#[allow(dead_code)]
 pub struct Vips {
     map: HashMap<MapData, VipKey, [u8; 4]>,
 }
 
-#[allow(dead_code)]
 impl Vips {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(ebpf.take_map("VIPS").context("VIPS map missing")?)?;
@@ -241,12 +203,10 @@ impl Vips {
 }
 
 /// Typed handle over the `LB` BPF map.
-#[allow(dead_code)]
 pub struct Lb {
     map: HashMap<MapData, LbKey, LbValue>,
 }
 
-#[allow(dead_code)]
 impl Lb {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(ebpf.take_map("LB").context("LB map missing")?)?;
@@ -260,19 +220,13 @@ impl Lb {
     pub fn remove(&mut self, key: &LbKey) -> anyhow::Result<()> {
         self.map.remove(key).context("remove lb")
     }
-
-    pub fn get(&self, key: &LbKey) -> Option<LbValue> {
-        self.map.get(key, 0).ok()
-    }
 }
 
 /// Typed handle over the `MAGLEV` BPF map.
-#[allow(dead_code)]
 pub struct Maglev {
     map: HashMap<MapData, MaglevKey, [u8; 16]>,
 }
 
-#[allow(dead_code)]
 impl Maglev {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(ebpf.take_map("MAGLEV").context("MAGLEV map missing")?)?;
@@ -286,19 +240,13 @@ impl Maglev {
     pub fn remove(&mut self, key: &MaglevKey) -> anyhow::Result<()> {
         self.map.remove(key).context("remove maglev")
     }
-
-    pub fn get(&self, key: &MaglevKey) -> Option<[u8; 16]> {
-        self.map.get(key, 0).ok()
-    }
 }
 
 /// Typed handle over the `CONNTRACK` BPF map (LRU hash map).
-#[allow(dead_code)]
 pub struct Conntrack {
     map: HashMap<MapData, CtKey, CtEntry>,
 }
 
-#[allow(dead_code)]
 impl Conntrack {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(
@@ -319,16 +267,8 @@ impl Conntrack {
         Ok(Self { map })
     }
 
-    pub fn upsert(&mut self, key: CtKey, val: CtEntry) -> anyhow::Result<()> {
-        self.map.insert(key, val, 0).context("insert conntrack")
-    }
-
     pub fn remove(&mut self, key: &CtKey) -> anyhow::Result<()> {
         self.map.remove(key).context("remove conntrack")
-    }
-
-    pub fn get(&self, key: &CtKey) -> Option<CtEntry> {
-        self.map.get(key, 0).ok()
     }
 
     /// Snapshot all (key, entry) pairs for a GC sweep.
@@ -338,12 +278,10 @@ impl Conntrack {
 }
 
 /// Typed handle over the `NAT` BPF map ((vni, guest ipv4) -> nat config).
-#[allow(dead_code)]
 pub struct Nat {
     map: HashMap<MapData, NatKey, NatValue>,
 }
 
-#[allow(dead_code)]
 impl Nat {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(ebpf.take_map("NAT").context("NAT map missing")?)?;
@@ -364,12 +302,10 @@ impl Nat {
 }
 
 /// Typed handle over the `FW_RULES` BPF map ((ifindex, slot) -> rule).
-#[allow(dead_code)]
 pub struct FwRules {
     map: HashMap<MapData, FwRuleKey, FwRule>,
 }
 
-#[allow(dead_code)]
 impl FwRules {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(ebpf.take_map("FW_RULES").context("FW_RULES map missing")?)?;
@@ -383,19 +319,13 @@ impl FwRules {
     pub fn remove(&mut self, key: &FwRuleKey) -> anyhow::Result<()> {
         self.map.remove(key).context("remove fw rule")
     }
-
-    pub fn get(&self, key: &FwRuleKey) -> Option<FwRule> {
-        self.map.get(key, 0).ok()
-    }
 }
 
 /// Typed handle over the `FW_META` BPF map (ifindex -> per-direction rule counts).
-#[allow(dead_code)]
 pub struct FwMetaMap {
     map: HashMap<MapData, u32, FwMeta>,
 }
 
-#[allow(dead_code)]
 impl FwMetaMap {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(ebpf.take_map("FW_META").context("FW_META map missing")?)?;
@@ -405,23 +335,13 @@ impl FwMetaMap {
     pub fn upsert(&mut self, ifindex: u32, val: FwMeta) -> anyhow::Result<()> {
         self.map.insert(ifindex, val, 0).context("insert fw meta")
     }
-
-    pub fn remove(&mut self, ifindex: u32) -> anyhow::Result<()> {
-        self.map.remove(&ifindex).context("remove fw meta")
-    }
-
-    pub fn get(&self, ifindex: u32) -> Option<FwMeta> {
-        self.map.get(&ifindex, 0).ok()
-    }
 }
 
 /// Typed handle over the single-entry `FW_CONFIG` Array map (entry 0 = enforce flag).
-#[allow(dead_code)]
 pub struct FwConfig {
     map: Array<MapData, u32>,
 }
 
-#[allow(dead_code)]
 impl FwConfig {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = Array::try_from(
@@ -432,17 +352,15 @@ impl FwConfig {
     }
 
     pub fn set(&mut self, enforce: u32) -> anyhow::Result<()> {
-        self.map.set(0, &enforce, 0).context("write FW_CONFIG[0]")
+        self.map.set(0, enforce, 0).context("write FW_CONFIG[0]")
     }
 }
 
 /// Typed handle over the `UNDERLAY` BPF map (underlay IPv6 -> VNI + tap + guest MAC).
-#[allow(dead_code)]
 pub struct Underlay {
     map: HashMap<MapData, [u8; 16], UnderlayValue>,
 }
 
-#[allow(dead_code)]
 impl Underlay {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(ebpf.take_map("UNDERLAY").context("UNDERLAY map missing")?)?;
@@ -463,12 +381,10 @@ impl Underlay {
 }
 
 /// Typed handle over the `NEIGHBOR_NAT` BPF map (slot index -> NeighborNatEntry).
-#[allow(dead_code)]
 pub struct NeighborNat {
     map: HashMap<MapData, u32, NeighborNatEntry>,
 }
 
-#[allow(dead_code)]
 impl NeighborNat {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(
@@ -481,19 +397,13 @@ impl NeighborNat {
     pub fn upsert(&mut self, idx: u32, val: NeighborNatEntry) -> anyhow::Result<()> {
         self.map.insert(idx, val, 0).context("insert neighbor_nat")
     }
-
-    pub fn remove(&mut self, idx: &u32) -> anyhow::Result<()> {
-        self.map.remove(idx).context("remove neighbor_nat")
-    }
 }
 
 /// Typed handle over the `METER` BPF map (ifindex -> per-interface token bucket state).
-#[allow(dead_code)]
 pub struct Meter {
     map: HashMap<MapData, u32, MeterState>,
 }
 
-#[allow(dead_code)]
 impl Meter {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(ebpf.take_map("METER").context("METER map missing")?)?;
@@ -511,12 +421,10 @@ impl Meter {
 
 /// Typed handle over the `NAT_IPS` BPF map ((vni, nat_ip) -> 1u8), marking NAT IP addresses
 /// so the ingress can generate ICMP echo replies without involving the VM.
-#[allow(dead_code)]
 pub struct NatIps {
     map: HashMap<MapData, VipKey, u8>,
 }
 
-#[allow(dead_code)]
 impl NatIps {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(ebpf.take_map("NAT_IPS").context("NAT_IPS map missing")?)?;
@@ -537,12 +445,10 @@ impl NatIps {
 }
 
 /// Typed handle over the single-entry `NEIGHBOR_NAT_COUNT` Array map.
-#[allow(dead_code)]
 pub struct NeighborNatCount {
     map: Array<MapData, u32>,
 }
 
-#[allow(dead_code)]
 impl NeighborNatCount {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = Array::try_from(
@@ -554,18 +460,16 @@ impl NeighborNatCount {
 
     pub fn set(&mut self, count: u32) -> anyhow::Result<()> {
         self.map
-            .set(0, &count, 0)
+            .set(0, count, 0)
             .context("write NEIGHBOR_NAT_COUNT[0]")
     }
 }
 
 /// Typed handle over the single-entry `DHCP_CONFIG` Array map (server-wide DHCP parameters).
-#[allow(dead_code)]
 pub struct DhcpConfigMap {
     map: Array<MapData, DhcpConfig>,
 }
 
-#[allow(dead_code)]
 impl DhcpConfigMap {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = Array::try_from(
@@ -581,12 +485,10 @@ impl DhcpConfigMap {
 }
 
 /// Typed handle over the `DHCP_META` BPF map (ifindex -> per-interface DHCP metadata).
-#[allow(dead_code)]
 pub struct DhcpMetaMap {
     map: HashMap<MapData, u32, DhcpMeta>,
 }
 
-#[allow(dead_code)]
 impl DhcpMetaMap {
     pub fn open(ebpf: &mut Ebpf) -> anyhow::Result<Self> {
         let map = HashMap::try_from(

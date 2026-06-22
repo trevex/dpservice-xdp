@@ -4,16 +4,8 @@ use xdp_dp_common::{
     TCP_RST_FIN,
 };
 
-use crate::csum::csum_replace4;
+use crate::csum::{csum_replace2, csum_replace4};
 use crate::parse::l4_ports;
-
-/// Fold a 16-bit field change (network-order) into an L4/ICMP checksum via csum_replace4.
-#[inline(always)]
-pub fn csum_replace2(check: u16, old: u16, new: u16) -> u16 {
-    let o = old.to_be_bytes();
-    let n = new.to_be_bytes();
-    csum_replace4(check, &[o[0], o[1], 0, 0], &[n[0], n[1], 0, 0])
-}
 
 /// Current kernel monotonic time (ns).
 #[inline(always)]
