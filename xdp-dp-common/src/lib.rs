@@ -464,6 +464,12 @@ pub mod arp_nd {
     pub const ETH_P_ARP: u16 = 0x0806;
     pub const ARP_LEN: usize = 28; // opcode@6 sha@8 spa@14 tha@18 tpa@24
 
+    pub const IPV6_LEN: usize = 40;
+    pub const ETH_P_IPV6: u16 = 0x86DD;
+    pub const IPPROTO_ICMPV6: u8 = 58;
+    const ND_NS: u8 = 135;
+    const ND_NA: u8 = 136;
+
     #[inline(always)]
     unsafe fn write6(dst: *mut u8, src: &[u8; 6]) {
         let mut i = 0;
@@ -471,6 +477,100 @@ pub mod arp_nd {
             *dst.add(i) = src[i];
             i += 1;
         }
+    }
+
+    #[inline(always)]
+    unsafe fn write16(dst: *mut u8, src: &[u8; 16]) {
+        let mut i = 0;
+        while i < 16 {
+            *dst.add(i) = src[i];
+            i += 1;
+        }
+    }
+
+    /// One's-complement checksum over `len` bytes at `ptr`, plus an initial `sum` (pseudo-header).
+    ///
+    /// The carry-propagation is done with exactly 2 fixed iterations (not a while loop) because
+    /// the BPF verifier requires bounded loops and one's complement fold needs at most 2 steps.
+    #[inline(always)]
+    pub(crate) unsafe fn csum16(mut sum: u32, ptr: *const u8, len: usize) -> u16 {
+        let mut i = 0;
+        while i + 1 < len {
+            sum += u16::from_be(core::ptr::read_unaligned(ptr.add(i) as *const u16)) as u32;
+            i += 2;
+        }
+        if i < len {
+            sum += (*ptr.add(i) as u32) << 8;
+        }
+        // Fold carries: two rounds suffices for any 32-bit accumulator (BPF verifier requires
+        // bounded loops, so we unroll rather than use `while sum >> 16 != 0`).
+        sum = (sum & 0xffff) + (sum >> 16);
+        sum = (sum & 0xffff) + (sum >> 16);
+        !(sum as u16)
+    }
+
+    /// If [data,data_end) is an ICMPv6 Neighbor Solicitation for `gateway_ipv6`, rewrite it in place
+    /// into a solicited Neighbor Advertisement from `reply_mac` and return true. Else false. Caller
+    /// must have made ETH_LEN+IPV6_LEN+32 bytes writable. Unsafe: raw pointer writes.
+    pub unsafe fn try_write_nd_reply(
+        data: usize,
+        data_end: usize,
+        gateway_ipv6: [u8; 16],
+        reply_mac: [u8; 6],
+    ) -> bool {
+        if data + ETH_LEN + IPV6_LEN + 32 > data_end {
+            return false;
+        }
+        let p = data as *mut u8;
+        let ethertype = u16::from_be(core::ptr::read_unaligned(p.add(12) as *const u16));
+        if ethertype != ETH_P_IPV6 {
+            return false;
+        }
+        let ip = p.add(ETH_LEN);
+        if *ip.add(6) != IPPROTO_ICMPV6 {
+            return false;
+        }
+        let icmp = p.add(ETH_LEN + IPV6_LEN);
+        if *icmp != ND_NS {
+            return false;
+        }
+        let target = core::ptr::read_unaligned(icmp.add(8) as *const [u8; 16]);
+        if target != gateway_ipv6 {
+            return false;
+        }
+        let req_mac = core::ptr::read_unaligned(p.add(6) as *const [u8; 6]);
+        let req_src = core::ptr::read_unaligned(ip.add(8) as *const [u8; 16]);
+        // Like ARP, present the virtual v6 gateway to the VF using the guest's own MAC.
+        let gw_mac = reply_mac;
+        write6(p, &req_mac);
+        write6(p.add(6), &gw_mac);
+        write16(ip.add(8), &gateway_ipv6);
+        write16(ip.add(24), &req_src);
+        *ip.add(7) = 255;
+        core::ptr::write_unaligned(ip.add(4) as *mut u16, 32u16.to_be());
+        *icmp = ND_NA;
+        *icmp.add(1) = 0;
+        core::ptr::write_unaligned(icmp.add(2) as *mut u16, 0);
+        *icmp.add(4) = 0x60;
+        *icmp.add(5) = 0;
+        *icmp.add(6) = 0;
+        *icmp.add(7) = 0;
+        // target @ +8 stays = gateway. Option @ +24: type=2 (target LL addr), len=1, gw_mac.
+        *icmp.add(24) = 2;
+        *icmp.add(25) = 1;
+        write6(icmp.add(26), &gw_mac);
+        let mut sum: u32 = 0;
+        let mut k = 0;
+        while k < 16 {
+            sum += u16::from_be(core::ptr::read_unaligned(ip.add(8 + k) as *const u16)) as u32;
+            sum += u16::from_be(core::ptr::read_unaligned(ip.add(24 + k) as *const u16)) as u32;
+            k += 2;
+        }
+        sum += 32u32;
+        sum += IPPROTO_ICMPV6 as u32;
+        let cks = csum16(sum, icmp as *const u8, 32);
+        core::ptr::write_unaligned(icmp.add(2) as *mut u16, cks.to_be());
+        true
     }
 
     /// If [data,data_end) is an ARP request for `gateway_ipv4`, rewrite it in place into a reply
@@ -514,6 +614,30 @@ pub mod arp_nd {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn rewrites_ns_to_na() {
+            let gw6 = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+            let mut f = [0u8; ETH_LEN + IPV6_LEN + 32];
+            f[6..12].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 2]);
+            f[12..14].copy_from_slice(&0x86DDu16.to_be_bytes());
+            let ip = ETH_LEN;
+            f[ip + 6] = 58;
+            f[ip + 8..ip + 24]
+                .copy_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+            let ic = ETH_LEN + IPV6_LEN;
+            f[ic] = 135;
+            f[ic + 8..ic + 24].copy_from_slice(&gw6);
+            let data = f.as_mut_ptr() as usize;
+            let ok =
+                unsafe { try_write_nd_reply(data, data + f.len(), gw6, [0x66, 0, 0, 0, 0, 1]) };
+            assert!(ok);
+            assert_eq!(&f[0..6], &[0x52, 0x54, 0, 0, 0, 2]); // eth dst = requester
+            assert_eq!(&f[6..12], &[0x66, 0, 0, 0, 0, 1]); // eth src = reply mac
+            assert_eq!(f[ic], 136); // NA
+            assert_eq!(f[ic + 4], 0x60); // solicited+override flags
+            assert_eq!(f[ic + 24], 2); // opt type = target LL addr
+            assert_eq!(&f[ic + 26..ic + 32], &[0x66, 0, 0, 0, 0, 1]); // opt = reply mac
+        }
         #[test]
         fn rewrites_arp_request_to_reply() {
             let mut f = [0u8; ETH_LEN + ARP_LEN];
