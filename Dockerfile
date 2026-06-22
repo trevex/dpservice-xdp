@@ -2,17 +2,8 @@
 #
 # Container image for the `xdp-dp` XDP datapath binary.
 #
-# WHY a self-building multi-stage build (Option A), not a host-built COPY (Option B):
-# the host build is driven by Nix, so `target/release/xdp-dp` is linked against a
-# /nix/store/... dynamic loader and glibc. That binary is NOT portable into a Debian/
-# distroless container (the nix interpreter path does not exist there) without dragging
-# the whole nix closure in. Building inside a Debian builder yields a binary linked
-# against the standard /lib64/ld-linux-x86-64.so.2 + Debian glibc, which is exactly what
-# the distroless/cc-debian12 runtime provides. So we build from source here.
-#
 # The eBPF object is compiled by aya-build (via bpf-linker) and include_bytes!-baked into
-# the xdp-dp binary at build time; the runtime image therefore needs ONLY that one binary
-# (no DPDK, no separate .o files).
+# the xdp-dp binary at build time; the runtime image therefore needs ONLY that one binary.
 #
 # Toolchain pinning is version-sensitive (see rust-toolchain.toml):
 #   * rustc nightly-2026-01-15 emits LLVM 21 bitcode.
@@ -77,9 +68,13 @@ RUN cargo +nightly-2026-01-15 build --release -p xdp-dp \
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
-# distroless/cc-debian12 provides glibc + libgcc + libstdc++ (matches the bookworm builder's
-# glibc), and nothing else — minimal attack surface for a single dynamically-linked binary.
-FROM gcr.io/distroless/cc-debian12
+# debian:bookworm-slim (matches the builder's glibc) + iproute2. iproute2 is included so the SAME
+# image can run the tap-pool init container (`ip tuntap add ...` to create the kernel taps DPDK's
+# net_tap PMD used to make) AND the datapath (`xdp-dp serve`) — one image, no extra init image.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /xdp-dp /usr/local/bin/xdp-dp
 
