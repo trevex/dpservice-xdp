@@ -71,6 +71,7 @@ sudo ip netns exec "$NS" env XDP_DP_DEBUG=1 "$BIN" tc-bringup \
     --guest-ipv4 "$GUEST_IP" --gateway-ipv4 "$GUEST_IP" --guest-mac "$GUEST_MAC" \
     --gateway-mac "$GW_MAC" --local-underlay fc00:1::1 --guest-underlay fc00:1::1 \
     --remote 10.0.0.2=fc00:2::2=100 \
+    --remote6 2001:db8:2::2=fc00:2::2=100 --guest6 2001:db8:1::1 \
     > "$DP_LOG" 2>&1 &
 DP_PID=$!
 
@@ -97,6 +98,23 @@ set -e
 
 if [[ $RC -ne 0 ]]; then
     echo "FAIL: egress encap not correct (probe rc=$RC). Datapath log tail:"
+    echo "------------------------------------------------------------------------"
+    tail -n 60 "$DP_LOG" || true
+    echo "------------------------------------------------------------------------"
+    exit 1
+fi
+
+echo "== send inner IPv6 on $TAP, capture ENCAPPED v6 frame on $PEER =="
+set +e
+sudo ip netns exec "$NS" "$PYBIN" "$ROOT/test/tap-dhcp-probe.py" \
+    --egress6 --tap "$TAP" --peer "$PEER" \
+    --guest6 2001:db8:1::1 --dst6 2001:db8:2::2 \
+    --nexthop6 fc00:2::2 --guest-underlay fc00:1::1 --timeout 5
+RC=$?
+set -e
+
+if [[ $RC -ne 0 ]]; then
+    echo "FAIL: IPv6 egress encap not correct (probe rc=$RC). Datapath log tail:"
     echo "------------------------------------------------------------------------"
     tail -n 60 "$DP_LOG" || true
     echo "------------------------------------------------------------------------"

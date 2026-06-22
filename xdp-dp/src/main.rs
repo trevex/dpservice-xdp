@@ -260,6 +260,14 @@ enum Cmd {
         /// Programs ROUTES so guest traffic to that overlay IPv4 encaps toward the nexthop.
         #[arg(long = "remote")]
         remotes: Vec<String>,
+        /// The guest's own overlay IPv6 (PortMeta.guest_ipv6). The DHCPv6 responder offers this
+        /// address; v6 egress reads the inner v6 dst from the packet (program --remote6 to route).
+        #[arg(long = "guest6")]
+        guest6: Option<String>,
+        /// Remote IPv6 route, repeatable: "<overlay_ipv6>[/len]=<nexthop_underlay_ipv6>=<vni>".
+        /// Programs the ROUTES6 LPM trie so v6 guest egress encaps toward the nexthop.
+        #[arg(long = "remote6")]
+        remotes6: Vec<String>,
     },
 }
 
@@ -998,12 +1006,18 @@ async fn main() -> anyhow::Result<()> {
             local_underlay,
             guest_underlay,
             remotes,
+            guest6,
+            remotes6,
         } => {
             let mut ebpf = loader::load_ebpf()?;
             loader::maybe_install_logger(&mut ebpf);
             let tap_ifindex = ifindex(&tap)?;
             let guest_mac = parse_mac(&guest_mac)?;
             let guest_underlay = parse_ipv6(&guest_underlay)?;
+            let guest_ipv6 = match &guest6 {
+                Some(s) => parse_ipv6(s)?,
+                None => [0u8; 16],
+            };
             // Load (verify) + attach the tc programs BEFORE opening any map: the map `open()`
             // helpers `take_map()` the map out of the loader, after which a later `prog.load()`
             // can no longer bind the maps the program references ("fd N is not pointing to valid
@@ -1021,7 +1035,7 @@ async fn main() -> anyhow::Result<()> {
                     _pad: [0; 2],
                     underlay_ipv6: guest_underlay,
                     gateway_ipv6: parse_ipv6(&gateway6)?,
-                    guest_ipv6: [0u8; 16],
+                    guest_ipv6,
                 },
             )?;
             // Egress encap wiring (optional): program LOCAL (uplink identity) so forward_decision_v4
@@ -1064,6 +1078,38 @@ async fn main() -> anyhow::Result<()> {
                         vni,
                         ip,
                         32,
+                        xdp_dp_common::RouteValue {
+                            nexthop_vni: vni,
+                            nexthop_ipv6: nh,
+                            is_external: 0,
+                            _pad: [0; 3],
+                        },
+                    )?;
+                }
+            }
+            {
+                // --remote6: "<overlay_ipv6>[/len]=<nexthop_underlay_ipv6>=<vni>".
+                // Copies the map-wrapper calls from Cmd::Bringup's --remote6 handling.
+                let mut routes6 = maps::Routes6::open(&mut ebpf)?;
+                for r6 in &remotes6 {
+                    let f: Vec<&str> = r6.split('=').collect();
+                    anyhow::ensure!(
+                        f.len() == 3,
+                        "--remote6 must be overlay_ipv6[/len]=nexthop_underlay_ipv6=vni, got {r6:?}"
+                    );
+                    let (ipv6_s, plen) = match f[0].split_once('/') {
+                        Some((ip, l)) => {
+                            (ip, l.parse::<u32>().context("--remote6: bad prefix len")?)
+                        }
+                        None => (f[0], 128u32),
+                    };
+                    let ipv6 = parse_ipv6(ipv6_s)?;
+                    let nh = parse_ipv6(f[1])?;
+                    let vni: u32 = f[2].parse().context("--remote6: bad vni")?;
+                    routes6.upsert(
+                        vni,
+                        ipv6,
+                        plen,
                         xdp_dp_common::RouteValue {
                             nexthop_vni: vni,
                             nexthop_ipv6: nh,

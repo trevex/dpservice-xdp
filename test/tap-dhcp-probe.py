@@ -243,6 +243,133 @@ def egress_probe(tap, peer, timeout):
     return 1
 
 
+def egress6_probe(tap, peer, guest6, dst6, nexthop6, guest_underlay, timeout):
+    """IPv6 egress encap gate: open a queue on `tap`, sniff on the veth `peer`, send one inner
+    IPv6 frame (guest6 -> dst6) on `tap` (guest egress), and assert the datapath redirected an
+    ENCAPPED frame onto the uplink (read on `peer`): outer Ether + IPv6(nh=41 IPPROTO_IPV6,
+    src=<guest_underlay>, dst=<nexthop6>) carrying the inner IPv6(dst=dst6). Returns 0 on success."""
+    from scapy.all import Ether, IPv6, ICMPv6EchoRequest, AsyncSniffer
+
+    fd = open_tap_queue(tap)
+    captured = []
+
+    sniffer = AsyncSniffer(iface=peer, prn=lambda p: captured.append(p),
+                           store=True, lfilter=lambda p: IPv6 in p)
+    sniffer.start()
+    time.sleep(0.5)
+    try:
+        inner = (Ether(src="52:54:00:00:00:01", dst="aa:aa:aa:aa:aa:aa") /
+                 IPv6(src=guest6, dst=dst6) /
+                 ICMPv6EchoRequest())
+        frame = bytes(inner)
+        os.write(fd, frame)
+        print(f"sent inner IPv6 ICMPv6 ({len(frame)} bytes) {guest6}->{dst6} on {tap}")
+        deadline = time.time() + timeout
+        while time.time() < deadline and not captured:
+            time.sleep(0.2)
+    finally:
+        time.sleep(0.3)
+        try:
+            sniffer.stop()
+        except Exception:
+            pass
+        os.close(fd)
+
+    # Outer IPv6 carrying an inner IPv6 -> scapy parses two stacked IPv6 layers.
+    cands = [p for p in captured if IPv6 in p]
+    if not cands:
+        print(f"RESULT: NO IPv6 frame captured on {peer} within {timeout}s")
+        return 1
+    for p in cands:
+        raw = bytes(p)
+        print(f"captured {len(raw)} bytes on {peer}: {raw.hex()}")
+        ip6 = p[IPv6]
+        ok_outer = (ip6.nh == 41 and ip6.src == nexthop6_norm(guest_underlay)
+                    and ip6.dst == nexthop6_norm(nexthop6))
+        # Inner IPv6 is the payload IPv6 layer (second IPv6 in the stack).
+        inner6 = None
+        if ip6.payload is not None and isinstance(ip6.payload, IPv6):
+            inner6 = ip6.payload
+        ok_inner = inner6 is not None and inner6.dst == nexthop6_norm(dst6)
+        print(f"  outer IPv6: nh={ip6.nh} src={ip6.src} dst={ip6.dst} (want nh=41 "
+              f"src={guest_underlay} dst={nexthop6})")
+        if inner6 is not None:
+            print(f"  inner IPv6: src={inner6.src} dst={inner6.dst} (want dst={dst6})")
+        else:
+            print("  inner IPv6: <not parsed as IPv6 inside IPv6>")
+        if ok_outer and ok_inner:
+            print("ENCAP6 OK")
+            return 0
+    print("RESULT: captured frame(s) not correctly v6-encapsulated (see hex above)")
+    return 1
+
+
+def nexthop6_norm(addr):
+    """Normalize an IPv6 string for comparison (scapy prints compressed form)."""
+    import ipaddress
+    return str(ipaddress.IPv6Address(addr))
+
+
+def dhcpv6_probe(tap, client_mac, expect_ip, timeout):
+    """Send a DHCPv6 SOLICIT on `tap` from client_mac, expect an ADVERTISE (or Reply) carrying an
+    IA Address option whose addr == expect_ip and an echoed ClientId. Returns 0 on success."""
+    from scapy.all import (Ether, IPv6, UDP, DHCP6_Solicit, DHCP6_Advertise, DHCP6_Reply,
+                           DHCP6OptClientId, DHCP6OptIA_NA, DHCP6OptIAAddress, DUID_LLT)
+    # The datapath caps the echoed client DUID at D6_MAX_DUID = 10 bytes (conformance-validated),
+    # so the ADVERTISE's ClientId DUID is the SOLICIT DUID truncated to 10 bytes.
+    DUID_CAP = 10
+    fd = open_tap_queue(tap)
+    try:
+        src6 = guest_link_local(client_mac)
+        cid = DUID_LLT(lladdr=client_mac)
+        sent_duid = bytes(cid)
+        sol = (Ether(src=client_mac, dst="33:33:00:01:00:02") /
+               IPv6(src=src6, dst="ff02::1:2") /
+               UDP(sport=546, dport=547) /
+               DHCP6_Solicit(trid=0xABCDEF) /
+               DHCP6OptClientId(duid=cid) /
+               DHCP6OptIA_NA(iaid=0x1122))
+        frame = bytes(sol)
+        os.write(fd, frame)
+        print(f"sent DHCPv6 SOLICIT ({len(frame)} bytes) from {client_mac} on {tap}, "
+              f"DUID={sent_duid.hex()}")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            r, _, _ = select.select([fd], [], [], 0.3)
+            if not r:
+                continue
+            p = Ether(os.read(fd, 2048))
+            if DHCP6_Advertise in p or DHCP6_Reply in p:
+                kind = "ADVERTISE" if DHCP6_Advertise in p else "REPLY"
+                ia_addr = p[DHCP6OptIAAddress].addr if DHCP6OptIAAddress in p else None
+                echoed_duid = None
+                if DHCP6OptClientId in p:
+                    echoed_duid = bytes(p[DHCP6OptClientId].duid)
+                print(f"got DHCP6 {kind}: ia_addr={ia_addr} "
+                      f"echoed_clientid={echoed_duid.hex() if echoed_duid is not None else None}")
+                if ia_addr is None:
+                    print("  but no IA Address option present")
+                    return 1
+                if nexthop6_norm(ia_addr) != nexthop6_norm(expect_ip):
+                    print(f"  but expected IA addr {expect_ip}, got {ia_addr}")
+                    return 1
+                if echoed_duid is None:
+                    print("  but ClientId was not echoed")
+                    return 1
+                # Datapath echoes the SOLICIT DUID truncated to the 10-byte cap.
+                want_duid = sent_duid[:DUID_CAP]
+                if echoed_duid != want_duid:
+                    print(f"  but echoed ClientId mismatch: {echoed_duid.hex()} "
+                          f"vs expected (sent DUID capped to {DUID_CAP}B) {want_duid.hex()}")
+                    return 1
+                print("DHCPv6 OK")
+                return 0
+    finally:
+        os.close(fd)
+    print(f"RESULT: NO DHCP6 ADVERTISE/REPLY on {tap} within {timeout}s")
+    return 1
+
+
 def mk_tap(name):
     """Create a tap netdev with a held fd (IFF_NO_PI = raw ethernet frames), bring it up,
     disable offloads so the kernel doesn't coalesce/segment and confuse XDP."""
@@ -263,10 +390,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--client-only", action="store_true",
                     help="drive an already-running datapath on --tap (no bringup); used by the tc gate")
-    ap.add_argument("--probe", choices=["dhcp", "arp", "nd"], default="dhcp",
+    ap.add_argument("--probe", choices=["dhcp", "arp", "nd", "dhcpv6"], default="dhcp",
                     help="which probe to run in --client-only mode (default: dhcp)")
     ap.add_argument("--egress", action="store_true",
                     help="egress encap gate: send inner IPv4 on --tap, capture encapped on --peer")
+    ap.add_argument("--egress6", action="store_true",
+                    help="IPv6 egress encap gate: send inner IPv6 on --tap, capture encapped on --peer")
+    ap.add_argument("--guest6", default="2001:db8:1::1", help="guest overlay IPv6 (egress6/dhcpv6)")
+    ap.add_argument("--dst6", default="2001:db8:2::2", help="inner IPv6 dst (egress6 probe)")
+    ap.add_argument("--nexthop6", default="fc00:2::2", help="expected outer IPv6 dst (egress6 probe)")
+    ap.add_argument("--guest-underlay", default="fc00:1::1",
+                    help="expected outer IPv6 src = guest underlay (egress6 probe)")
     ap.add_argument("--peer", default=None, help="veth peer to capture redirected uplink frames on")
     ap.add_argument("--tap", default=None, help="existing tap netdev (client-only mode)")
     ap.add_argument("--client-mac", default="52:54:00:00:00:01")
@@ -279,6 +413,12 @@ def main():
             print("ERROR: --egress requires --tap and --peer", file=sys.stderr)
             return 2
         return egress_probe(args.tap, args.peer, args.timeout)
+    if args.egress6:
+        if not args.tap or not args.peer:
+            print("ERROR: --egress6 requires --tap and --peer", file=sys.stderr)
+            return 2
+        return egress6_probe(args.tap, args.peer, args.guest6, args.dst6, args.nexthop6,
+                             args.guest_underlay, args.timeout)
     if args.client_only:
         if not args.tap:
             print("ERROR: --client-only requires --tap", file=sys.stderr)
@@ -287,6 +427,8 @@ def main():
             return arp_probe(args.tap, args.client_mac, args.expect_ip, args.timeout)
         if args.probe == "nd":
             return nd_probe(args.tap, args.client_mac, args.gateway6, args.timeout)
+        if args.probe == "dhcpv6":
+            return dhcpv6_probe(args.tap, args.client_mac, args.guest6, args.timeout)
         return client_only(args.tap, args.client_mac, args.expect_ip, args.timeout)
 
     if not os.path.exists(BIN):

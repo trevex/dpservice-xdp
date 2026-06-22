@@ -62,6 +62,7 @@ sudo ip netns exec "$NS" env XDP_DP_DEBUG=1 "$BIN" tc-bringup \
     --guest-mac "$GUEST_MAC" \
     --gateway-mac "$GW_MAC" \
     --gateway6 fe80::1 \
+    --guest6 2001:db8:1::1 \
     --dhcp-dns 8.8.8.8 \
     > "$DP_LOG" 2>&1 &
 DP_PID=$!
@@ -126,5 +127,20 @@ if [[ $RC -ne 0 ]]; then
     exit 1
 fi
 
-echo "PASS: tc DHCP + ARP + ND OK"
+echo "== send DHCPv6 SOLICIT on $TAP (client MAC $GUEST_MAC), expect ADVERTISE for 2001:db8:1::1 =="
+set +e
+sudo ip netns exec "$NS" "$PYBIN" "$ROOT/test/tap-dhcp-probe.py" \
+    --client-only --probe dhcpv6 --tap "$TAP" --client-mac "$GUEST_MAC" \
+    --guest6 2001:db8:1::1 --timeout 4
+RC=$?
+set -e
+if [[ $RC -ne 0 ]]; then
+    echo "FAIL: no valid DHCPv6 ADVERTISE for 2001:db8:1::1 (probe rc=$RC). Datapath log tail:"
+    echo "------------------------------------------------------------------------"
+    tail -n 40 "$DP_LOG" || true
+    echo "------------------------------------------------------------------------"
+    exit 1
+fi
+
+echo "PASS: tc DHCP + ARP + ND + DHCPv6 OK"
 exit 0
