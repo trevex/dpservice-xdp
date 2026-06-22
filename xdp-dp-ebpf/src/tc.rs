@@ -60,6 +60,25 @@ pub fn tc_guest_tx(ctx: TcContext) -> i32 {
 
     // IPv6 → may be an ND Neighbor Solicitation for the gateway.
     if ethertype == xdp_dp_common::arp_nd::ETH_P_IPV6 {
+        // NAT64 egress (mirrors XDP v6_guest_tx order: nat64 first). The full translate+SNAT+encap
+        // path can't run inline here — tc_guest_tx's own stack frame plus tc_nat64_egress's blow
+        // the BPF 512-byte combined-call stack budget. So we cheaply peek the inner IPv6 dst and, if
+        // it's in 64:ff9b::/96, TAIL-CALL the dedicated tc_guest_nat64 program (fresh stack budget),
+        // exactly like DHCP. Non-NAT64 IPv6 falls through to ND / overlay forwarding below.
+        const V6_HDR: usize = xdp_dp_common::arp_nd::ETH_LEN + crate::parse::IPV6_LEN;
+        if ctx.pull_data(V6_HDR as u32).is_ok()
+            && ctx.data() + V6_HDR <= ctx.data_end()
+            && unsafe {
+                crate::nat64::is_nat64_addr(&core::ptr::read_unaligned(
+                    (ctx.data() as *const u8).add(xdp_dp_common::arp_nd::ETH_LEN + 24)
+                        as *const [u8; 16],
+                ))
+            }
+        {
+            let _ = unsafe { GUEST_PROGS_TC.tail_call(&ctx, xdp_dp_common::GUEST_PROG_IPV6) };
+            // tail_call only returns on failure (e.g. slot empty) → fall through to passthrough.
+            return TC_ACT_OK;
+        }
         const ND_FRAME: usize =
             xdp_dp_common::arp_nd::ETH_LEN + xdp_dp_common::arp_nd::IPV6_LEN + 32;
         if ctx.pull_data(ND_FRAME as u32).is_ok()
@@ -200,6 +219,26 @@ pub fn tc_guest_tx(ctx: TcContext) -> i32 {
         }
     }
     TC_ACT_OK
+}
+
+/// tc NAT64 egress responder (tail-call target, slot GUEST_PROG_IPV6). Reached from `tc_guest_tx`
+/// when the inner IPv6 dst is in 64:ff9b::/96. Running as its own program gives the heavy
+/// translate+SNAT+encap path a fresh BPF stack budget (it doesn't fit on top of tc_guest_tx's
+/// frame). On any fall-through/parse miss, pass the packet to the stack.
+#[classifier]
+pub fn tc_guest_nat64(ctx: TcContext) -> i32 {
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    // Read only the three fields tc_nat64_egress needs — copying the whole ~70-byte PortMeta onto
+    // this entry's frame would add to the tail-called call chain's combined BPF stack budget.
+    let (vni, guest_ipv4, underlay_ipv6) = match unsafe { PORT_META.get(&ifindex) } {
+        Some(m) => (m.vni, m.guest_ipv4, m.underlay_ipv6),
+        None => return TC_ACT_OK,
+    };
+    match crate::nat64::tc_nat64_egress(&ctx, vni, guest_ipv4, &underlay_ipv6) {
+        Ok(Some(act)) => act,
+        Ok(None) => TC_ACT_OK,
+        Err(()) => TC_ACT_SHOT,
+    }
 }
 
 /// tc DHCP responder: build the OFFER/ACK into the (resized) skb and redirect it back to the guest.

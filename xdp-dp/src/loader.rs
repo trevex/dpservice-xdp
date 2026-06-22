@@ -144,6 +144,24 @@ pub fn register_guest_dhcp_tc(ebpf: &mut Ebpf) -> anyhow::Result<ProgramArray<Ma
     progs
         .set(xdp_dp_common::GUEST_PROG_DHCP, fd, 0)
         .context("register tc_guest_dhcp in GUEST_PROGS_TC")?;
+
+    // NAT64 egress tail-call target (slot GUEST_PROG_IPV6): tc_guest_tx tail-calls this when the
+    // inner IPv6 dst is in 64:ff9b::/96, giving the translate+SNAT+encap path its own stack budget.
+    {
+        let prog: &mut SchedClassifier = ebpf
+            .program_mut("tc_guest_nat64")
+            .context("tc_guest_nat64 program missing")?
+            .try_into()?;
+        prog.load().context("verify tc_guest_nat64")?;
+    }
+    let prog: &SchedClassifier = ebpf
+        .program("tc_guest_nat64")
+        .context("tc_guest_nat64 program missing")?
+        .try_into()?;
+    let fd: &ProgramFd = prog.fd()?;
+    progs
+        .set(xdp_dp_common::GUEST_PROG_IPV6, fd, 0)
+        .context("register tc_guest_nat64 in GUEST_PROGS_TC")?;
     Ok(progs)
 }
 
