@@ -816,6 +816,32 @@ pub mod dhcp {
         udp_dst == 67
     }
 
+    const ETH_P_IPV6: u16 = 0x86DD;
+    // ETH(14) + IPv6(40) + UDP(8) + DHCPv6 header(4) = 66.
+    const MIN_DHCPV6_LEN: usize = ETH_LEN + 40 + 8 + 4;
+
+    /// Cheap fixed-offset check: IPv6 + next-header UDP + UDP dport 547. Bounds-checked on
+    /// `data..data_end`. All offsets are constant, so this is safe in `xdp-dp-common`.
+    #[inline(always)]
+    pub fn looks_like_dhcpv6(data: usize, data_end: usize) -> bool {
+        if data + MIN_DHCPV6_LEN > data_end {
+            return false;
+        }
+        let p = data as *const u8;
+        let ethertype = u16::from_be(unsafe { core::ptr::read_unaligned(p.add(12) as *const u16) });
+        if ethertype != ETH_P_IPV6 {
+            return false;
+        }
+        // IPv6 next-header (no extension-header support needed for DHCPv6).
+        if unsafe { *p.add(ETH_LEN + 6) } != IPPROTO_UDP {
+            return false;
+        }
+        let udp_dst = u16::from_be(unsafe {
+            core::ptr::read_unaligned(p.add(ETH_LEN + 40 + 2) as *const u16)
+        });
+        udp_dst == 547
+    }
+
     /// Validate + parse a DISCOVER/REQUEST; `None` for other message types. Pure (no maps): reads
     /// `msg_type` via the option walk, the Ethernet source, and xid/secs/flags. Computes
     /// `reply_type`.
@@ -1155,6 +1181,22 @@ pub mod dhcp {
             assert_eq!(&buf[58..62], &[10, 0, 0, 1]); // yiaddr at BOOTP+16
                                                       // xid/secs/flags echoed at BOOTP+4
             assert_eq!(&buf[46..54], &[0xde, 0xad, 0xbe, 0xef, 0, 0, 0x80, 0]);
+        }
+
+        #[test]
+        fn detects_dhcpv6_solicit() {
+            let mut buf = [0u8; MIN_DHCPV6_LEN];
+            buf[12..14].copy_from_slice(&ETH_P_IPV6.to_be_bytes());
+            buf[ETH_LEN + 6] = IPPROTO_UDP; // IPv6 next-header
+            buf[ETH_LEN + 40 + 2..ETH_LEN + 40 + 4].copy_from_slice(&547u16.to_be_bytes());
+            let data = buf.as_ptr() as usize;
+            assert!(looks_like_dhcpv6(data, data + buf.len()));
+            // Wrong port → rejected.
+            buf[ETH_LEN + 40 + 2..ETH_LEN + 40 + 4].copy_from_slice(&546u16.to_be_bytes());
+            let data = buf.as_ptr() as usize;
+            assert!(!looks_like_dhcpv6(data, data + buf.len()));
+            // Undersized → rejected.
+            assert!(!looks_like_dhcpv6(data, data + MIN_DHCPV6_LEN - 1));
         }
     }
 }

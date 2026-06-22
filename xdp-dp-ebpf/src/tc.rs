@@ -9,10 +9,12 @@ use aya_ebpf::{
     programs::TcContext,
 };
 
+use crate::dhcp::tc_dhcpv6_respond;
 use crate::dhcp::{gather_dhcpv4_reply, learn_mac};
 use crate::maps::{GUEST_PROGS_TC, PORT_META};
 use xdp_dp_common::dhcp::{
-    looks_like_dhcpv4, parse_dhcpv4_request, write_dhcpv4_reply, MIN_DHCP_LEN, REPLY_LEN,
+    looks_like_dhcpv4, looks_like_dhcpv6, parse_dhcpv4_request, write_dhcpv4_reply, MIN_DHCP_LEN,
+    REPLY_LEN,
 };
 
 // `aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_SHOT}` are already `i32` (the verdict type a
@@ -72,6 +74,12 @@ pub fn tc_guest_tx(ctx: TcContext) -> i32 {
         {
             return unsafe { bpf_redirect(ifindex, 0) as i32 };
         }
+        // DHCPv6 (UDP dst 547) → tail-call the dedicated responder.
+        if looks_like_dhcpv6(ctx.data(), ctx.data_end()) {
+            let _ = unsafe { GUEST_PROGS_TC.tail_call(&ctx, xdp_dp_common::GUEST_PROG_DHCP) };
+            return TC_ACT_OK;
+        }
+
         // Not ND → IPv6 inner overlay egress (route6 → local or encap, proto 41).
         let _ = ctx.pull_data((xdp_dp_common::arp_nd::ETH_LEN + crate::parse::IPV6_LEN) as u32);
         if ctx.data() + xdp_dp_common::arp_nd::ETH_LEN + crate::parse::IPV6_LEN > ctx.data_end() {
@@ -202,6 +210,14 @@ pub fn tc_guest_dhcp(ctx: TcContext) -> i32 {
         Some(m) => *m,
         None => return TC_ACT_OK,
     };
+    // DHCPv4 and DHCPv6 share this tail-call slot; dispatch on the ethertype/port. DHCPv6 builds the
+    // ADVERTISE/REPLY into the skb and redirects it back out the tap toward the guest.
+    if looks_like_dhcpv6(ctx.data(), ctx.data_end()) {
+        if tc_dhcpv6_respond(&ctx, &meta) {
+            return unsafe { bpf_redirect(ifindex, 0) as i32 };
+        }
+        return TC_ACT_OK;
+    }
     // Make the request head writable/linear so the parse works on direct packet access. A DISCOVER
     // is typically SHORTER than REPLY_LEN (e.g. ~286B vs 428B), so pulling REPLY_LEN here fails
     // (bpf_skb_pull_data cannot pull past skb->len) and we'd bail before ever growing the skb.
