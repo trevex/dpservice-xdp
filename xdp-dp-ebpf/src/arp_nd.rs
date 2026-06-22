@@ -6,6 +6,21 @@ use crate::parse::{write16, write6, ETH_LEN, ETH_P_ARP, IPPROTO_ICMPV6, IPV6_LEN
 /// Virtual gateway MAC the datapath answers ARP with (and uses as inner-eth src on delivery).
 pub const GW_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
+/// Reflect a rewritten-in-place reply (ARP / ND / DHCP) back to the guest it arrived from, and
+/// return the XDP action to use.
+///
+/// We use `bpf_redirect(ingress_ifindex)` rather than `XDP_TX`. On a vhost-net-backed tun, the
+/// XDP_TX path is NOT drained back to the guest: the guest's RX is fed by vhost reading the tun's
+/// `ptr_ring`, which `ndo_xdp_xmit` (redirect) feeds but the XDP_TX bounce path does not — so
+/// XDP_TX replies are silently lost under vhost (which native XDP requires; see the ioiab setup).
+/// Redirecting to the ingress ifindex reuses the exact delivery path overlay traffic already uses
+/// to reach a guest, and behaves identically in generic (SKB) mode, so conformance is unaffected.
+#[inline(always)]
+pub fn reflect(ctx: &XdpContext) -> u32 {
+    let ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
+    unsafe { aya_ebpf::helpers::bpf_redirect(ifindex, 0) as u32 }
+}
+
 // ARP (Ethernet/IPv4) field offsets, relative to the ARP header start (= ETH_LEN):
 //   opcode @ 6 (2B; 1=request, 2=reply)
 //   sha    @ 8 (6B, sender hw addr)
@@ -55,7 +70,7 @@ pub fn try_arp_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
         write6(arp.add(18), &sender_mac);
         core::ptr::write_unaligned(arp.add(24) as *mut [u8; 4], spa);
     }
-    Some(xdp_action::XDP_TX)
+    Some(reflect(ctx))
 }
 
 const ND_NS: u8 = 135;
@@ -143,5 +158,5 @@ pub fn try_nd_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
         let cks = csum16(sum, icmp as *const u8, 32);
         core::ptr::write_unaligned(icmp.add(2) as *mut u16, cks.to_be());
     }
-    Some(xdp_action::XDP_TX)
+    Some(reflect(ctx))
 }

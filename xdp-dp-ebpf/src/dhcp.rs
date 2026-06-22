@@ -356,7 +356,7 @@ pub fn try_dhcpv4_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
         core::ptr::write_unaligned(p.add(ETH_LEN + 26) as *mut u16, 0u16);
     }
 
-    Some(xdp_action::XDP_TX)
+    Some(crate::arp_nd::reflect(ctx))
 }
 
 // ──────────────────────── DHCPv6 responder ────────────────────────
@@ -1046,5 +1046,5 @@ pub fn try_dhcpv6_reply(ctx: &XdpContext, meta: &PortMeta) -> Option<u32> {
     let udp_len = (real_opts_len + F6_OPTS - ETH_LEN - 40) as u16;
     let _ = d6_checksum(data, data_end, udp_len);
 
-    Some(xdp_action::XDP_TX)
+    Some(crate::arp_nd::reflect(ctx))
 }
