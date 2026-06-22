@@ -20,7 +20,8 @@
 - `test/tc-dhcp-netns.sh` — the Phase-1 integration gate: a tap in a netns with the tc datapath attached, a scapy DHCP DISCOVER, asserts an OFFER comes back.
 
 **Modified files:**
-- `xdp-dp-ebpf/src/dhcp.rs` — extract the v4 reply byte-builder into pure `write_dhcpv4_reply(...)`; the existing `try_dhcpv4_reply` keeps doing parse + MAC-learn + XDP tail-resize, then calls the pure builder. Add the shared `parse_dhcpv4_request(...)` and `learn_mac(ifindex, meta, eth_src)` helpers used by both glues.
+- `xdp-dp-common/src/lib.rs` — **new `pub mod dhcp`** holding the PURE, host-testable pieces: `write_dhcpv4_reply`, `parse_dhcpv4_request`, `looks_like_dhcpv4`, the `Dhcpv4Request`/`Dhcpv4Reply` structs, and the DHCP framing constants the writer needs (`REPLY_LEN`, message-type/offset consts). This follows the existing precedent in this file (the `fw_match` pure firewall logic at lib.rs:360 — "no_std; used by the datapath and host-tested"). The eBPF crate is `#![no_std] #![no_main]` and its `dhcp.rs` is a *bin* module, so it cannot host-run `cargo test`; the pure logic must live in `xdp-dp-common`, which IS host-testable (`cargo test -p xdp-dp-common`).
+- `xdp-dp-ebpf/src/dhcp.rs` — keeps the MAP-touching glue: `gather_dhcpv4_reply(req, meta)` (reads `DHCP_CONFIG`/`DHCP_META`), `learn_mac(ifindex, meta, eth_src)` (writes `PORT_META`/`UNDERLAY`/`INTERFACES`), and the rewritten XDP glue `try_dhcpv4_reply` that calls `xdp_dp_common::dhcp::{parse_dhcpv4_request, write_dhcpv4_reply}` around the XDP tail-resize. Remove the now-moved byte-builder and request-field constants (re-export or import from common).
 - `xdp-dp-ebpf/src/maps.rs:69` — add a second `ProgramArray` `GUEST_PROGS_TC` for the tc tail-call (tc progs can only tail-call tc progs).
 - `xdp-dp-ebpf/src/main.rs` — register `mod verdict; mod tc;`.
 - `xdp-dp/src/loader.rs` — add `attach_tc_clsact_ingress(ebpf, prog, iface)` and `register_guest_dhcp_tc(ebpf)`.
@@ -80,7 +81,9 @@ git commit -m "feat(ebpf): add context-neutral Verdict seam type"
 
 ## Task 2: Extract the pure DHCPv4 reply serializer (+ std unit test)
 
-**Goal:** Split `try_dhcpv4_reply` (`xdp-dp-ebpf/src/dhcp.rs:53`) so the *byte-writing* is a pure function over `(data, data_end)` with no context, tail-resize, or map access — testable in plain `cargo test`. The context-coupled steps (read `ingress_ifindex`, MAC-learn map writes, `bpf_xdp_adjust_tail`) stay in the XDP glue.
+> **CORRECTION (location):** the pure functions + structs + DHCP constants + unit tests go in **`xdp-dp-common/src/lib.rs`** under a new `pub mod dhcp` — NOT in the eBPF crate. The eBPF crate is `#![no_std] #![no_main]` and `dhcp.rs` is a *bin* module, so `cargo test` cannot run there; `xdp-dp-common` is host-testable (`cargo test -p xdp-dp-common`, 16 tests already pass) and already hosts pure datapath logic (the `fw_match`/csum functions). The eBPF `dhcp.rs` keeps only the map-touching glue (`gather_dhcpv4_reply`, `learn_mac`) and the XDP entry `try_dhcpv4_reply`, importing the pure pieces from `xdp_dp_common::dhcp`. Tests run with `cargo test -p xdp-dp-common`, not `cargo test -p xdp-dp-ebpf`.
+
+**Goal:** Split `try_dhcpv4_reply` (`xdp-dp-ebpf/src/dhcp.rs:53`) so the *byte-writing* is a pure function over `(data, data_end)` with no context, tail-resize, or map access — placed in `xdp-dp-common` and testable in plain `cargo test`. The context-coupled steps (read `ingress_ifindex`, MAC-learn map writes, `bpf_xdp_adjust_tail`) stay in the eBPF XDP glue.
 
 **Files:**
 - Modify: `xdp-dp-ebpf/src/dhcp.rs` (the v4 block, ~lines 53–400)
@@ -274,8 +277,9 @@ use aya_ebpf::{
     programs::TcContext,
 };
 
-use crate::dhcp::{gather_dhcpv4_reply, parse_dhcpv4_request, write_dhcpv4_reply, REPLY_LEN};
+use crate::dhcp::gather_dhcpv4_reply; // map-touching glue stays in the eBPF crate
 use crate::maps::{GUEST_PROGS_TC, PORT_META};
+use xdp_dp_common::dhcp::{looks_like_dhcpv4, parse_dhcpv4_request, write_dhcpv4_reply, REPLY_LEN};
 
 /// clsact-ingress on a guest tap. Classifies guest egress; DHCP is tail-called to keep verifier
 /// cost split, mirroring the XDP path.
@@ -335,9 +339,7 @@ pub fn tc_guest_dhcp(ctx: TcContext) -> i32 {
 /// Cheap port-only classifier: IPv4/UDP dport 67. Full validation happens in `tc_guest_dhcp`.
 #[inline(always)]
 fn is_dhcpv4_request(ctx: &TcContext) -> bool {
-    let data = ctx.data();
-    let data_end = ctx.data_end();
-    crate::dhcp::looks_like_dhcpv4(data, data_end)
+    looks_like_dhcpv4(ctx.data(), ctx.data_end())
 }
 ```
 
